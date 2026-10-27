@@ -307,7 +307,7 @@ pub struct H264CodecDecoder {
     #[doc(hidden)] // internal — exposed for tests/fuzz; not part of the stable API
     pub last_slice: Option<SliceHeader>,
     /// Count of per-slice / per-picture reconstruction errors that were
-    /// swallowed to keep the stream alive (the `h264 slice skipped: …`
+    /// swallowed to keep the stream alive (the skipped-slice
     /// paths). Zero means every slice fed so far decoded cleanly; any
     /// frame emitted while this is non-zero may be partial/concealed
     /// output. Diagnostic only — see [`Self::decode_error_count`].
@@ -714,9 +714,8 @@ impl H264CodecDecoder {
     }
 
     /// Number of per-slice / per-picture reconstruction errors that were
-    /// swallowed so the stream could keep decoding (the paths that log
-    /// `h264 slice skipped: …`). Zero means every slice fed so far
-    /// decoded cleanly; when non-zero, frames produced by this decoder
+    /// swallowed so the stream could keep decoding (skipped slices).
+    /// Zero means every slice fed so far decoded cleanly; when non-zero, frames produced by this decoder
     /// instance may be partial (missing slices) rather than a faithful
     /// reconstruction. Resets with [`Decoder::reset`].
     #[doc(hidden)] // internal diagnostic — exposed for tests/fuzz; not part of the stable API
@@ -3195,9 +3194,9 @@ impl H264CodecDecoder {
     }
 
     fn handle_event_logged(&mut self, ev: Event) {
-        if let Err(e) = self.handle_event(ev) {
+        // Counted for decode_error_count() rather than printed: a library leaves reporting to its caller.
+        if self.handle_event(ev).is_err() {
             self.decode_errors += 1;
-            eprintln!("h264 slice skipped: {e}");
         }
         self.pending_sd = None;
     }
