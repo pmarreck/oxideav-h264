@@ -229,7 +229,7 @@ impl RefPicProvider for NoRefs {
 mod tests {
     use super::*;
 
-    fn pic(w: u32, fill: i32) -> Picture {
+    fn pic(w: u32, fill: u16) -> Picture {
         let mut p = Picture::new(w, w, 1, 8, 8);
         for v in p.luma.iter_mut() {
             *v = fill;
@@ -281,7 +281,7 @@ mod tests {
     fn store_retain_keys_prunes_dead_pictures() {
         let mut s = RefPicStore::new();
         for k in 0..10 {
-            s.insert(k, pic(16, k as i32));
+            s.insert(k, pic(16, k as u16));
         }
         assert_eq!(s.stored_count(), 10);
         s.retain_keys(&[3, 7]);

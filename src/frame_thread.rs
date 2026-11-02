@@ -40,9 +40,9 @@ pub struct SharedPlanes {
     chroma_height: usize,
     /// Chroma rows per macroblock row (0 for monochrome).
     chroma_band_rows: usize,
-    luma: Vec<OnceLock<Box<[i32]>>>,
-    cb: Vec<OnceLock<Box<[i32]>>>,
-    cr: Vec<OnceLock<Box<[i32]>>>,
+    luma: Vec<OnceLock<Box<[Sample]>>>,
+    cb: Vec<OnceLock<Box<[Sample]>>>,
+    cr: Vec<OnceLock<Box<[Sample]>>>,
     /// Number of bands published, or `usize::MAX` once the job failed.
     progress: Mutex<usize>,
     cond: Condvar,
@@ -104,7 +104,7 @@ impl SharedPlanes {
 
     /// Publish band `b` from the picture's planes (`luma` /
     /// `cb` / `cr` are whole row-major planes).
-    pub(crate) fn publish(&self, b: usize, luma: &[i32], cb: &[i32], cr: &[i32]) {
+    pub(crate) fn publish(&self, b: usize, luma: &[Sample], cb: &[Sample], cr: &[Sample]) {
         let w = self.width;
         let l0 = (16 * b).min(self.height);
         let l1 = (16 * b + 16).min(self.height);
@@ -177,8 +177,8 @@ impl SharedPlanes {
     }
 
     /// Assemble the whole picture's planes (after [`Self::wait_done`]).
-    pub(crate) fn assemble(&self) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
-        let cat = |v: &[OnceLock<Box<[i32]>>]| {
+    pub(crate) fn assemble(&self) -> (Vec<Sample>, Vec<Sample>, Vec<Sample>) {
+        let cat = |v: &[OnceLock<Box<[Sample]>>]| {
             let mut out = Vec::new();
             for b in v {
                 if let Some(b) = b.get() {
@@ -383,7 +383,7 @@ pub(crate) fn run_job(planes: &SharedPlanes, f: impl FnOnce()) {
 // ---------------------------------------------------------------------
 
 use crate::mb_grid::MbGrid;
-use crate::picture::Picture;
+use crate::picture::{Picture, Sample};
 use crate::pps::Pps;
 use crate::reconstruct::{self, FtSlicePlan};
 use crate::ref_store::RefPicProvider;

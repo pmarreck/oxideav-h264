@@ -19,6 +19,7 @@
 //!
 //! Clean-room: derived only from ITU-T Rec. H.264 (08/2024) §8.4.2.2.
 
+use crate::picture::Sample;
 use std::sync::OnceLock;
 
 /// Largest window a kernel gathers: a 16x16 luma block plus the
@@ -31,7 +32,7 @@ pub(crate) enum PlaneSrc<'a> {
     /// A flat row-major plane: row `y` starts at `data[y * stride]`.
     /// A field of a frame is a flat plane with a doubled stride.
     Flat {
-        data: &'a [i32],
+        data: &'a [Sample],
         stride: usize,
         width: usize,
         height: usize,
@@ -41,7 +42,7 @@ pub(crate) enum PlaneSrc<'a> {
     /// reads must already be published.
     #[cfg_attr(not(test), allow(dead_code))]
     Banded {
-        bands: &'a [OnceLock<Box<[i32]>>],
+        bands: &'a [OnceLock<Box<[Sample]>>],
         band_rows: usize,
         width: usize,
         height: usize,
@@ -65,7 +66,7 @@ impl<'a> PlaneSrc<'a> {
 
     /// Row `y` (`y < height`), `width` samples long.
     #[inline]
-    fn row(&self, y: usize) -> &'a [i32] {
+    fn row(&self, y: usize) -> &'a [Sample] {
         match *self {
             PlaneSrc::Flat {
                 data,
@@ -114,23 +115,25 @@ fn gather(
             copy_short(o, &row[x0 as usize..x0 as usize + ww]);
         } else {
             for (c, slot) in o.iter_mut().enumerate() {
-                *slot = row[(x0 + c as i32).clamp(0, width - 1) as usize];
+                *slot = i32::from(row[(x0 + c as i32).clamp(0, width - 1) as usize]);
             }
         }
     }
 }
 
-/// `dst.copy_from_slice(src)` for the short rows of a block window.
-/// The row lengths a kernel uses are dispatched to fixed-size copies,
-/// which compile to a few loads and stores (a library `memcpy` call per
-/// row costs more than the copy itself at these lengths).
+/// Widen the short stored-sample rows of a block window into `dst`.
+/// The row lengths a kernel uses are dispatched to fixed-size loops,
+/// which compile to a few widening vector loads and stores (a generic
+/// loop per row costs more than the copy itself at these lengths).
 #[inline(always)]
-fn copy_short(dst: &mut [i32], src: &[i32]) {
+fn copy_short(dst: &mut [i32], src: &[Sample]) {
     #[inline(always)]
-    fn fixed<const N: usize>(dst: &mut [i32], src: &[i32]) {
+    fn fixed<const N: usize>(dst: &mut [i32], src: &[Sample]) {
         let d: &mut [i32; N] = (&mut dst[..N]).try_into().expect("row length");
-        let s: &[i32; N] = (&src[..N]).try_into().expect("row length");
-        *d = *s;
+        let s: &[Sample; N] = (&src[..N]).try_into().expect("row length");
+        for (d, &s) in d.iter_mut().zip(s) {
+            *d = i32::from(s);
+        }
     }
     match dst.len() {
         2 => fixed::<2>(dst, src),
@@ -143,7 +146,7 @@ fn copy_short(dst: &mut [i32], src: &[i32]) {
         16 => fixed::<16>(dst, src),
         17 => fixed::<17>(dst, src),
         21 => fixed::<21>(dst, src),
-        n => dst.copy_from_slice(&src[..n]),
+        n => crate::picture::load_samples(&mut dst[..n], &src[..n]),
     }
 }
 
@@ -359,7 +362,9 @@ mod tests {
     fn luma_and_chroma_match_reference_interpolators() {
         let (pw, ph) = (40usize, 36usize);
         let data = plane(pw, ph, 7);
-        let bands: Vec<OnceLock<Box<[i32]>>> = data
+        // The stored form of the same samples, for the window kernels.
+        let stored: Vec<Sample> = data.iter().map(|&s| s as Sample).collect();
+        let bands: Vec<OnceLock<Box<[Sample]>>> = stored
             .chunks(pw * 4)
             .map(|c| {
                 let l = OnceLock::new();
@@ -369,7 +374,7 @@ mod tests {
             .collect();
         let srcs = [
             PlaneSrc::Flat {
-                data: &data,
+                data: &stored,
                 stride: pw,
                 width: pw,
                 height: ph,

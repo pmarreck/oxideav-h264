@@ -2644,8 +2644,8 @@ fn gray_picture(
         bit_depth_c,
     );
     p.non_existing = true;
-    let grey_y: i32 = 1 << (bit_depth_y.saturating_sub(1));
-    let grey_c: i32 = 1 << (bit_depth_c.saturating_sub(1));
+    let grey_y = crate::picture::to_sample(1 << (bit_depth_y.saturating_sub(1)));
+    let grey_c = crate::picture::to_sample(1 << (bit_depth_c.saturating_sub(1)));
     for v in p.luma.iter_mut() {
         *v = grey_y;
     }
@@ -3620,7 +3620,7 @@ fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargin
     // whose row stride is `src_stride` samples.
     #[allow(clippy::too_many_arguments)]
     fn pack(
-        src: &[i32],
+        src: &[crate::picture::Sample],
         src_stride: usize,
         x0: usize,
         y0: usize,
@@ -3634,10 +3634,10 @@ fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargin
             let row = &row[x0.min(row.len())..(x0 + rect_w).min(row.len())];
             if wide {
                 for &s in row {
-                    out.extend_from_slice(&(s.clamp(0, max) as u16).to_le_bytes());
+                    out.extend_from_slice(&s.min(max as u16).to_le_bytes());
                 }
             } else {
-                out.extend(row.iter().map(|&s| s.clamp(0, 255) as u8));
+                out.extend(row.iter().map(|&s| s.min(255) as u8));
             }
         }
         out
@@ -4766,7 +4766,7 @@ mod tests {
     /// Build a small half-height field [`Picture`] whose every luma
     /// sample equals `fill` and chroma samples equal `cfill`, with the
     /// given POC + frame_num stamped on.
-    fn field_pic(w: u32, field_h: u32, fill: i32, cfill: i32, poc: i32, frame_num: u32) -> Picture {
+    fn field_pic(w: u32, field_h: u32, fill: u16, cfill: u16, poc: i32, frame_num: u32) -> Picture {
         let mut p = Picture::new(w, field_h, 1, 8, 8);
         for s in p.luma.iter_mut() {
             *s = fill;
@@ -4915,13 +4915,13 @@ mod tests {
     fn output_frame_is_the_cropping_rectangle() {
         let mut pic = Picture::new(32, 32, 1, 8, 8);
         for (i, s) in pic.luma.iter_mut().enumerate() {
-            *s = ((i % 32) + 4 * (i / 32)) as i32;
+            *s = ((i % 32) + 4 * (i / 32)) as u16;
         }
         for (i, s) in pic.cb.iter_mut().enumerate() {
-            *s = ((i % 16) + 16 * (i / 16)) as i32;
+            *s = ((i % 16) + 16 * (i / 16)) as u16;
         }
         for (i, s) in pic.cr.iter_mut().enumerate() {
-            *s = 255 - ((i % 16) + 16 * (i / 16)) as i32;
+            *s = 255 - ((i % 16) + 16 * (i / 16)) as u16;
         }
         let crop = FrameCropMargins {
             left: 2,
@@ -4954,12 +4954,49 @@ mod tests {
         }
     }
 
+    /// Output samples are clipped to the sample range of their bit depth
+    /// (overshoot to the maximum), on narrow and wide
+    /// planes alike, at every column of rows whose width is not a
+    /// multiple of any vector width.
+    #[test]
+    fn output_samples_are_clipped_to_the_bit_depth_range() {
+        let values: [u16; 10] = [0, 1, 127, 254, 255, 256, 1023, 1024, 16383, u16::MAX];
+        for (depth, max) in [(8u32, 255i32), (10, 1023)] {
+            let mut pic = Picture::new(18, 2, 0, depth, depth);
+            for (i, s) in pic.luma.iter_mut().enumerate() {
+                *s = values[i % values.len()];
+            }
+            let crop = FrameCropMargins {
+                left: 1,
+                right: 0,
+                top: 0,
+                bottom: 0,
+            };
+            let vf = picture_to_video_frame(&pic, None, crop);
+            let data = &vf.planes[0].data;
+            let wide = depth > 8;
+            assert_eq!(data.len(), 17 * 2 * if wide { 2 } else { 1 });
+            for y in 0..2 {
+                for x in 0..17 {
+                    let want = i32::from(pic.luma[y * 18 + x + 1]).min(max);
+                    let got = if wide {
+                        let o = (y * 17 + x) * 2;
+                        u16::from_le_bytes([data[o], data[o + 1]]) as i32
+                    } else {
+                        data[y * 17 + x] as i32
+                    };
+                    assert_eq!(got, want, "depth {depth} ({x},{y})");
+                }
+            }
+        }
+    }
+
     /// A 10-bit picture keeps its two-byte samples inside the window.
     #[test]
     fn cropping_keeps_wide_samples_little_endian() {
         let mut pic = Picture::new(16, 16, 0, 10, 10);
         for (i, s) in pic.luma.iter_mut().enumerate() {
-            *s = (i as i32) * 4;
+            *s = (i as u16) * 4;
         }
         let crop = FrameCropMargins {
             left: 0,

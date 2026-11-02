@@ -1,8 +1,10 @@
 //! Picture sample buffer for a decoded frame/field.
 //!
 //! Holds luma + chroma sample planes sized from the active SPS.
-//! Samples are stored as `i32` to accommodate bit_depth up to 14; the
-//! actual value range is `0..(1 << bit_depth)`.
+//! Samples are stored as [`Sample`] (`u16`), wide enough for every bit
+//! depth the spec allows (up to 14); the actual value range is
+//! `0..(1 << bit_depth)`. Arithmetic on samples happens in `i32`: the
+//! accessors widen on read and [`to_sample`] narrows on write.
 //!
 //! Spec references:
 //! * §6.2 — ChromaArrayType and sample-array layout.
@@ -12,6 +14,43 @@
 //!   (returns the nearest edge sample, per §8.4.2.2.1).
 //!
 //! Clean-room: derived only from ITU-T Rec. H.264 (08/2024).
+
+/// One stored picture sample. Two bytes hold every bit depth of
+/// §7.4.2.1.1 (`BitDepthY` / `BitDepthC` ≤ 14) at half the
+/// memory traffic of the `i32` the arithmetic uses.
+pub type Sample = u16;
+
+/// Narrow a reconstructed sample (already clipped to its bit depth by
+/// the Clip1 of the producing process) to its stored form. Every
+/// producer clips first, so the saturation is a guard, never a change of
+/// value; debug builds assert it.
+#[inline(always)]
+pub fn to_sample(v: i32) -> Sample {
+    debug_assert!(
+        (0..=Sample::MAX as i32).contains(&v),
+        "sample {v} outside the stored range"
+    );
+    v.clamp(0, Sample::MAX as i32) as Sample
+}
+
+/// Narrow a row of clipped `i32` samples into stored samples
+/// ([`to_sample`] for each; `dst` and `src` have equal lengths).
+#[inline]
+pub fn store_samples(dst: &mut [Sample], src: &[i32]) {
+    debug_assert_eq!(dst.len(), src.len());
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = to_sample(s);
+    }
+}
+
+/// Widen a row of stored samples into `i32` working samples.
+#[inline]
+pub fn load_samples(dst: &mut [i32], src: &[Sample]) {
+    debug_assert_eq!(dst.len(), src.len());
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = i32::from(s);
+    }
+}
 
 /// §8.4.1.2.1 Table 8-7 — `PicCodingStruct( X )` of a decoded picture:
 /// FLD (coded with `field_pic_flag` = 1), FRM (frame,
@@ -40,9 +79,9 @@ pub struct Picture {
     pub chroma_array_type: u32,
     pub bit_depth_luma: u32,
     pub bit_depth_chroma: u32,
-    pub luma: Vec<i32>,
-    pub cb: Vec<i32>,
-    pub cr: Vec<i32>,
+    pub luma: Vec<Sample>,
+    pub cb: Vec<Sample>,
+    pub cr: Vec<Sample>,
     /// §8.2.5.2 — set on the placeholder pictures synthesised to fill a
     /// gap in `frame_num`. Their samples are "not available for
     /// prediction of other pictures": a conforming bitstream never
@@ -206,7 +245,7 @@ impl Picture {
             self.bit_depth_luma,
             self.bit_depth_chroma,
         );
-        let take_rows = |src: &[i32], width: usize, height: usize| -> Vec<i32> {
+        let take_rows = |src: &[Sample], width: usize, height: usize| -> Vec<Sample> {
             let mut v = Vec::with_capacity(width * height / 2);
             for row in (usize::from(bottom)..height).step_by(2) {
                 v.extend_from_slice(&src[row * width..(row + 1) * width]);
@@ -285,7 +324,7 @@ impl Picture {
         }
         let xi = clip3_i32(0, self.width_in_samples as i32 - 1, x) as usize;
         let yi = clip3_i32(0, self.height_in_samples as i32 - 1, y) as usize;
-        self.luma[yi * (self.width_in_samples as usize) + xi]
+        i32::from(self.luma[yi * (self.width_in_samples as usize) + xi])
     }
 
     /// Clamped chroma Cb access (§6.2).
@@ -298,7 +337,7 @@ impl Picture {
         }
         let xi = clip3_i32(0, cw as i32 - 1, x) as usize;
         let yi = clip3_i32(0, ch as i32 - 1, y) as usize;
-        self.cb[yi * (cw as usize) + xi]
+        i32::from(self.cb[yi * (cw as usize) + xi])
     }
 
     /// Clamped chroma Cr access.
@@ -311,7 +350,7 @@ impl Picture {
         }
         let xi = clip3_i32(0, cw as i32 - 1, x) as usize;
         let yi = clip3_i32(0, ch as i32 - 1, y) as usize;
-        self.cr[yi * (cw as usize) + xi]
+        i32::from(self.cr[yi * (cw as usize) + xi])
     }
 
     /// Write a luma sample. Out-of-bounds writes are silently ignored
@@ -328,7 +367,7 @@ impl Picture {
             return;
         }
         let idx = (yi as usize) * (self.width_in_samples as usize) + (xi as usize);
-        self.luma[idx] = v;
+        self.luma[idx] = to_sample(v);
     }
 
     /// Write a Cb sample.
@@ -345,7 +384,7 @@ impl Picture {
             return;
         }
         let idx = (yi as usize) * (cw as usize) + (xi as usize);
-        self.cb[idx] = v;
+        self.cb[idx] = to_sample(v);
     }
 
     /// Write a Cr sample.
@@ -362,7 +401,7 @@ impl Picture {
             return;
         }
         let idx = (yi as usize) * (cw as usize) + (xi as usize);
-        self.cr[idx] = v;
+        self.cr[idx] = to_sample(v);
     }
 
     /// Fetch the colocated L0 MV + refIdx for the 4x4 block at

@@ -50,10 +50,9 @@ use crate::mv_deriv::{
     Mv, MvpredInputs, MvpredShape, NeighbourMv, derive_b_spatial_direct_with_d,
     derive_median_mvpred, derive_mvpred_with_d, derive_p_skip_mv_with_d,
 };
-use crate::picture::Picture;
+use crate::picture::{Picture, Sample, to_sample};
 use crate::pps::Pps;
 use crate::ref_store::RefPicProvider;
-use crate::simd::interpolate_luma;
 use crate::slice_data::SliceData;
 use crate::slice_header::{PredWeightTable, SliceHeader, SliceType};
 use crate::sp_transform::{
@@ -598,7 +597,7 @@ impl MbWriter {
             let wu = w as usize;
             for y in 0..16usize {
                 let o = (self.mb_py as usize + y * ys as usize) * wu + self.mb_px as usize;
-                pic.luma[o..o + 16].copy_from_slice(&samples[y * 16..y * 16 + 16]);
+                crate::picture::store_samples(&mut pic.luma[o..o + 16], &samples[y * 16..y * 16 + 16]);
             }
         } else {
             for y in 0..16 {
@@ -641,7 +640,7 @@ impl MbWriter {
             let dst = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
             for y in 0..h {
                 let o = (y0 as usize + y * ys as usize) * cw as usize + x0 as usize;
-                dst[o..o + w].copy_from_slice(&samples[y * w..y * w + w]);
+                crate::picture::store_samples(&mut dst[o..o + w], &samples[y * w..y * w + w]);
             }
         } else {
             for y in 0..h {
@@ -1057,9 +1056,9 @@ fn synth_mb_inter<R: RefPicProvider>(
 /// worker of the inter sample stage.
 struct MbRowBand<'a> {
     mb_y: u32,
-    luma: &'a mut [i32],
-    cb: &'a mut [i32],
-    cr: &'a mut [i32],
+    luma: &'a mut [Sample],
+    cb: &'a mut [Sample],
+    cr: &'a mut [Sample],
 }
 
 /// Whether [`reconstruct_slice_no_deblock_threaded`] can split this
@@ -1218,9 +1217,9 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
     }
     let mut bands: Vec<Option<MbRowBand<'_>>> = Vec::new();
     {
-        let mut luma_rest: &mut [i32] = &mut pic.luma;
-        let mut cb_rest: &mut [i32] = &mut pic.cb;
-        let mut cr_rest: &mut [i32] = &mut pic.cr;
+        let mut luma_rest: &mut [Sample] = &mut pic.luma;
+        let mut cb_rest: &mut [Sample] = &mut pic.cb;
+        let mut cr_rest: &mut [Sample] = &mut pic.cr;
         let mut consumed_rows = 0u32;
         for (mb_y, _) in &rows {
             let skip = (*mb_y - consumed_rows) as usize;
@@ -6570,7 +6569,7 @@ fn mc_luma_partition(
     // §8.4.2.1 — field view of a stored frame: rows of one parity,
     // exposed zero-copy as a doubled-stride half-height plane.
     let stride = ref_pic.width_in_samples as usize;
-    let (src, src_stride, src_h): (&[i32], usize, usize) = match field {
+    let (src, src_stride, src_h): (&[Sample], usize, usize) = match field {
         Some(parity) => (
             &ref_pic.luma[(parity as usize) * stride..],
             stride * 2,
@@ -6764,38 +6763,29 @@ fn mc_chroma_partition_444(
 
     // §8.4.2.2.1 — luma interpolation process applied to each chroma
     // plane (the same 6-tap kernel `mc_luma_partition` drives).
-    interpolate_luma(
-        &ref_pic.cb[row_off..],
-        src_stride,
-        cw,
-        src_h,
-        int_x,
-        int_y,
-        x_frac,
-        y_frac,
-        w,
-        h,
-        bit_depth,
-        dst_cb,
-        w as usize,
-    )
-    .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
-    interpolate_luma(
-        &ref_pic.cr[row_off..],
-        src_stride,
-        cw,
-        src_h,
-        int_x,
-        int_y,
-        x_frac,
-        y_frac,
-        w,
-        h,
-        bit_depth,
-        dst_cr,
-        w as usize,
-    )
-    .map_err(|_| ReconstructError::IntraPredOutOfBounds)?;
+    if w == 0 || h == 0 || w > 16 || h > 16 || !w.is_multiple_of(4) || !h.is_multiple_of(4) {
+        return Err(ReconstructError::IntraPredOutOfBounds);
+    }
+    for (plane, dst) in [(&ref_pic.cb, dst_cb), (&ref_pic.cr, dst_cr)] {
+        let src = crate::mc::PlaneSrc::Flat {
+            data: &plane[row_off..],
+            stride: src_stride,
+            width: cw,
+            height: src_h,
+        };
+        crate::mc::luma(
+            &src,
+            int_x,
+            int_y,
+            x_frac,
+            y_frac,
+            w as usize,
+            h as usize,
+            (1i32 << bit_depth) - 1,
+            dst,
+            w as usize,
+        );
+    }
     Ok(())
 }
 
@@ -10301,9 +10291,9 @@ fn mv_delta_below_4(a: (i16, i16), b: (i16, i16), field_units: bool) -> bool {
 /// `4 / SubHeightC` chroma rows of each chroma plane, once no later
 /// edge of its own row can change them.
 struct DeblockHalo {
-    luma: [i32; 64],
-    cb: [i32; 32],
-    cr: [i32; 32],
+    luma: [Sample; 64],
+    cb: [Sample; 32],
+    cr: [Sample; 32],
 }
 
 /// Per-row count of published [`DeblockHalo`] columns, with a condvar
@@ -10374,9 +10364,9 @@ impl RowProgress {
 
 /// One macroblock row's own sample rows of the picture.
 struct DeblockRowSink<'a> {
-    luma: &'a mut [i32],
-    cb: &'a mut [i32],
-    cr: &'a mut [i32],
+    luma: &'a mut [Sample],
+    cb: &'a mut [Sample],
+    cr: &'a mut [Sample],
     luma_bs: &'a mut [u8],
 }
 
@@ -10385,9 +10375,9 @@ struct DeblockRowSink<'a> {
 /// back into the picture after every row is done.
 struct DeblockRowBack {
     row: usize,
-    luma: Vec<i32>,
-    cb: Vec<i32>,
-    cr: Vec<i32>,
+    luma: Vec<Sample>,
+    cb: Vec<Sample>,
+    cr: Vec<Sample>,
 }
 
 /// §8.7 — deblock a non-MBAFF picture (ChromaArrayType 0, 1 or 2) by
@@ -10449,9 +10439,9 @@ fn deblock_rows_threaded(
     let mut luma_bs = vec![BS_NOT_DERIVED; mb_w * mb_h * 32];
     let mut sinks: Vec<Option<DeblockRowSink<'_>>> = Vec::with_capacity(mb_h);
     {
-        let mut l_rest: &mut [i32] = &mut pic.luma;
-        let mut b_rest: &mut [i32] = &mut pic.cb;
-        let mut r_rest: &mut [i32] = &mut pic.cr;
+        let mut l_rest: &mut [Sample] = &mut pic.luma;
+        let mut b_rest: &mut [Sample] = &mut pic.cb;
+        let mut r_rest: &mut [Sample] = &mut pic.cr;
         let mut s_rest: &mut [u8] = &mut luma_bs;
         for _ in 0..mb_h {
             let (l, lr) = std::mem::take(&mut l_rest).split_at_mut(16 * wu);
@@ -12032,14 +12022,14 @@ fn filter_vertical_edge_luma(
         for dy in 0..4 {
             let y = (y0 + dy) as usize;
             let row = &mut pic.luma[y * stride + base_x..y * stride + base_x + 8];
-            let p3 = row[0];
-            let q3 = row[7];
-            let mut p2 = row[1];
-            let mut p1 = row[2];
-            let mut p0 = row[3];
-            let mut q0 = row[4];
-            let mut q1 = row[5];
-            let mut q2 = row[6];
+            let p3 = i32::from(row[0]);
+            let q3 = i32::from(row[7]);
+            let mut p2 = i32::from(row[1]);
+            let mut p1 = i32::from(row[2]);
+            let mut p0 = i32::from(row[3]);
+            let mut q0 = i32::from(row[4]);
+            let mut q1 = i32::from(row[5]);
+            let mut q2 = i32::from(row[6]);
             filter_edge(
                 Plane::Luma,
                 EdgeSamples {
@@ -12054,12 +12044,12 @@ fn filter_vertical_edge_luma(
                 },
                 params,
             );
-            row[1] = p2;
-            row[2] = p1;
-            row[3] = p0;
-            row[4] = q0;
-            row[5] = q1;
-            row[6] = q2;
+            row[1] = to_sample(p2);
+            row[2] = to_sample(p1);
+            row[3] = to_sample(p0);
+            row[4] = to_sample(q0);
+            row[5] = to_sample(q1);
+            row[6] = to_sample(q2);
         }
         return;
     }
@@ -12140,14 +12130,14 @@ fn filter_horizontal_edge_luma(
             let x = (x0 + dx) as usize;
             let p3_idx = ((edge_y - 4) as usize) * stride + x;
             let q3_idx = ((edge_y + 3) as usize) * stride + x;
-            let p3 = pic.luma[p3_idx];
-            let q3 = pic.luma[q3_idx];
-            let mut p2 = pic.luma[((edge_y - 3) as usize) * stride + x];
-            let mut p1 = pic.luma[((edge_y - 2) as usize) * stride + x];
-            let mut p0 = pic.luma[((edge_y - 1) as usize) * stride + x];
-            let mut q0 = pic.luma[((edge_y) as usize) * stride + x];
-            let mut q1 = pic.luma[((edge_y + 1) as usize) * stride + x];
-            let mut q2 = pic.luma[((edge_y + 2) as usize) * stride + x];
+            let p3 = i32::from(pic.luma[p3_idx]);
+            let q3 = i32::from(pic.luma[q3_idx]);
+            let mut p2 = i32::from(pic.luma[((edge_y - 3) as usize) * stride + x]);
+            let mut p1 = i32::from(pic.luma[((edge_y - 2) as usize) * stride + x]);
+            let mut p0 = i32::from(pic.luma[((edge_y - 1) as usize) * stride + x]);
+            let mut q0 = i32::from(pic.luma[((edge_y) as usize) * stride + x]);
+            let mut q1 = i32::from(pic.luma[((edge_y + 1) as usize) * stride + x]);
+            let mut q2 = i32::from(pic.luma[((edge_y + 2) as usize) * stride + x]);
             filter_edge(
                 Plane::Luma,
                 EdgeSamples {
@@ -12162,12 +12152,12 @@ fn filter_horizontal_edge_luma(
                 },
                 params,
             );
-            pic.luma[((edge_y - 3) as usize) * stride + x] = p2;
-            pic.luma[((edge_y - 2) as usize) * stride + x] = p1;
-            pic.luma[((edge_y - 1) as usize) * stride + x] = p0;
-            pic.luma[((edge_y) as usize) * stride + x] = q0;
-            pic.luma[((edge_y + 1) as usize) * stride + x] = q1;
-            pic.luma[((edge_y + 2) as usize) * stride + x] = q2;
+            pic.luma[((edge_y - 3) as usize) * stride + x] = to_sample(p2);
+            pic.luma[((edge_y - 2) as usize) * stride + x] = to_sample(p1);
+            pic.luma[((edge_y - 1) as usize) * stride + x] = to_sample(p0);
+            pic.luma[((edge_y) as usize) * stride + x] = to_sample(q0);
+            pic.luma[((edge_y + 1) as usize) * stride + x] = to_sample(q1);
+            pic.luma[((edge_y + 2) as usize) * stride + x] = to_sample(q2);
         }
         return;
     }
@@ -12241,18 +12231,18 @@ fn filter_chroma_vertical_rows(
     if edge_x >= 4 && edge_x + 4 <= cw && y0 >= 0 && y0 + rows <= ch {
         let stride = cw as usize;
         let base_x = (edge_x - 4) as usize;
-        let buf: &mut [i32] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+        let buf: &mut [Sample] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
         for dy in 0..rows {
             let y = (y0 + dy) as usize;
             let row = &mut buf[y * stride + base_x..y * stride + base_x + 8];
-            let p3 = row[0];
-            let q3 = row[7];
-            let mut p2 = row[1];
-            let mut p1 = row[2];
-            let mut p0 = row[3];
-            let mut q0 = row[4];
-            let mut q1 = row[5];
-            let mut q2 = row[6];
+            let p3 = i32::from(row[0]);
+            let q3 = i32::from(row[7]);
+            let mut p2 = i32::from(row[1]);
+            let mut p1 = i32::from(row[2]);
+            let mut p0 = i32::from(row[3]);
+            let mut q0 = i32::from(row[4]);
+            let mut q1 = i32::from(row[5]);
+            let mut q2 = i32::from(row[6]);
             filter_edge(
                 Plane::Chroma,
                 EdgeSamples {
@@ -12268,10 +12258,10 @@ fn filter_chroma_vertical_rows(
                 params,
             );
             // Chroma-style filter only updates p1/p0/q0/q1.
-            row[2] = p1;
-            row[3] = p0;
-            row[4] = q0;
-            row[5] = q1;
+            row[2] = to_sample(p1);
+            row[3] = to_sample(p0);
+            row[4] = to_sample(q0);
+            row[5] = to_sample(q1);
         }
         return;
     }
@@ -12357,17 +12347,17 @@ fn filter_chroma_horizontal_cols(
     // Fast in-bounds path.
     if x0 >= 0 && x0 + cols <= cw && edge_y >= 4 && edge_y + 4 <= ch {
         let stride = cw as usize;
-        let buf: &mut [i32] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+        let buf: &mut [Sample] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
         for dx in 0..cols {
             let x = (x0 + dx) as usize;
-            let p3 = buf[((edge_y - 4) as usize) * stride + x];
-            let q3 = buf[((edge_y + 3) as usize) * stride + x];
-            let mut p2 = buf[((edge_y - 3) as usize) * stride + x];
-            let mut p1 = buf[((edge_y - 2) as usize) * stride + x];
-            let mut p0 = buf[((edge_y - 1) as usize) * stride + x];
-            let mut q0 = buf[((edge_y) as usize) * stride + x];
-            let mut q1 = buf[((edge_y + 1) as usize) * stride + x];
-            let mut q2 = buf[((edge_y + 2) as usize) * stride + x];
+            let p3 = i32::from(buf[((edge_y - 4) as usize) * stride + x]);
+            let q3 = i32::from(buf[((edge_y + 3) as usize) * stride + x]);
+            let mut p2 = i32::from(buf[((edge_y - 3) as usize) * stride + x]);
+            let mut p1 = i32::from(buf[((edge_y - 2) as usize) * stride + x]);
+            let mut p0 = i32::from(buf[((edge_y - 1) as usize) * stride + x]);
+            let mut q0 = i32::from(buf[((edge_y) as usize) * stride + x]);
+            let mut q1 = i32::from(buf[((edge_y + 1) as usize) * stride + x]);
+            let mut q2 = i32::from(buf[((edge_y + 2) as usize) * stride + x]);
             filter_edge(
                 Plane::Chroma,
                 EdgeSamples {
@@ -12382,10 +12372,10 @@ fn filter_chroma_horizontal_cols(
                 },
                 params,
             );
-            buf[((edge_y - 2) as usize) * stride + x] = p1;
-            buf[((edge_y - 1) as usize) * stride + x] = p0;
-            buf[((edge_y) as usize) * stride + x] = q0;
-            buf[((edge_y + 1) as usize) * stride + x] = q1;
+            buf[((edge_y - 2) as usize) * stride + x] = to_sample(p1);
+            buf[((edge_y - 1) as usize) * stride + x] = to_sample(p0);
+            buf[((edge_y) as usize) * stride + x] = to_sample(q0);
+            buf[((edge_y + 1) as usize) * stride + x] = to_sample(q1);
         }
         return;
     }
@@ -13937,8 +13927,8 @@ mod tests {
                 info.qp_y = 46;
             }
         }
-        let before_cb: Vec<i32> = pic.cb.clone();
-        let before_cr: Vec<i32> = pic.cr.clone();
+        let before_cb: Vec<Sample> = pic.cb.clone();
+        let before_cr: Vec<Sample> = pic.cr.clone();
         deblock_plane_chroma_444(
             &mut pic,
             &grid,
