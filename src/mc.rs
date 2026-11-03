@@ -106,6 +106,32 @@ fn gather(
 ) {
     let width = src.width() as i32;
     let ymax = src.height() as i32 - 1;
+    // Interior window of a flat plane (nearly every block): no
+    // coordinate clamping, and the row length is dispatched once for the
+    // whole window instead of once per row.
+    if let PlaneSrc::Flat { data, stride, .. } = *src
+        && x0 >= 0
+        && y0 >= 0
+        && x0 + ww as i32 <= width
+        && y0 + wh as i32 <= ymax + 1
+    {
+        let base = y0 as usize * stride + x0 as usize;
+        match ww {
+            4 => rows_fixed::<4>(data, base, stride, wh, out, ostride),
+            8 => rows_fixed::<8>(data, base, stride, wh, out, ostride),
+            9 => rows_fixed::<9>(data, base, stride, wh, out, ostride),
+            16 => rows_fixed::<16>(data, base, stride, wh, out, ostride),
+            17 => rows_fixed::<17>(data, base, stride, wh, out, ostride),
+            21 => rows_fixed::<21>(data, base, stride, wh, out, ostride),
+            _ => {
+                for r in 0..wh {
+                    let s = &data[base + r * stride..base + r * stride + ww];
+                    crate::picture::load_samples(&mut out[r * ostride..r * ostride + ww], s);
+                }
+            }
+        }
+        return;
+    }
     let inside_x = x0 >= 0 && x0 + ww as i32 <= width;
     for r in 0..wh {
         let y = (y0 + r as i32).clamp(0, ymax) as usize;
@@ -117,6 +143,32 @@ fn gather(
             for (c, slot) in o.iter_mut().enumerate() {
                 *slot = i32::from(row[(x0 + c as i32).clamp(0, width - 1) as usize]);
             }
+        }
+    }
+}
+
+/// Widen `wh` rows of `N` stored samples, the first starting at
+/// `data[base]` and each `stride` after the previous, into `out` (row
+/// stride `ostride`). `N` is a compile-time constant so each row is a
+/// few widening vector loads and stores.
+#[inline(always)]
+fn rows_fixed<const N: usize>(
+    data: &[Sample],
+    base: usize,
+    stride: usize,
+    wh: usize,
+    out: &mut [i32],
+    ostride: usize,
+) {
+    for r in 0..wh {
+        let s: &[Sample; N] = data[base + r * stride..][..N]
+            .try_into()
+            .expect("row length");
+        let d: &mut [i32; N] = (&mut out[r * ostride..][..N])
+            .try_into()
+            .expect("row length");
+        for (d, &s) in d.iter_mut().zip(s) {
+            *d = i32::from(s);
         }
     }
 }
