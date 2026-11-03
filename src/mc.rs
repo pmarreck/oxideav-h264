@@ -235,6 +235,15 @@ pub(crate) fn luma(
     let ws = w + 5;
     let mut win = [0i32; WIN * WIN];
     gather(src, int_x - 2, int_y - 2, ws, h + 5, &mut win, ws);
+    // Luma partitions are 4, 8 or 16 samples wide: a fixed width gives
+    // each row loop a fixed trip count and no per-sample branching, so
+    // it compiles to vector arithmetic.
+    match w {
+        4 => return luma_fixed::<4, 9>(&win, x_frac, y_frac, h, max_v, dst, dst_stride),
+        8 => return luma_fixed::<8, 13>(&win, x_frac, y_frac, h, max_v, dst, dst_stride),
+        16 => return luma_fixed::<16, 21>(&win, x_frac, y_frac, h, max_v, dst, dst_stride),
+        _ => {}
+    }
     // G at (x, y) of the block is win[(y + 2) * ws + x + 2].
     let g = |x: usize, y: usize| win[(y + 2) * ws + x + 2];
     // eq. 8-241 — b1 at (x, y + dy) (dy = 0: b, dy = 1: s).
@@ -346,6 +355,120 @@ pub(crate) fn luma(
                     let hh = half(h1(x + hx, y));
                     *d = (b + hh + 1) >> 1;
                 }
+            }
+        }
+    }
+}
+
+/// The 6-tap filter (eqs. 8-241 / 8-242) over `W` consecutive outputs,
+/// output `x` from `r[x..x + 6]`.
+#[inline(always)]
+fn tap6_row<const W: usize>(r: &[i32]) -> [i32; W] {
+    let r = &r[..W + 5];
+    std::array::from_fn(|x| tap6(r[x], r[x + 1], r[x + 2], r[x + 3], r[x + 4], r[x + 5]))
+}
+
+/// The 6-tap filter down six rows of `W` samples each.
+#[inline(always)]
+fn tap6_cols<const W: usize>(rows: [&[i32]; 6]) -> [i32; W] {
+    let [a, b, c, d, e, f] = rows.map(|r| &r[..W]);
+    std::array::from_fn(|x| tap6(a[x], b[x], c[x], d[x], e[x], f[x]))
+}
+
+/// [`luma`] for a block `W` samples wide, on its gathered window `win`
+/// (row stride `WS` = `W` + 5). Each row is computed as whole arrays,
+/// with the fractional position chosen outside the sample loops.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn luma_fixed<const W: usize, const WS: usize>(
+    win: &[i32],
+    x_frac: u8,
+    y_frac: u8,
+    h: usize,
+    max_v: i32,
+    dst: &mut [i32],
+    dst_stride: usize,
+) {
+    debug_assert_eq!(WS, W + 5);
+    let row = |yy: usize| -> &[i32] { &win[yy * WS..yy * WS + WS] };
+    let half = |v: i32| clip1((v + 16) >> 5, max_v);
+    let avg = |a: i32, b: i32| (a + b + 1) >> 1;
+    let out = |dst: &mut [i32], y: usize, v: [i32; W]| {
+        dst[y * dst_stride..y * dst_stride + W].copy_from_slice(&v);
+    };
+    // Vertical 6-tap of window columns `x0..x0 + W` at block row `y`.
+    let h1 = |x0: usize, y: usize| -> [i32; W] {
+        tap6_cols::<W>([0, 1, 2, 3, 4, 5].map(|k| &row(y + k)[x0..]))
+    };
+    match (x_frac, y_frac) {
+        // a / b / c — horizontal half sample, averaged with G or H.
+        (_, 0) => {
+            for y in 0..h {
+                let r = row(y + 2);
+                let b = tap6_row::<W>(r).map(half);
+                let v: [i32; W] = match x_frac {
+                    2 => b,
+                    1 => std::array::from_fn(|x| avg(r[x + 2], b[x])),
+                    _ => std::array::from_fn(|x| avg(r[x + 3], b[x])),
+                };
+                out(dst, y, v);
+            }
+        }
+        // d / h / n — vertical half sample, averaged with G or M.
+        (0, _) => {
+            for y in 0..h {
+                let hh = h1(2, y).map(half);
+                let v: [i32; W] = match y_frac {
+                    2 => hh,
+                    1 => {
+                        let g = &row(y + 2)[2..];
+                        std::array::from_fn(|x| avg(g[x], hh[x]))
+                    }
+                    _ => {
+                        let g = &row(y + 3)[2..];
+                        std::array::from_fn(|x| avg(g[x], hh[x]))
+                    }
+                };
+                out(dst, y, v);
+            }
+        }
+        // f / j / q — j from the b1 intermediates (eq. 8-246), averaged
+        // with b or s.
+        (2, _) => {
+            let mut mid = [[0i32; W]; WIN];
+            for (yy, m) in mid.iter_mut().enumerate().take(h + 5) {
+                *m = tap6_row::<W>(row(yy));
+            }
+            for y in 0..h {
+                let j1 = tap6_cols::<W>([0, 1, 2, 3, 4, 5].map(|k| &mid[y + k][..]));
+                let j = j1.map(|v| clip1((v + 512) >> 10, max_v));
+                let side = &mid[y + if y_frac == 1 { 2 } else { 3 }];
+                let v: [i32; W] = match y_frac {
+                    2 => j,
+                    _ => std::array::from_fn(|x| avg(half(side[x]), j[x])),
+                };
+                out(dst, y, v);
+            }
+        }
+        // i / k — j from the h1 intermediates (eq. 8-245), averaged
+        // with h or m.
+        (_, 2) => {
+            let side = if x_frac == 1 { 2 } else { 3 };
+            for y in 0..h {
+                let m: [i32; WS] = tap6_cols::<WS>([0, 1, 2, 3, 4, 5].map(|k| row(y + k)));
+                let j = tap6_row::<W>(&m).map(|v| clip1((v + 512) >> 10, max_v));
+                let s = &m[side..];
+                out(dst, y, std::array::from_fn(|x| avg(half(s[x]), j[x])));
+            }
+        }
+        // e / g / p / r — diagonal averages of b or s with h or m.
+        _ => {
+            let by = if y_frac == 1 { 2 } else { 3 };
+            let hx = if x_frac == 1 { 2 } else { 3 };
+            for y in 0..h {
+                let b = tap6_row::<W>(row(y + by)).map(half);
+                let hh = h1(hx, y).map(half);
+                out(dst, y, std::array::from_fn(|x| avg(b[x], hh[x])));
             }
         }
     }
