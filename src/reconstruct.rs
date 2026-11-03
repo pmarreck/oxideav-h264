@@ -5672,6 +5672,144 @@ impl CombineOp {
     }
 }
 
+/// §8.4.2.3.2 — one row of weighted prediction in the shape every
+/// weighted form shares: `d[i] = Clip3(0, max, ((a[i] * wa + b[i] * wb +
+/// round) >> shift) + off)`, where `b` is `None` for the constant 1 (the
+/// single-list eqs. 8-274 / 8-275 put their rounding term in `wb`).
+/// Samples are at most 14 bits; conforming weights (-128..=128) fit `i16`.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn weighted_pair_row(
+    d: &mut [i32],
+    a: &[i32],
+    b: Option<&[i32]>,
+    wa: i32,
+    wb: i32,
+    round: i32,
+    shift: u32,
+    off: i32,
+    max: i32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // pred_weight_table weights are not range-checked by the parser:
+        // a malformed stream's out-of-range weight takes the 32-bit path.
+        if i16::try_from(wa).is_ok() && i16::try_from(wb).is_ok() && max <= i32::from(i16::MAX) {
+            weighted_pair_row_sse2(d, a, b, wa, wb, round, shift, off, max);
+        } else {
+            weighted_pair_row_scalar(d, a, b, wa, wb, round, shift, off, max);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        weighted_pair_row_scalar(d, a, b, wa, wb, round, shift, off, max);
+    }
+}
+
+/// [`weighted_pair_row`], one sample at a time: the reference form, and
+/// the implementation where 32-bit vector multiplies are available.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn weighted_pair_row_scalar(
+    d: &mut [i32],
+    a: &[i32],
+    b: Option<&[i32]>,
+    wa: i32,
+    wb: i32,
+    round: i32,
+    shift: u32,
+    off: i32,
+    max: i32,
+) {
+    match b {
+        Some(b) => {
+            for ((d, &a), &b) in d.iter_mut().zip(a).zip(b) {
+                *d = (((a * wa + b * wb + round) >> shift) + off).clamp(0, max);
+            }
+        }
+        None => {
+            for (d, &a) in d.iter_mut().zip(a) {
+                *d = (((a * wa + wb + round) >> shift) + off).clamp(0, max);
+            }
+        }
+    }
+}
+
+/// [`weighted_pair_row`] four samples at a time with SSE2, which every
+/// x86-64 CPU has but which lacks a 32-bit vector multiply: each `(a, b)`
+/// pair goes into 16-bit lanes and `pmaddwd` forms `a * wa + b * wb`
+/// exactly in 32 bits. The final clip saturates to 16 bits and clamps
+/// there, which equals the 32-bit `Clip3(0, max, ..)` for `max` < 2^15.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn weighted_pair_row_sse2(
+    d: &mut [i32],
+    a: &[i32],
+    b: Option<&[i32]>,
+    wa: i32,
+    wb: i32,
+    round: i32,
+    shift: u32,
+    off: i32,
+    max: i32,
+) {
+    use core::arch::x86_64::{
+        __m128i, _mm_add_epi32, _mm_cvtsi32_si128, _mm_loadu_si128, _mm_madd_epi16, _mm_max_epi16,
+        _mm_min_epi16, _mm_packs_epi32, _mm_set1_epi16, _mm_set1_epi32, _mm_setzero_si128,
+        _mm_sra_epi32, _mm_storeu_si128, _mm_unpacklo_epi16,
+    };
+    debug_assert!(a.len() == d.len() && b.is_none_or(|b| b.len() == d.len()));
+    debug_assert!(i16::try_from(wa).is_ok() && i16::try_from(wb).is_ok());
+    debug_assert!((0..=i32::from(i16::MAX)).contains(&max));
+    let n4 = d.len() / 4 * 4;
+    // SAFETY: SSE2 is part of every x86-64 target, so the intrinsics are
+    // always available; the only memory accesses are the unaligned loads
+    // and stores of the bounds-checked four-element arrays below.
+    unsafe {
+        // Each 32-bit lane holds the 16-bit pair (wa, wb), low half first,
+        // matching the (a, b) interleave below.
+        let weights = _mm_set1_epi32((wa as u16 as u32 | (wb as u16 as u32) << 16) as i32);
+        let round_v = _mm_set1_epi32(round);
+        let off_v = _mm_set1_epi32(off);
+        let shift_v = _mm_cvtsi32_si128(shift as i32);
+        let zero = _mm_setzero_si128();
+        let max_v = _mm_set1_epi16(max as i16);
+        let ones = _mm_set1_epi32(1);
+        for i in (0..n4).step_by(4) {
+            let a4: &[i32; 4] = a[i..i + 4].try_into().expect("four samples");
+            let av = _mm_loadu_si128(a4.as_ptr().cast::<__m128i>());
+            let bv = match b {
+                Some(b) => {
+                    let b4: &[i32; 4] = b[i..i + 4].try_into().expect("four samples");
+                    _mm_loadu_si128(b4.as_ptr().cast::<__m128i>())
+                }
+                None => ones,
+            };
+            let pairs = _mm_unpacklo_epi16(_mm_packs_epi32(av, av), _mm_packs_epi32(bv, bv));
+            let sum = _mm_add_epi32(_mm_madd_epi16(pairs, weights), round_v);
+            let v = _mm_add_epi32(_mm_sra_epi32(sum, shift_v), off_v);
+            let v16 = _mm_min_epi16(_mm_max_epi16(_mm_packs_epi32(v, v), zero), max_v);
+            let d4: &mut [i32; 4] = (&mut d[i..i + 4]).try_into().expect("four samples");
+            _mm_storeu_si128(
+                d4.as_mut_ptr().cast::<__m128i>(),
+                _mm_unpacklo_epi16(v16, zero),
+            );
+        }
+    }
+    weighted_pair_row_scalar(
+        &mut d[n4..],
+        &a[n4..],
+        b.map(|b| &b[n4..]),
+        wa,
+        wb,
+        round,
+        shift,
+        off,
+        max,
+    );
+}
+
 /// Write the `w`x`h` combination of `l0` / `l1` (tightly packed,
 /// stride `w`) into `dst` at `dst_off` with row stride `dst_stride`.
 /// The weighted forms equal [`weighted_pred_explicit`].
@@ -5745,9 +5883,9 @@ fn combine_partition(
                 };
                 each_row(dst, dst_off, dst_stride, l0, l1, w, h, |d, a, b| {
                     let src = if from_l0 { a } else { b };
-                    for (d, &p) in d.iter_mut().zip(src) {
-                        *d = (((p * e.weight + round) >> log2_wd) + e.offset).clamp(0, max_v);
-                    }
+                    // (p * w + round) >> logWD: the rounding term rides on
+                    // the constant second operand.
+                    weighted_pair_row(d, src, None, e.weight, round, 0, log2_wd, e.offset, max_v);
                 })
             }
             BiPredMode::Bipred => {
@@ -5755,10 +5893,17 @@ fn combine_partition(
                 let round = 1i32 << log2_wd;
                 let off = (w0.offset + w1.offset + 1) >> 1;
                 each_row(dst, dst_off, dst_stride, l0, l1, w, h, |d, a, b| {
-                    for ((d, &p0), &p1) in d.iter_mut().zip(a).zip(b) {
-                        let sum = p0 * w0.weight + p1 * w1.weight + round;
-                        *d = ((sum >> (log2_wd + 1)) + off).clamp(0, max_v);
-                    }
+                    weighted_pair_row(
+                        d,
+                        a,
+                        Some(b),
+                        w0.weight,
+                        w1.weight,
+                        round,
+                        log2_wd + 1,
+                        off,
+                        max_v,
+                    );
                 })
             }
         },
@@ -12857,6 +13002,53 @@ mod tests {
     use crate::macroblock_layer::{
         Intra16x16, Macroblock, MbPred, MbType, PcmSamples, SubMbPred, SubMbType,
     };
+
+    /// The weighted-pair row kernel (scalar, and the SSE2 form on
+    /// x86-64) equals `Clip3(0, max, ((a * wa + b * wb + round) >> shift)
+    /// + off)` per sample, with `b` an array or the constant 1, for every
+    /// row length from 1 to 17 (vector tails), every shift used by
+    /// eqs. 8-274..8-276, weights over -128..=128 (and out-of-range ones a
+    /// malformed stream can carry), offsets past both clip bounds, and 8-,
+    /// 10- and 14-bit samples.
+    #[test]
+    fn weighted_pair_rows_match_the_per_sample_equation() {
+        let mut seed = 0x7f4a_7c15u32;
+        let mut next = |m: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % m
+        };
+        for round_no in 0..4000 {
+            let bit_depth = [8u32, 10, 14][round_no % 3];
+            let max = (1i32 << bit_depth) - 1;
+            let len = 1 + round_no % 17;
+            let a: Vec<i32> = (0..len).map(|_| next(max as u32 + 1) as i32).collect();
+            let b: Vec<i32> = (0..len).map(|_| next(max as u32 + 1) as i32).collect();
+            let shift = next(9);
+            // Mostly in-range weights; every tenth row carries a weight a
+            // malformed pred_weight_table could hold (it is not range-checked),
+            // which must still give the 32-bit result.
+            let wide = |w: i32| if round_no % 10 == 9 { w * 300 } else { w };
+            let (wa, wb) = (wide(next(257) as i32 - 128), wide(next(257) as i32 - 128));
+            let round = next(1 << shift.max(1)) as i32;
+            let off = next(4 * max as u32) as i32 - 2 * max;
+            let with_b = round_no % 2 == 0;
+            let want: Vec<i32> = (0..len)
+                .map(|i| {
+                    let bv = if with_b { b[i] } else { 1 };
+                    (((a[i] * wa + bv * wb + round) >> shift) + off).clamp(0, max)
+                })
+                .collect();
+            let b_arg = with_b.then_some(&b[..]);
+            let mut got = vec![-1i32; len];
+            weighted_pair_row_scalar(&mut got, &a, b_arg, wa, wb, round, shift, off, max);
+            assert_eq!(got, want, "scalar round {round_no}");
+            let mut got = vec![-1i32; len];
+            weighted_pair_row(&mut got, &a, b_arg, wa, wb, round, shift, off, max);
+            assert_eq!(got, want, "dispatched round {round_no}");
+        }
+    }
 
     /// The macroblock writers clip each sample to `0..=max` (the Clip1 of
     /// §8.5.14) as they store it, on the in-picture path and on the
