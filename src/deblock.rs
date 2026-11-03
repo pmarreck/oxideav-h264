@@ -522,6 +522,100 @@ fn filter_strong(samples: &mut EdgeSamples<'_>, alpha: i32, beta: i32, chroma_st
 }
 
 // --------------------------------------------------------------------
+// Line filter with thresholds computed once per edge segment
+// --------------------------------------------------------------------
+
+/// §8.7.2.2 — the thresholds one edge segment's lines share: `bS`, α and
+/// β (eqs. 8-454..8-459) and `tC0` (eqs. 8-461 / 8-462, zero for
+/// bS == 4), scaled to the bit depth, and the sample maximum for Clip1.
+/// Computing them once per segment instead of once per line is what
+/// [`filter_line`] exists for; the filtering itself is
+/// [`filter_edge`]'s, sample for sample.
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct EdgeThresholds {
+    pub bs: u8,
+    pub alpha: i32,
+    pub beta: i32,
+    pub tc0: i32,
+    pub max: i32,
+}
+
+impl EdgeThresholds {
+    /// Thresholds for `bs` (1..=4) at `qPav` with the slice's filter
+    /// offsets, per eqs. 8-454..8-462.
+    #[inline]
+    pub(crate) fn new(
+        bs: u8,
+        qp_avg: i32,
+        filter_offset_a: i32,
+        filter_offset_b: i32,
+        bit_depth: u32,
+    ) -> Self {
+        let index_a = clip3(0, 51, qp_avg + filter_offset_a);
+        let index_b = clip3(0, 51, qp_avg + filter_offset_b);
+        Self {
+            bs,
+            alpha: alpha_from_index(index_a, bit_depth),
+            beta: beta_from_index(index_b, bit_depth),
+            tc0: tc0_from(bs, index_a, bit_depth),
+            max: (1i32 << bit_depth) - 1,
+        }
+    }
+}
+
+/// §8.7.2.2..8.7.2.4 — filter one line `[p3, p2, p1, p0, q0, q1, q2,
+/// q3]` across an edge in place, with thresholds precomputed by
+/// [`EdgeThresholds::new`]. `chroma_style` is `chromaStyleFilteringFlag`
+/// (eq. 8-450). Equal to [`filter_edge`] for every input (bS ≥ 1).
+#[inline(always)]
+pub(crate) fn filter_line(s: &mut [i32; 8], t: &EdgeThresholds, chroma_style: bool) {
+    let [p3, p2, p1, p0, q0, q1, q2, q3] = *s;
+    // eq. 8-460 — filterSamplesFlag.
+    if (p0 - q0).abs() >= t.alpha || (p1 - p0).abs() >= t.beta || (q1 - q0).abs() >= t.beta {
+        return;
+    }
+    // eqs. 8-463 / 8-464.
+    let a_p = (p2 - p0).abs();
+    let a_q = (q2 - q0).abs();
+    if t.bs < 4 {
+        // §8.7.2.3 — eqs. 8-465..8-473.
+        let tc = if chroma_style {
+            t.tc0 + 1
+        } else {
+            t.tc0 + i32::from(a_p < t.beta) + i32::from(a_q < t.beta)
+        };
+        let delta = clip3(-tc, tc, (((q0 - p0) << 2) + (p1 - q1) + 4) >> 3);
+        s[3] = clip3(0, t.max, p0 + delta);
+        s[4] = clip3(0, t.max, q0 - delta);
+        if !chroma_style {
+            if a_p < t.beta {
+                s[2] = p1 + clip3(-t.tc0, t.tc0, (p2 + ((p0 + q0 + 1) >> 1) - (p1 << 1)) >> 1);
+            }
+            if a_q < t.beta {
+                s[5] = q1 + clip3(-t.tc0, t.tc0, (q2 + ((p0 + q0 + 1) >> 1) - (q1 << 1)) >> 1);
+            }
+        }
+    } else {
+        // §8.7.2.4 — eqs. 8-476..8-489.
+        let near = (p0 - q0).abs() < ((t.alpha >> 2) + 2);
+        if !chroma_style && a_p < t.beta && near {
+            s[3] = (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3;
+            s[2] = (p2 + p1 + p0 + q0 + 2) >> 2;
+            s[1] = (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3;
+        } else {
+            s[3] = (2 * p1 + p0 + q1 + 2) >> 2;
+        }
+        if !chroma_style && a_q < t.beta && near {
+            s[4] = (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3;
+            s[5] = (p0 + q0 + q1 + q2 + 2) >> 2;
+            s[6] = (2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3;
+        } else {
+            s[4] = (2 * q1 + q0 + p1 + 2) >> 2;
+        }
+    }
+}
+
+// --------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------
 
@@ -558,6 +652,62 @@ mod tests {
             params,
         );
         [samples[0], p2, p1, p0, q0, q1, q2, samples[7]]
+    }
+
+    /// The precomputed-threshold line filter equals [`filter_edge`] for
+    /// every bS, every indexA / indexB the offsets and QPs can reach
+    /// (including the clipped ends), luma and chroma style, 8- and
+    /// 10-bit samples. The sample octets are drawn near the edge so both
+    /// the filtered and the unfiltered (`filterSamplesFlag == 0`) paths,
+    /// and the strong-filter refinements, are all exercised.
+    #[test]
+    fn line_filter_with_precomputed_thresholds_matches_filter_edge() {
+        let mut seed = 0x9e37_79b9u32;
+        let mut next = |m: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % m
+        };
+        let mut filtered = 0usize;
+        for bit_depth in [8u32, 10] {
+            let max = (1i32 << bit_depth) - 1;
+            for bs in 1..=4u8 {
+                for qp_avg in (-12..=51).step_by(3) {
+                    for (off_a, off_b) in [(0, 0), (-12, 12), (12, -12), (12, 12), (-6, -6)] {
+                        let params = FilterParams {
+                            bs,
+                            qp_avg,
+                            filter_offset_a: off_a,
+                            filter_offset_b: off_b,
+                            bit_depth,
+                        };
+                        let t = EdgeThresholds::new(bs, qp_avg, off_a, off_b, bit_depth);
+                        for plane in [Plane::Luma, Plane::Chroma] {
+                            for _ in 0..24 {
+                                let base = next(max as u32 + 1) as i32;
+                                let spread = 1 + next(48) as i32 * (1 << (bit_depth - 8));
+                                let mut s = [0i32; 8];
+                                for v in s.iter_mut() {
+                                    *v = (base + next(2 * spread as u32 + 1) as i32 - spread)
+                                        .clamp(0, max);
+                                }
+                                let want = run_filter(plane, s, params);
+                                let mut got = s;
+                                filter_line(&mut got, &t, plane == Plane::Chroma);
+                                filtered += usize::from(got != s);
+                                assert_eq!(
+                                    got, want,
+                                    "bs {bs} qp {qp_avg} offs ({off_a},{off_b}) {plane:?} {s:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Non-vacuity: a substantial share of the cases changed samples.
+        assert!(filtered > 5_000, "only {filtered} cases filtered");
     }
 
     // ---------------- Table spot-checks (§8.7.2.2 / Table 8-16,

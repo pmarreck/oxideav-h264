@@ -35,8 +35,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::deblock::{
-    BsInputs, EdgeSamples, FilterParams, Plane, alpha_from_index, beta_from_index,
-    derive_boundary_strength, filter_edge, tc0_from,
+    BsInputs, EdgeSamples, EdgeThresholds, FilterParams, Plane, alpha_from_index, beta_from_index,
+    derive_boundary_strength, filter_edge, filter_line, tc0_from,
 };
 use crate::inter_pred::{BiPredMode, WeightedEntry, weighted_pred_explicit};
 use crate::intra_pred::{
@@ -597,7 +597,10 @@ impl MbWriter {
             let wu = w as usize;
             for y in 0..16usize {
                 let o = (self.mb_py as usize + y * ys as usize) * wu + self.mb_px as usize;
-                crate::picture::store_samples(&mut pic.luma[o..o + 16], &samples[y * 16..y * 16 + 16]);
+                crate::picture::store_samples(
+                    &mut pic.luma[o..o + 16],
+                    &samples[y * 16..y * 16 + 16],
+                );
             }
         } else {
             for y in 0..16 {
@@ -5679,54 +5682,80 @@ fn combine_partition(
     bit_depth: u32,
 ) {
     let max_v = (1i32 << bit_depth) - 1;
-    for y in 0..h {
-        let d = &mut dst[dst_off + y * dst_stride..dst_off + y * dst_stride + w];
-        let a = &l0[y * w..y * w + w];
-        let b = &l1[y * w..y * w + w];
-        match op {
-            CombineOp::Zero => d.fill(0),
-            CombineOp::Copy0 => d.copy_from_slice(a),
-            CombineOp::Copy1 => d.copy_from_slice(b),
-            CombineOp::Avg => {
-                for ((d, &p0), &p1) in d.iter_mut().zip(a).zip(b) {
-                    *d = (p0 + p1 + 1) >> 1;
-                }
+    // The operation is chosen once per partition; each arm runs a plain
+    // row loop the compiler vectorizes (a per-row `match` defeated that).
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn each_row<F: Fn(&mut [i32], &[i32], &[i32])>(
+        dst: &mut [i32],
+        dst_off: usize,
+        dst_stride: usize,
+        l0: &[i32],
+        l1: &[i32],
+        w: usize,
+        h: usize,
+        f: F,
+    ) {
+        for y in 0..h {
+            let o = dst_off + y * dst_stride;
+            f(
+                &mut dst[o..o + w],
+                &l0[y * w..y * w + w],
+                &l1[y * w..y * w + w],
+            );
+        }
+    }
+    match op {
+        CombineOp::Zero => each_row(dst, dst_off, dst_stride, l0, l1, w, h, |d, _, _| d.fill(0)),
+        CombineOp::Copy0 => each_row(dst, dst_off, dst_stride, l0, l1, w, h, |d, a, _| {
+            d.copy_from_slice(a)
+        }),
+        CombineOp::Copy1 => each_row(dst, dst_off, dst_stride, l0, l1, w, h, |d, _, b| {
+            d.copy_from_slice(b)
+        }),
+        CombineOp::Avg => each_row(dst, dst_off, dst_stride, l0, l1, w, h, |d, a, b| {
+            for ((d, &p0), &p1) in d.iter_mut().zip(a).zip(b) {
+                *d = (p0 + p1 + 1) >> 1;
             }
-            CombineOp::Weighted {
-                mode,
-                w0,
-                w1,
-                log2_wd,
-            } => match mode {
-                BiPredMode::L0Only | BiPredMode::L1Only => {
-                    let (src, e) = if mode == BiPredMode::L0Only {
-                        (a, w0)
-                    } else {
-                        (b, w1)
-                    };
-                    if log2_wd >= 1 {
-                        // Eq. 8-274 / 8-275, logWD >= 1.
-                        let round = 1i32 << (log2_wd - 1);
-                        for (d, &p) in d.iter_mut().zip(src) {
-                            *d = (((p * e.weight + round) >> log2_wd) + e.offset).clamp(0, max_v);
-                        }
-                    } else {
-                        for (d, &p) in d.iter_mut().zip(src) {
-                            *d = (p * e.weight + e.offset).clamp(0, max_v);
-                        }
+        }),
+        CombineOp::Weighted {
+            mode,
+            w0,
+            w1,
+            log2_wd,
+        } => match mode {
+            BiPredMode::L0Only | BiPredMode::L1Only => {
+                let (from_l0, e) = if mode == BiPredMode::L0Only {
+                    (true, w0)
+                } else {
+                    (false, w1)
+                };
+                // Eq. 8-274 (logWD >= 1) / 8-275 (logWD == 0): with
+                // logWD == 0 the rounding term and shift vanish.
+                let round = if log2_wd >= 1 {
+                    1i32 << (log2_wd - 1)
+                } else {
+                    0
+                };
+                each_row(dst, dst_off, dst_stride, l0, l1, w, h, |d, a, b| {
+                    let src = if from_l0 { a } else { b };
+                    for (d, &p) in d.iter_mut().zip(src) {
+                        *d = (((p * e.weight + round) >> log2_wd) + e.offset).clamp(0, max_v);
                     }
-                }
-                BiPredMode::Bipred => {
-                    // Eq. 8-276.
-                    let round = 1i32 << log2_wd;
-                    let off = (w0.offset + w1.offset + 1) >> 1;
+                })
+            }
+            BiPredMode::Bipred => {
+                // Eq. 8-276.
+                let round = 1i32 << log2_wd;
+                let off = (w0.offset + w1.offset + 1) >> 1;
+                each_row(dst, dst_off, dst_stride, l0, l1, w, h, |d, a, b| {
                     for ((d, &p0), &p1) in d.iter_mut().zip(a).zip(b) {
                         let sum = p0 * w0.weight + p1 * w1.weight + round;
                         *d = ((sum >> (log2_wd + 1)) + off).clamp(0, max_v);
                     }
-                }
-            },
-        }
+                })
+            }
+        },
     }
 }
 
@@ -11031,48 +11060,66 @@ fn deblock_luma_mb_frame(
                 continue;
             }
             let p_off = if is_mb_edge { 3 } else { edge_off - 1 } as u32;
-            for seg in 0..4i32 {
-                let along = (if vertical { mb_y } else { mb_x }) * 16 + seg * 4;
-                if along >= if vertical { h } else { w } {
-                    break;
-                }
-                // 4x4 block coordinates (x, y) inside the p / q MBs.
-                let (pbx, pby, qbx, qby) = if vertical {
-                    (p_off, seg as u32, edge_off as u32, seg as u32)
+            // Segments inside the picture along the edge (a cropped last
+            // macroblock row / column may hold fewer than four).
+            let along0 = (if vertical { mb_y } else { mb_x }) * 16;
+            let segs = ((if vertical { h } else { w }) - along0 + 3)
+                .div_euclid(4)
+                .clamp(0, 4);
+            // §8.7.2.1 — the bS of the edge's segments. An intra / SP / SI
+            // side settles every segment at once (bS 4 on a macroblock
+            // edge of a frame, or a vertical one of a field; else 3);
+            // otherwise coded coefficients give 2 and differing motion 1.
+            let mut bs = [0u8; 4];
+            let intra_like = p_info.is_intra
+                || q_info.is_intra
+                || p_info.in_sp_si_slice
+                || q_info.in_sp_si_slice;
+            if intra_like {
+                let v = if is_mb_edge && (!field_pic || vertical) {
+                    4
                 } else {
-                    (seg as u32, p_off, seg as u32, edge_off as u32)
+                    3
                 };
-                let p_blk4_z = blk4_raster_index(pbx as u8, pby as u8) as usize;
-                let q_blk4_z = blk4_raster_index(qbx as u8, qby as u8) as usize;
-                let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
-                let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
-                let diff_ref_mv = !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
-                    && !(!is_mb_edge && *q_uniform.get_or_insert_with(|| uniform_motion(q_info)))
-                    && different_ref_or_mv_luma(
-                        p_info,
-                        q_info,
-                        pbx * 4,
-                        pby * 4,
-                        qbx * 4,
-                        qby * 4,
-                        field_pic,
-                    );
-                let bs = derive_boundary_strength(BsInputs {
-                    p_is_intra: p_info.is_intra,
-                    q_is_intra: q_info.is_intra,
-                    is_mb_edge,
-                    is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
-                    either_has_nonzero_coeffs: p_has_nz || q_has_nz,
-                    different_ref_or_mv: diff_ref_mv,
-                    mixed_mode_edge: false,
-                    vertical_edge: vertical,
-                    mbaff_or_field: field_pic,
-                    both_in_frame_mbs: !field_pic,
-                });
-                luma_bs[luma_bs_index(0, 0, 0, !vertical, edge_off, seg)] = bs;
+                bs[..segs as usize].fill(v);
+            } else {
+                for seg in 0..segs {
+                    // 4x4 block coordinates (x, y) inside the p / q MBs.
+                    let (pbx, pby, qbx, qby) = if vertical {
+                        (p_off, seg as u32, edge_off as u32, seg as u32)
+                    } else {
+                        (seg as u32, p_off, seg as u32, edge_off as u32)
+                    };
+                    let p_blk4_z = blk4_raster_index(pbx as u8, pby as u8);
+                    let q_blk4_z = blk4_raster_index(qbx as u8, qby as u8);
+                    let nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1
+                        || (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                    bs[seg as usize] = if nz {
+                        2
+                    } else if !is_mb_edge
+                        && *q_uniform.get_or_insert_with(|| uniform_motion(q_info))
+                    {
+                        0
+                    } else {
+                        u8::from(different_ref_or_mv_luma(
+                            p_info,
+                            q_info,
+                            pbx * 4,
+                            pby * 4,
+                            qbx * 4,
+                            qby * 4,
+                            field_pic,
+                        ))
+                    };
+                }
+            }
+            let rec = luma_bs_index(0, 0, 0, !vertical, edge_off, 0);
+            luma_bs[rec..rec + segs as usize].copy_from_slice(&bs[..segs as usize]);
+            for (seg, &bs) in bs.iter().enumerate().take(segs as usize) {
                 if bs == 0 {
                     continue;
                 }
+                let along = along0 + seg as i32 * 4;
                 if vertical {
                     filter_vertical_edge_luma(
                         pic,
@@ -11975,6 +12022,44 @@ fn plane_set(pic: &mut Picture, plane: u8, x: i32, y: i32, v: i32) {
     }
 }
 
+/// Filter the eight stored samples `p3..q3` of one line, `step` apart in
+/// `plane` starting at `p3_at` (1 across a vertical edge, the row
+/// stride across a horizontal one), with [`filter_line`].
+#[inline(always)]
+fn filter_samples_strided(
+    plane: &mut [Sample],
+    p3_at: usize,
+    step: usize,
+    t: &EdgeThresholds,
+    chroma_style: bool,
+) {
+    let mut s = [0i32; 8];
+    for (k, v) in s.iter_mut().enumerate() {
+        *v = i32::from(plane[p3_at + k * step]);
+    }
+    let before = s;
+    filter_line(&mut s, t, chroma_style);
+    if s != before {
+        for k in 1..7 {
+            plane[p3_at + k * step] = to_sample(s[k]);
+        }
+    }
+}
+
+/// [`filter_samples_strided`] for eight contiguous samples (a line across
+/// a vertical edge).
+#[inline(always)]
+fn filter_samples(row: &mut [Sample; 8], t: &EdgeThresholds, chroma_style: bool) {
+    let mut s = row.map(i32::from);
+    let before = s;
+    filter_line(&mut s, t, chroma_style);
+    if s != before {
+        for k in 1..7 {
+            row[k] = to_sample(s[k]);
+        }
+    }
+}
+
 fn filter_vertical_edge_luma(
     pic: &mut Picture,
     edge_x: i32,
@@ -12016,40 +12101,16 @@ fn filter_vertical_edge_luma(
     // is fully inside the picture (the common case for picture-internal
     // edges), we can take a contiguous &mut [i32] slice and avoid the
     // per-pixel bounds-checked accessors.
-    if edge_x >= 4 && edge_x + 4 <= pic_w && y0 >= 0 && y0 + 4 <= pic_h {
+    if bs != 0 && edge_x >= 4 && edge_x + 4 <= pic_w && y0 >= 0 && y0 + 4 <= pic_h {
+        let t = EdgeThresholds::new(bs, qp_avg, alpha_off, beta_off, bit_depth);
         let stride = pic_w as usize;
         let base_x = (edge_x - 4) as usize;
         for dy in 0..4 {
             let y = (y0 + dy) as usize;
-            let row = &mut pic.luma[y * stride + base_x..y * stride + base_x + 8];
-            let p3 = i32::from(row[0]);
-            let q3 = i32::from(row[7]);
-            let mut p2 = i32::from(row[1]);
-            let mut p1 = i32::from(row[2]);
-            let mut p0 = i32::from(row[3]);
-            let mut q0 = i32::from(row[4]);
-            let mut q1 = i32::from(row[5]);
-            let mut q2 = i32::from(row[6]);
-            filter_edge(
-                Plane::Luma,
-                EdgeSamples {
-                    p3,
-                    p2: &mut p2,
-                    p1: &mut p1,
-                    p0: &mut p0,
-                    q0: &mut q0,
-                    q1: &mut q1,
-                    q2: &mut q2,
-                    q3,
-                },
-                params,
-            );
-            row[1] = to_sample(p2);
-            row[2] = to_sample(p1);
-            row[3] = to_sample(p0);
-            row[4] = to_sample(q0);
-            row[5] = to_sample(q1);
-            row[6] = to_sample(q2);
+            let row: &mut [Sample; 8] = (&mut pic.luma[y * stride + base_x..][..8])
+                .try_into()
+                .expect("eight samples");
+            filter_samples(row, &t, false);
         }
         return;
     }
@@ -12122,42 +12183,14 @@ fn filter_horizontal_edge_luma(
     };
     let pic_w = pic.width_in_samples as i32;
     let pic_h = pic.height_in_samples as i32;
-    if x0 >= 0 && x0 + 4 <= pic_w && edge_y >= 4 && edge_y + 4 <= pic_h {
+    if bs != 0 && x0 >= 0 && x0 + 4 <= pic_w && edge_y >= 4 && edge_y + 4 <= pic_h {
+        let t = EdgeThresholds::new(bs, qp_avg, alpha_off, beta_off, bit_depth);
         let stride = pic_w as usize;
         // For horizontal edges, the 8 samples are in 8 different rows at
-        // the same column. We split-borrow row-by-row.
+        // the same column.
         for dx in 0..4 {
-            let x = (x0 + dx) as usize;
-            let p3_idx = ((edge_y - 4) as usize) * stride + x;
-            let q3_idx = ((edge_y + 3) as usize) * stride + x;
-            let p3 = i32::from(pic.luma[p3_idx]);
-            let q3 = i32::from(pic.luma[q3_idx]);
-            let mut p2 = i32::from(pic.luma[((edge_y - 3) as usize) * stride + x]);
-            let mut p1 = i32::from(pic.luma[((edge_y - 2) as usize) * stride + x]);
-            let mut p0 = i32::from(pic.luma[((edge_y - 1) as usize) * stride + x]);
-            let mut q0 = i32::from(pic.luma[((edge_y) as usize) * stride + x]);
-            let mut q1 = i32::from(pic.luma[((edge_y + 1) as usize) * stride + x]);
-            let mut q2 = i32::from(pic.luma[((edge_y + 2) as usize) * stride + x]);
-            filter_edge(
-                Plane::Luma,
-                EdgeSamples {
-                    p3,
-                    p2: &mut p2,
-                    p1: &mut p1,
-                    p0: &mut p0,
-                    q0: &mut q0,
-                    q1: &mut q1,
-                    q2: &mut q2,
-                    q3,
-                },
-                params,
-            );
-            pic.luma[((edge_y - 3) as usize) * stride + x] = to_sample(p2);
-            pic.luma[((edge_y - 2) as usize) * stride + x] = to_sample(p1);
-            pic.luma[((edge_y - 1) as usize) * stride + x] = to_sample(p0);
-            pic.luma[((edge_y) as usize) * stride + x] = to_sample(q0);
-            pic.luma[((edge_y + 1) as usize) * stride + x] = to_sample(q1);
-            pic.luma[((edge_y + 2) as usize) * stride + x] = to_sample(q2);
+            let p3_at = ((edge_y - 4) as usize) * stride + (x0 + dx) as usize;
+            filter_samples_strided(&mut pic.luma, p3_at, stride, &t, false);
         }
         return;
     }
@@ -12228,40 +12261,17 @@ fn filter_chroma_vertical_rows(
         bit_depth,
     };
     // Fast in-bounds path for the chroma edge.
-    if edge_x >= 4 && edge_x + 4 <= cw && y0 >= 0 && y0 + rows <= ch {
+    if bs != 0 && edge_x >= 4 && edge_x + 4 <= cw && y0 >= 0 && y0 + rows <= ch {
+        let t = EdgeThresholds::new(bs, qp_avg, alpha_off, beta_off, bit_depth);
         let stride = cw as usize;
         let base_x = (edge_x - 4) as usize;
         let buf: &mut [Sample] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
         for dy in 0..rows {
             let y = (y0 + dy) as usize;
-            let row = &mut buf[y * stride + base_x..y * stride + base_x + 8];
-            let p3 = i32::from(row[0]);
-            let q3 = i32::from(row[7]);
-            let mut p2 = i32::from(row[1]);
-            let mut p1 = i32::from(row[2]);
-            let mut p0 = i32::from(row[3]);
-            let mut q0 = i32::from(row[4]);
-            let mut q1 = i32::from(row[5]);
-            let mut q2 = i32::from(row[6]);
-            filter_edge(
-                Plane::Chroma,
-                EdgeSamples {
-                    p3,
-                    p2: &mut p2,
-                    p1: &mut p1,
-                    p0: &mut p0,
-                    q0: &mut q0,
-                    q1: &mut q1,
-                    q2: &mut q2,
-                    q3,
-                },
-                params,
-            );
-            // Chroma-style filter only updates p1/p0/q0/q1.
-            row[2] = to_sample(p1);
-            row[3] = to_sample(p0);
-            row[4] = to_sample(q0);
-            row[5] = to_sample(q1);
+            let row: &mut [Sample; 8] = (&mut buf[y * stride + base_x..][..8])
+                .try_into()
+                .expect("eight samples");
+            filter_samples(row, &t, true);
         }
         return;
     }
@@ -12345,37 +12355,13 @@ fn filter_chroma_horizontal_cols(
         bit_depth,
     };
     // Fast in-bounds path.
-    if x0 >= 0 && x0 + cols <= cw && edge_y >= 4 && edge_y + 4 <= ch {
+    if bs != 0 && x0 >= 0 && x0 + cols <= cw && edge_y >= 4 && edge_y + 4 <= ch {
+        let t = EdgeThresholds::new(bs, qp_avg, alpha_off, beta_off, bit_depth);
         let stride = cw as usize;
         let buf: &mut [Sample] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
         for dx in 0..cols {
-            let x = (x0 + dx) as usize;
-            let p3 = i32::from(buf[((edge_y - 4) as usize) * stride + x]);
-            let q3 = i32::from(buf[((edge_y + 3) as usize) * stride + x]);
-            let mut p2 = i32::from(buf[((edge_y - 3) as usize) * stride + x]);
-            let mut p1 = i32::from(buf[((edge_y - 2) as usize) * stride + x]);
-            let mut p0 = i32::from(buf[((edge_y - 1) as usize) * stride + x]);
-            let mut q0 = i32::from(buf[((edge_y) as usize) * stride + x]);
-            let mut q1 = i32::from(buf[((edge_y + 1) as usize) * stride + x]);
-            let mut q2 = i32::from(buf[((edge_y + 2) as usize) * stride + x]);
-            filter_edge(
-                Plane::Chroma,
-                EdgeSamples {
-                    p3,
-                    p2: &mut p2,
-                    p1: &mut p1,
-                    p0: &mut p0,
-                    q0: &mut q0,
-                    q1: &mut q1,
-                    q2: &mut q2,
-                    q3,
-                },
-                params,
-            );
-            buf[((edge_y - 2) as usize) * stride + x] = to_sample(p1);
-            buf[((edge_y - 1) as usize) * stride + x] = to_sample(p0);
-            buf[((edge_y) as usize) * stride + x] = to_sample(q0);
-            buf[((edge_y + 1) as usize) * stride + x] = to_sample(q1);
+            let p3_at = ((edge_y - 4) as usize) * stride + (x0 + dx) as usize;
+            filter_samples_strided(buf, p3_at, stride, &t, true);
         }
         return;
     }
@@ -12857,6 +12843,392 @@ mod tests {
     use crate::macroblock_layer::{
         Intra16x16, Macroblock, MbPred, MbType, PcmSamples, SubMbPred, SubMbType,
     };
+
+    /// The per-segment frame deblocking walker as it stood before the
+    /// edge-at-a-time rewrite: the differential oracle for
+    /// [`deblock_luma_mb_frame`].
+    #[allow(clippy::too_many_arguments)]
+    fn deblock_luma_mb_frame_reference(
+        pic: &mut Picture,
+        y_base: i32,
+        w: i32,
+        h: i32,
+        grid: &MbGrid,
+        mb_x: i32,
+        mb_y: i32,
+        alpha_off: i32,
+        beta_off: i32,
+        bit_depth: u32,
+        field_pic: bool,
+        luma_bs: &mut [u8],
+    ) {
+        let mb_w = grid.width_in_mbs as i32;
+        let mb_h = grid.height_in_mbs as i32;
+        if mb_x < 0 || mb_y < 0 || mb_x >= mb_w || mb_y >= mb_h {
+            return;
+        }
+        let addr = (mb_y * mb_w + mb_x) as usize;
+        let Some(q_info) = grid.info.get(addr) else {
+            return;
+        };
+        if !q_info.available {
+            return;
+        }
+        let mut q_uniform: Option<bool> = None;
+        for vertical in [true, false] {
+            // The neighbouring macroblock across this direction's MB edge.
+            let (edge_mb, neighbour) = if vertical {
+                (
+                    mb_x,
+                    if mb_x > 0 {
+                        grid.info.get(addr - 1)
+                    } else {
+                        None
+                    },
+                )
+            } else {
+                (
+                    mb_y,
+                    if mb_y > 0 {
+                        grid.info.get(addr - mb_w as usize)
+                    } else {
+                        None
+                    },
+                )
+            };
+            for edge_off in 0..4i32 {
+                let edge = edge_mb * 16 + edge_off * 4;
+                if edge == 0 || edge >= if vertical { w } else { h } {
+                    continue;
+                }
+                let is_mb_edge = edge_off == 0;
+                let p_info = if is_mb_edge {
+                    match neighbour {
+                        Some(p) if p.available => p,
+                        _ => continue,
+                    }
+                } else {
+                    q_info
+                };
+                if !is_mb_edge && (edge_off == 1 || edge_off == 3) && q_info.transform_size_8x8_flag
+                {
+                    continue;
+                }
+                let p_off = if is_mb_edge { 3 } else { edge_off - 1 } as u32;
+                for seg in 0..4i32 {
+                    let along = (if vertical { mb_y } else { mb_x }) * 16 + seg * 4;
+                    if along >= if vertical { h } else { w } {
+                        break;
+                    }
+                    // 4x4 block coordinates (x, y) inside the p / q MBs.
+                    let (pbx, pby, qbx, qby) = if vertical {
+                        (p_off, seg as u32, edge_off as u32, seg as u32)
+                    } else {
+                        (seg as u32, p_off, seg as u32, edge_off as u32)
+                    };
+                    let p_blk4_z = blk4_raster_index(pbx as u8, pby as u8) as usize;
+                    let q_blk4_z = blk4_raster_index(qbx as u8, qby as u8) as usize;
+                    let p_has_nz = (p_info.luma_nonzero_4x4 >> p_blk4_z) & 1 == 1;
+                    let q_has_nz = (q_info.luma_nonzero_4x4 >> q_blk4_z) & 1 == 1;
+                    let diff_ref_mv = !(p_info.is_intra || q_info.is_intra || p_has_nz || q_has_nz)
+                        && !(!is_mb_edge
+                            && *q_uniform.get_or_insert_with(|| uniform_motion(q_info)))
+                        && different_ref_or_mv_luma(
+                            p_info,
+                            q_info,
+                            pbx * 4,
+                            pby * 4,
+                            qbx * 4,
+                            qby * 4,
+                            field_pic,
+                        );
+                    let bs = derive_boundary_strength(BsInputs {
+                        p_is_intra: p_info.is_intra,
+                        q_is_intra: q_info.is_intra,
+                        is_mb_edge,
+                        is_sp_or_si: p_info.in_sp_si_slice || q_info.in_sp_si_slice,
+                        either_has_nonzero_coeffs: p_has_nz || q_has_nz,
+                        different_ref_or_mv: diff_ref_mv,
+                        mixed_mode_edge: false,
+                        vertical_edge: vertical,
+                        mbaff_or_field: field_pic,
+                        both_in_frame_mbs: !field_pic,
+                    });
+                    luma_bs[luma_bs_index(0, 0, 0, !vertical, edge_off, seg)] = bs;
+                    if bs == 0 {
+                        continue;
+                    }
+                    if vertical {
+                        filter_vertical_edge_luma(
+                            pic,
+                            edge,
+                            along - y_base,
+                            bs,
+                            p_info.qp_y,
+                            q_info.qp_y,
+                            alpha_off,
+                            beta_off,
+                            bit_depth,
+                        );
+                    } else {
+                        filter_horizontal_edge_luma(
+                            pic,
+                            along,
+                            edge - y_base,
+                            bs,
+                            p_info.qp_y,
+                            q_info.qp_y,
+                            alpha_off,
+                            beta_off,
+                            bit_depth,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`deblock_luma_mb_frame`] filters every picture and records every
+    /// bS exactly as the per-segment reference walker does, over random
+    /// macroblock grids mixing intra / SP / inter macroblocks, coded
+    /// coefficients, 8x8 transforms, unavailable neighbours, uniform and
+    /// split motion with near / far / bipred vectors and references, QPs,
+    /// filter offsets, frame and field pictures, 8- and 10-bit samples,
+    /// and pictures whose size is not a multiple of the macroblock.
+    #[test]
+    fn frame_luma_deblocking_matches_the_per_segment_walker() {
+        let mut seed = 0x1234_5679u32;
+        let mut next = |m: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % m
+        };
+        let mut nonzero_bs = 0usize;
+        for case in 0..160 {
+            let (mb_w, mb_h) = (1 + next(4) as i32, 1 + next(4) as i32);
+            let bit_depth = if case % 3 == 0 { 10 } else { 8 };
+            let max = (1u32 << bit_depth) - 1;
+            let field_pic = case % 5 == 0;
+            // Coded size, optionally cropped short of the last MB.
+            let w = mb_w * 16 - if case % 4 == 1 { 6 } else { 0 };
+            let h = mb_h * 16 - if case % 4 == 2 { 10 } else { 0 };
+            let mut grid = MbGrid::new(mb_w as u32, mb_h as u32);
+            for info in grid.info.iter_mut() {
+                info.available = next(10) != 0;
+                let kind = next(10);
+                info.is_intra = kind < 2;
+                info.in_sp_si_slice = kind == 2;
+                info.qp_y = next(52) as i32;
+                info.transform_size_8x8_flag = next(3) == 0;
+                info.luma_nonzero_4x4 = match next(4) {
+                    0 => 0,
+                    1 => 0xffff,
+                    _ => next(0x1_0000) as u16,
+                };
+                let uniform = next(2) == 0;
+                let base_ref = next(3) as i8 - 1;
+                for k in 0..4 {
+                    let r0 = if uniform { base_ref } else { next(3) as i8 - 1 };
+                    let r1 = if uniform {
+                        base_ref.max(0) - 1
+                    } else {
+                        next(3) as i8 - 1
+                    };
+                    info.ref_idx_l0[k] = r0;
+                    info.ref_idx_l1[k] = r1;
+                    info.ref_poc_l0[k] = i32::from(r0) * 2;
+                    info.ref_poc_l1[k] = 8 - i32::from(r1) * 2;
+                }
+                let base = (next(9) as i16 - 4, next(9) as i16 - 4);
+                for k in 0..16 {
+                    let mv = |n: &mut dyn FnMut(u32) -> u32| {
+                        if uniform {
+                            base
+                        } else {
+                            (base.0 + n(9) as i16 - 4, base.1 + n(9) as i16 - 4)
+                        }
+                    };
+                    info.mv_l0[k] = mv(&mut next);
+                    info.mv_l1[k] = mv(&mut next);
+                }
+            }
+            let mut pic = Picture::new(w as u32, h as u32, 0, bit_depth, bit_depth);
+            // Flat-ish blocks with small steps so many edges pass the
+            // alpha / beta tests.
+            let level = next(max) as i32;
+            for s in pic.luma.iter_mut() {
+                *s = (level + next(9) as i32 - 4).clamp(0, max as i32) as Sample;
+            }
+            let (alpha_off, beta_off) = (next(13) as i32 * 2 - 12, next(13) as i32 * 2 - 12);
+            let mut want_pic = pic.clone();
+            let n = (mb_w * mb_h) as usize * 32;
+            let mut want_bs = vec![BS_NOT_DERIVED; n];
+            let mut got_bs = vec![BS_NOT_DERIVED; n];
+            for mb_y in 0..mb_h {
+                for mb_x in 0..mb_w {
+                    let base = luma_bs_index(mb_w, mb_x, mb_y, false, 0, 0);
+                    deblock_luma_mb_frame_reference(
+                        &mut want_pic,
+                        0,
+                        w,
+                        h,
+                        &grid,
+                        mb_x,
+                        mb_y,
+                        alpha_off,
+                        beta_off,
+                        bit_depth,
+                        field_pic,
+                        &mut want_bs[base..base + 32],
+                    );
+                    deblock_luma_mb_frame(
+                        &mut pic,
+                        0,
+                        w,
+                        h,
+                        &grid,
+                        mb_x,
+                        mb_y,
+                        alpha_off,
+                        beta_off,
+                        bit_depth,
+                        field_pic,
+                        &mut got_bs[base..base + 32],
+                    );
+                }
+            }
+            nonzero_bs += want_bs
+                .iter()
+                .filter(|&&b| b != 0 && b != BS_NOT_DERIVED)
+                .count();
+            assert_eq!(got_bs, want_bs, "case {case}: bS record");
+            assert_eq!(pic.luma, want_pic.luma, "case {case}: samples");
+        }
+        assert!(nonzero_bs > 2_000, "only {nonzero_bs} filtered segments");
+    }
+
+    /// §8.4.2.3 — every combine operation equals the per-sample
+    /// equations (8-273 default average, 8-274 / 8-275 single-list
+    /// explicit with and without rounding, 8-276 bipred) for every
+    /// partition shape, at an offset inside a 16-wide destination whose
+    /// other samples stay untouched, for 8- and 10-bit samples.
+    #[test]
+    fn combine_partition_matches_the_weighted_sample_equations() {
+        let mut seed = 0x2545_f491u32;
+        let mut next = |m: i32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed % m as u32) as i32
+        };
+        let shapes = [(16, 16), (16, 8), (8, 16), (8, 8), (8, 4), (4, 8), (4, 4)];
+        for bit_depth in [8u32, 10] {
+            let max_v = (1i32 << bit_depth) - 1;
+            for &(w, h) in &shapes {
+                for round in 0..40 {
+                    let l0: Vec<i32> = (0..w * h).map(|_| next(max_v + 1)).collect();
+                    let l1: Vec<i32> = (0..w * h).map(|_| next(max_v + 1)).collect();
+                    let log2_wd = (round % 8) as u32;
+                    let entry = |n: &mut dyn FnMut(i32) -> i32| WeightedEntry {
+                        weight: n(256) - 128,
+                        offset: n(256) - 128,
+                    };
+                    let (w0, w1) = (entry(&mut next), entry(&mut next));
+                    let ops = [
+                        CombineOp::Zero,
+                        CombineOp::Copy0,
+                        CombineOp::Copy1,
+                        CombineOp::Avg,
+                        CombineOp::Weighted {
+                            mode: BiPredMode::L0Only,
+                            w0,
+                            w1,
+                            log2_wd,
+                        },
+                        CombineOp::Weighted {
+                            mode: BiPredMode::L1Only,
+                            w0,
+                            w1,
+                            log2_wd,
+                        },
+                        CombineOp::Weighted {
+                            mode: BiPredMode::Bipred,
+                            w0,
+                            w1,
+                            log2_wd,
+                        },
+                    ];
+                    for op in ops {
+                        let want_at = |i: usize| -> i32 {
+                            let (a, b) = (l0[i], l1[i]);
+                            match op {
+                                CombineOp::Zero => 0,
+                                CombineOp::Copy0 => a,
+                                CombineOp::Copy1 => b,
+                                CombineOp::Avg => (a + b + 1) >> 1,
+                                CombineOp::Weighted {
+                                    mode,
+                                    w0,
+                                    w1,
+                                    log2_wd,
+                                } => match mode {
+                                    BiPredMode::Bipred => {
+                                        (((a * w0.weight + b * w1.weight + (1 << log2_wd))
+                                            >> (log2_wd + 1))
+                                            + ((w0.offset + w1.offset + 1) >> 1))
+                                            .clamp(0, max_v)
+                                    }
+                                    _ => {
+                                        let (p, e) = if mode == BiPredMode::L0Only {
+                                            (a, w0)
+                                        } else {
+                                            (b, w1)
+                                        };
+                                        if log2_wd >= 1 {
+                                            (((p * e.weight + (1 << (log2_wd - 1))) >> log2_wd)
+                                                + e.offset)
+                                                .clamp(0, max_v)
+                                        } else {
+                                            (p * e.weight + e.offset).clamp(0, max_v)
+                                        }
+                                    }
+                                },
+                            }
+                        };
+                        let (x0, y0) = (16 - w, 16 - h);
+                        let mut dst = [-7i32; 256];
+                        combine_partition(
+                            &mut dst,
+                            y0 * 16 + x0,
+                            16,
+                            &l0,
+                            &l1,
+                            w,
+                            h,
+                            op,
+                            bit_depth,
+                        );
+                        for y in 0..16 {
+                            for x in 0..16 {
+                                let inside = x >= x0 && y >= y0;
+                                let want = if inside {
+                                    want_at((y - y0) * w + (x - x0))
+                                } else {
+                                    -7
+                                };
+                                assert_eq!(
+                                    dst[y * 16 + x],
+                                    want,
+                                    "{w}x{h} ({x},{y}) depth {bit_depth}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // ----- §6.4.10 MBAFF neighbour-address derivation -------------------
 
