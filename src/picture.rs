@@ -43,6 +43,18 @@ pub fn store_samples(dst: &mut [Sample], src: &[i32]) {
     }
 }
 
+/// Clip a row of `i32` samples to `0..=max` (Clip1, `max` at most
+/// [`Sample::MAX`]) and store them: one clamp per sample, so a producer
+/// need not clip first.
+#[inline]
+pub fn store_clipped(dst: &mut [Sample], src: &[i32], max: i32) {
+    debug_assert_eq!(dst.len(), src.len());
+    debug_assert!((0..=Sample::MAX as i32).contains(&max));
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = s.clamp(0, max) as Sample;
+    }
+}
+
 /// Widen a row of stored samples into `i32` working samples.
 #[inline]
 pub fn load_samples(dst: &mut [i32], src: &[Sample]) {

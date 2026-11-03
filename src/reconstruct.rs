@@ -587,9 +587,9 @@ impl MbWriter {
         pic.set_luma(ax, ay, v);
     }
 
-    /// Write the macroblock's 16x16 luma samples (`samples[y * 16 + x]`)
-    /// — [`Self::set_luma`] for each sample, by row.
-    fn write_luma_mb(&self, pic: &mut Picture, samples: &[i32; 256]) {
+    /// Write the macroblock's 16x16 luma samples (`samples[y * 16 + x]`),
+    /// clipped to `0..=max` — [`Self::set_luma`] for each sample, by row.
+    fn write_luma_mb(&self, pic: &mut Picture, samples: &[i32; 256], max: i32) {
         let w = pic.width_in_samples as i32;
         let h = pic.height_in_samples as i32;
         let ys = self.luma_y_stride();
@@ -597,15 +597,16 @@ impl MbWriter {
             let wu = w as usize;
             for y in 0..16usize {
                 let o = (self.mb_py as usize + y * ys as usize) * wu + self.mb_px as usize;
-                crate::picture::store_samples(
+                crate::picture::store_clipped(
                     &mut pic.luma[o..o + 16],
                     &samples[y * 16..y * 16 + 16],
+                    max,
                 );
             }
         } else {
             for y in 0..16 {
                 for x in 0..16 {
-                    self.set_luma(pic, x, y, samples[(y * 16 + x) as usize]);
+                    self.set_luma(pic, x, y, samples[(y * 16 + x) as usize].clamp(0, max));
                 }
             }
         }
@@ -630,8 +631,16 @@ impl MbWriter {
 
     /// Write the macroblock's `w`x`h` chroma samples of plane `plane`
     /// (0 = Cb, 1 = Cr; `samples[y * w + x]`) — [`Self::set_cb`] /
-    /// [`Self::set_cr`] for each sample, by row.
-    fn write_chroma_mb(&self, pic: &mut Picture, plane: u8, samples: &[i32], w: usize, h: usize) {
+    /// [`Self::set_cr`] for each sample, by row, clipped to `0..=max`.
+    fn write_chroma_mb(
+        &self,
+        pic: &mut Picture,
+        plane: u8,
+        samples: &[i32],
+        w: usize,
+        h: usize,
+        max: i32,
+    ) {
         let cw = pic.chroma_width() as i32;
         let ch = pic.chroma_height() as i32;
         let (x0, y0, ys) = (
@@ -643,12 +652,12 @@ impl MbWriter {
             let dst = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
             for y in 0..h {
                 let o = (y0 as usize + y * ys as usize) * cw as usize + x0 as usize;
-                crate::picture::store_samples(&mut dst[o..o + w], &samples[y * w..y * w + w]);
+                crate::picture::store_clipped(&mut dst[o..o + w], &samples[y * w..y * w + w], max);
             }
         } else {
             for y in 0..h {
                 for x in 0..w {
-                    let v = samples[y * w + x];
+                    let v = samples[y * w + x].clamp(0, max);
                     if plane == 0 {
                         self.set_cb(pic, x as i32, y as i32, v);
                     } else {
@@ -5137,11 +5146,8 @@ fn inter_residual_write(
             }
         }
     }
-    let max_y = (1i32 << bit_depth_y) - 1;
-    for v in out.iter_mut() {
-        *v = (*v).clamp(0, max_y);
-    }
-    writer.write_luma_mb(pic, &out);
+    // §8.5.14 — Clip1Y as the samples are stored.
+    writer.write_luma_mb(pic, &out, (1i32 << bit_depth_y) - 1);
 
     // -------- Chroma residual + write --------------------------------
     if chroma_array_type == 1 || chroma_array_type == 2 {
@@ -8773,11 +8779,9 @@ fn reconstruct_inter_chroma_residual(
                 }
             }
         }
+        // §8.5.14 — Clip1C as the samples are stored.
         let max_c = (1i32 << bit_depth_c) - 1;
-        for v in out.iter_mut() {
-            *v = (*v).clamp(0, max_c);
-        }
-        writer.write_chroma_mb(pic, plane, out, mbw_c as usize, mbh_c as usize);
+        writer.write_chroma_mb(pic, plane, out, mbw_c as usize, mbh_c as usize, max_c);
     }
     let _ = c_mb_px;
     let _ = c_mb_py;
@@ -12060,6 +12064,8 @@ fn filter_samples(row: &mut [Sample; 8], t: &EdgeThresholds, chroma_style: bool)
     }
 }
 
+// Kept out of line; see `filter_horizontal_edge_luma`.
+#[inline(never)]
 fn filter_vertical_edge_luma(
     pic: &mut Picture,
     edge_x: i32,
@@ -12158,6 +12164,10 @@ fn filter_vertical_edge_luma(
     }
 }
 
+// Kept out of line: inlined into the per-segment loop of
+// `deblock_luma_mb_frame`, its strength-reduced row pointers were spilled
+// and stepped on every segment, filtered or not.
+#[inline(never)]
 fn filter_horizontal_edge_luma(
     pic: &mut Picture,
     x0: i32,
@@ -12239,6 +12249,8 @@ fn filter_horizontal_edge_luma(
 /// with a specific luma 4-row segment by SubHeightC == 2) or 4 for
 /// 4:2:2 (SubHeightC == 1).
 #[allow(clippy::too_many_arguments)]
+// Kept out of line; see `filter_horizontal_edge_luma`.
+#[inline(never)]
 fn filter_chroma_vertical_rows(
     pic: &mut Picture,
     plane: u8,
@@ -12333,6 +12345,8 @@ fn filter_chroma_vertical_rows(
 /// chroma edge at `edge_y`. Analogous to `filter_chroma_vertical_rows`
 /// for the horizontal direction.
 #[allow(clippy::too_many_arguments)]
+// Kept out of line; see `filter_horizontal_edge_luma`.
+#[inline(never)]
 fn filter_chroma_horizontal_cols(
     pic: &mut Picture,
     plane: u8,
@@ -12843,6 +12857,46 @@ mod tests {
     use crate::macroblock_layer::{
         Intra16x16, Macroblock, MbPred, MbType, PcmSamples, SubMbPred, SubMbType,
     };
+
+    /// The macroblock writers clip each sample to `0..=max` (the Clip1 of
+    /// §8.5.14) as they store it, on the in-picture path and on the
+    /// guarded path of a macroblock hanging past the picture edge, for
+    /// luma and both chroma planes.
+    #[test]
+    fn macroblock_writers_clip_samples_to_the_bit_depth() {
+        let values = [-300, -1, 0, 1, 254, 255, 256, 1023, 1024, 70_000];
+        for (max, width) in [(255i32, 32u32), (1023, 32), (255, 24)] {
+            let grid = MbGrid::new(2, 1);
+            let mut pic = Picture::new(width, 16, 1, 8, 8);
+            for mb_x in 0..2 {
+                let writer = MbWriter::new(&grid, mb_x, mb_x as i32 * 16, 0, false, false, 1);
+                let luma: [i32; 256] = std::array::from_fn(|i| values[i % values.len()]);
+                writer.write_luma_mb(&mut pic, &luma, max);
+                let chroma: Vec<i32> = (0..64).map(|i| values[(i + 3) % values.len()]).collect();
+                writer.write_chroma_mb(&mut pic, 0, &chroma, 8, 8, max);
+                writer.write_chroma_mb(&mut pic, 1, &chroma, 8, 8, max);
+                for y in 0..16 {
+                    for x in 0..16 {
+                        let px = mb_x as i32 * 16 + x;
+                        if px < width as i32 {
+                            let want = luma[(y * 16 + x) as usize].clamp(0, max);
+                            assert_eq!(pic.luma_at(px, y), want, "luma ({px},{y}) max {max}");
+                        }
+                    }
+                }
+                for y in 0..8 {
+                    for x in 0..8 {
+                        let cx = mb_x as i32 * 8 + x;
+                        if cx < pic.chroma_width() as i32 {
+                            let want = chroma[(y * 8 + x) as usize].clamp(0, max);
+                            assert_eq!(pic.cb_at(cx, y), want, "cb ({cx},{y})");
+                            assert_eq!(pic.cr_at(cx, y), want, "cr ({cx},{y})");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// The per-segment frame deblocking walker as it stood before the
     /// edge-at-a-time rewrite: the differential oracle for
