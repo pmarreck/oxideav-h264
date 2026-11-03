@@ -167,9 +167,7 @@ fn rows_fixed<const N: usize>(
         let d: &mut [i32; N] = (&mut out[r * ostride..][..N])
             .try_into()
             .expect("row length");
-        for (d, &s) in d.iter_mut().zip(s) {
-            *d = i32::from(s);
-        }
+        *d = s.map(i32::from);
     }
 }
 

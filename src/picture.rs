@@ -44,13 +44,19 @@ pub fn store_samples(dst: &mut [Sample], src: &[i32]) {
 }
 
 /// Clip a row of `i32` samples to `0..=max` (Clip1, `max` at most
-/// [`Sample::MAX`]) and store them: one clamp per sample, so a producer
+/// `i16::MAX`, which every bit depth satisfies) and store them: one clamp per sample, so a producer
 /// need not clip first.
 #[inline]
 pub fn store_clipped(dst: &mut [Sample], src: &[i32], max: i32) {
     debug_assert_eq!(dst.len(), src.len());
-    debug_assert!((0..=Sample::MAX as i32).contains(&max));
+    debug_assert!((0..=i32::from(i16::MAX)).contains(&max));
+    // Saturating to i16 first, then clamping in 16 bits, equals the
+    // 32-bit clamp for any `max` that fits i16 (every bit depth does) and
+    // maps onto 16-bit vector packs and min / max that x86-64's baseline
+    // SSE2 has (it lacks 32-bit min / max).
+    let max = max as i16;
     for (d, &s) in dst.iter_mut().zip(src) {
+        let s = s.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
         *d = s.clamp(0, max) as Sample;
     }
 }
