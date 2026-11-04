@@ -207,7 +207,9 @@ fn tap6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
 
 #[inline(always)]
 fn clip1(v: i32, max_v: i32) -> i32 {
-    v.clamp(0, max_v)
+    // Max-then-min: `i32::clamp` asserts its bounds are ordered, and that
+    // panic branch keeps the row loops scalar.
+    v.max(0).min(max_v)
 }
 
 /// §8.4.2.2.1 — predict a `w`x`h` luma block (`w`, `h` ≤ 16) at the
@@ -365,14 +367,22 @@ pub(crate) fn luma(
 #[inline(always)]
 fn tap6_row<const W: usize>(r: &[i32]) -> [i32; W] {
     let r = &r[..W + 5];
-    std::array::from_fn(|x| tap6(r[x], r[x + 1], r[x + 2], r[x + 3], r[x + 4], r[x + 5]))
+    let mut out = [0i32; W];
+    for (x, o) in out.iter_mut().enumerate() {
+        *o = tap6(r[x], r[x + 1], r[x + 2], r[x + 3], r[x + 4], r[x + 5]);
+    }
+    out
 }
 
 /// The 6-tap filter down six rows of `W` samples each.
 #[inline(always)]
 fn tap6_cols<const W: usize>(rows: [&[i32]; 6]) -> [i32; W] {
     let [a, b, c, d, e, f] = rows.map(|r| &r[..W]);
-    std::array::from_fn(|x| tap6(a[x], b[x], c[x], d[x], e[x], f[x]))
+    let mut out = [0i32; W];
+    for (x, o) in out.iter_mut().enumerate() {
+        *o = tap6(a[x], b[x], c[x], d[x], e[x], f[x]);
+    }
+    out
 }
 
 /// [`luma`] for a block `W` samples wide, on its gathered window `win`
