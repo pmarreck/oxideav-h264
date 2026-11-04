@@ -35,8 +35,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::deblock::{
-    BsInputs, EdgeSamples, EdgeThresholds, FilterParams, Plane, alpha_from_index, beta_from_index,
-    derive_boundary_strength, filter_edge, filter_line, tc0_from,
+    BsInputs, EDGE_LINES, EdgeSamples, EdgeThresholds, FilterParams, Plane, alpha_from_index,
+    beta_from_index, derive_boundary_strength, filter_edge, filter_line, filter_luma_lines16,
+    tc0_from,
 };
 use crate::inter_pred::{BiPredMode, WeightedEntry, weighted_pred_explicit};
 use crate::intra_pred::{
@@ -11264,6 +11265,25 @@ fn deblock_luma_mb_frame(
             }
             let rec = luma_bs_index(0, 0, 0, !vertical, edge_off, 0);
             luma_bs[rec..rec + segs as usize].copy_from_slice(&bs[..segs as usize]);
+            if bs == [0; 4] {
+                continue;
+            }
+            // A whole edge inside the picture: its 16 lines at once.
+            if segs == 4
+                && filter_luma_edge16(
+                    pic,
+                    vertical,
+                    if vertical { edge } else { edge - y_base },
+                    if vertical { along0 - y_base } else { along0 },
+                    bs,
+                    (p_info.qp_y + q_info.qp_y + 1) >> 1,
+                    alpha_off,
+                    beta_off,
+                    bit_depth,
+                )
+            {
+                continue;
+            }
             for (seg, &bs) in bs.iter().enumerate().take(segs as usize) {
                 if bs == 0 {
                     continue;
@@ -11297,6 +11317,85 @@ fn deblock_luma_mb_frame(
             }
         }
     }
+}
+
+/// Filter all 16 luma lines across one macroblock-long edge with
+/// [`filter_luma_lines16`]: a vertical edge at column `edge` over rows
+/// `along..along + 16`, or a horizontal edge at row `edge` over columns
+/// `along..along + 16`. Returns `false`, filtering nothing, when the
+/// edge's samples are not all inside the picture (the caller then
+/// filters segment by segment). Equal to four calls of
+/// [`filter_vertical_edge_luma`] / [`filter_horizontal_edge_luma`].
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn filter_luma_edge16(
+    pic: &mut Picture,
+    vertical: bool,
+    edge: i32,
+    along: i32,
+    bs: [u8; 4],
+    qp_avg: i32,
+    alpha_off: i32,
+    beta_off: i32,
+    bit_depth: u32,
+) -> bool {
+    let pic_w = pic.width_in_samples as i32;
+    let pic_h = pic.height_in_samples as i32;
+    let (across, length) = if vertical {
+        (pic_w, pic_h)
+    } else {
+        (pic_h, pic_w)
+    };
+    if edge < 4 || edge + 4 > across || along < 0 || along + EDGE_LINES as i32 > length {
+        return false;
+    }
+    // α and β depend only on qPav; tC0 also on each segment's bS.
+    let thresholds =
+        bs.map(|b| EdgeThresholds::new(b.max(1), qp_avg, alpha_off, beta_off, bit_depth));
+    let (alpha, beta, max) = (thresholds[0].alpha, thresholds[0].beta, thresholds[0].max);
+    let tc0 = thresholds.map(|t| t.tc0);
+    let stride = pic_w as usize;
+    let mut lanes = [[0i32; EDGE_LINES]; 8];
+    if vertical {
+        let x = (edge - 4) as usize;
+        for (l, y) in (along as usize..along as usize + EDGE_LINES).enumerate() {
+            let row: &[Sample; 8] = pic.luma[y * stride + x..][..8]
+                .try_into()
+                .expect("eight samples");
+            for k in 0..8 {
+                lanes[k][l] = i32::from(row[k]);
+            }
+        }
+        filter_luma_lines16(&mut lanes, bs, tc0, alpha, beta, max);
+        for (l, y) in (along as usize..along as usize + EDGE_LINES).enumerate() {
+            let row: &mut [Sample; 8] = (&mut pic.luma[y * stride + x..][..8])
+                .try_into()
+                .expect("eight samples");
+            for k in 1..7 {
+                row[k] = to_sample(lanes[k][l]);
+            }
+        }
+    } else {
+        let x = along as usize;
+        for (k, lane) in lanes.iter_mut().enumerate() {
+            let y = (edge - 4) as usize + k;
+            let row: &[Sample; EDGE_LINES] = pic.luma[y * stride + x..][..EDGE_LINES]
+                .try_into()
+                .expect("sixteen samples");
+            *lane = row.map(i32::from);
+        }
+        filter_luma_lines16(&mut lanes, bs, tc0, alpha, beta, max);
+        for (k, lane) in lanes.iter().enumerate().take(7).skip(1) {
+            let y = (edge - 4) as usize + k;
+            let row: &mut [Sample; EDGE_LINES] = (&mut pic.luma[y * stride + x..][..EDGE_LINES])
+                .try_into()
+                .expect("sixteen samples");
+            for (d, &v) in row.iter_mut().zip(lane) {
+                *d = to_sample(v);
+            }
+        }
+    }
+    true
 }
 
 /// §8.7.2.1 — whether every 4x4 block of a macroblock has the same

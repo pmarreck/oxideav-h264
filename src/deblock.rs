@@ -615,6 +615,105 @@ pub(crate) fn filter_line(s: &mut [i32; 8], t: &EdgeThresholds, chroma_style: bo
     }
 }
 
+/// Lines filtered at once by [`filter_luma_lines16`]: the 16 lines of a
+/// macroblock edge, four segments of four.
+pub(crate) const EDGE_LINES: usize = 16;
+
+/// [`filter_line`] for the 16 luma lines across one macroblock-long edge
+/// at once, lane by lane: `s[k][l]` is sample `k` (`p3..q3`) of line `l`.
+/// Segment `l / 4` has strength `bs[l / 4]` (0 leaves its lines alone)
+/// and `tc0[l / 4]`; α, β and the maximum are the edge's (one qPav per
+/// edge). Every lane computes both the bS < 4 and the bS == 4 results and
+/// keeps the one its strength selects, so the loops carry no branches and
+/// compile to vector arithmetic. Equal to [`filter_line`] (luma style) on
+/// every line.
+#[inline(always)]
+pub(crate) fn filter_luma_lines16(
+    s: &mut [[i32; EDGE_LINES]; 8],
+    bs: [u8; 4],
+    tc0: [i32; 4],
+    alpha: i32,
+    beta: i32,
+    max: i32,
+) {
+    let lane_bs: [i32; EDGE_LINES] = std::array::from_fn(|l| i32::from(bs[l / 4]));
+    let lane_tc0: [i32; EDGE_LINES] = std::array::from_fn(|l| tc0[l / 4]);
+    let [p3, p2, p1, p0, q0, q1, q2, q3] = *s;
+    let mut out = *s;
+    for l in 0..EDGE_LINES {
+        let (p3, p2, p1, p0) = (p3[l], p2[l], p1[l], p0[l]);
+        let (q0, q1, q2, q3) = (q0[l], q1[l], q2[l], q3[l]);
+        let b = lane_bs[l];
+        // eq. 8-460 — filterSamplesFlag (and bS != 0).
+        let filter =
+            b != 0 && (p0 - q0).abs() < alpha && (p1 - p0).abs() < beta && (q1 - q0).abs() < beta;
+        let ap = (p2 - p0).abs() < beta;
+        let aq = (q2 - q0).abs() < beta;
+        // §8.7.2.3 — bS < 4.
+        let tc0 = lane_tc0[l];
+        let tc = tc0 + i32::from(ap) + i32::from(aq);
+        // Clip3 as max-then-min: `i32::clamp` asserts its bounds are
+        // ordered, and that panic branch keeps the loop scalar.
+        let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).max(-tc).min(tc);
+        let avg = (p0 + q0 + 1) >> 1;
+        let n_p0 = (p0 + delta).max(0).min(max);
+        let n_q0 = (q0 - delta).max(0).min(max);
+        let n_p1 = if ap {
+            p1 + ((p2 + avg - (p1 << 1)) >> 1).max(-tc0).min(tc0)
+        } else {
+            p1
+        };
+        let n_q1 = if aq {
+            q1 + ((q2 + avg - (q1 << 1)) >> 1).max(-tc0).min(tc0)
+        } else {
+            q1
+        };
+        // §8.7.2.4 — bS == 4.
+        let near = (p0 - q0).abs() < ((alpha >> 2) + 2);
+        let sp = ap && near;
+        let sq = aq && near;
+        let s_p0 = if sp {
+            (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3
+        } else {
+            (2 * p1 + p0 + q1 + 2) >> 2
+        };
+        let s_p1 = if sp { (p2 + p1 + p0 + q0 + 2) >> 2 } else { p1 };
+        let s_p2 = if sp {
+            (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3
+        } else {
+            p2
+        };
+        let s_q0 = if sq {
+            (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3
+        } else {
+            (2 * q1 + q0 + p1 + 2) >> 2
+        };
+        let s_q1 = if sq { (p0 + q0 + q1 + q2 + 2) >> 2 } else { q1 };
+        let s_q2 = if sq {
+            (2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3
+        } else {
+            q2
+        };
+        let strong = b == 4;
+        let pick = |strong_v: i32, normal_v: i32, orig: i32| {
+            if !filter {
+                orig
+            } else if strong {
+                strong_v
+            } else {
+                normal_v
+            }
+        };
+        out[1][l] = pick(s_p2, p2, p2);
+        out[2][l] = pick(s_p1, n_p1, p1);
+        out[3][l] = pick(s_p0, n_p0, p0);
+        out[4][l] = pick(s_q0, n_q0, q0);
+        out[5][l] = pick(s_q1, n_q1, q1);
+        out[6][l] = pick(s_q2, q2, q2);
+    }
+    *s = out;
+}
+
 // --------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------
@@ -652,6 +751,65 @@ mod tests {
             params,
         );
         [samples[0], p2, p1, p0, q0, q1, q2, samples[7]]
+    }
+
+    /// The 16-line lane filter equals [`filter_line`] on every line, for
+    /// random strengths per segment (0..=4, mixed within an edge), every
+    /// indexA / indexB, 8- and 10-bit samples, with sample octets drawn
+    /// near the edge so the unfiltered, normal and strong paths and the
+    /// strong refinements all occur.
+    #[test]
+    fn sixteen_line_filter_matches_the_line_filter() {
+        let mut seed = 0x2545_f491u32;
+        let mut next = |m: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % m
+        };
+        let mut filtered = 0usize;
+        for bit_depth in [8u32, 10] {
+            let max = (1i32 << bit_depth) - 1;
+            for _ in 0..4000 {
+                let qp_avg = next(52) as i32;
+                let (off_a, off_b) = (next(25) as i32 - 12, next(25) as i32 - 12);
+                let bs: [u8; 4] = std::array::from_fn(|_| next(5) as u8);
+                let thresholds =
+                    bs.map(|b| EdgeThresholds::new(b.max(1), qp_avg, off_a, off_b, bit_depth));
+                let tc0 = thresholds.map(|t| t.tc0);
+                let base = next(max as u32 + 1) as i32;
+                let spread = 1 + next(24) as i32;
+                let mut lanes = [[0i32; EDGE_LINES]; 8];
+                for k in 0..8 {
+                    for l in 0..EDGE_LINES {
+                        lanes[k][l] =
+                            (base + next(2 * spread as u32 + 1) as i32 - spread).clamp(0, max);
+                    }
+                }
+                let mut expected = lanes;
+                for l in 0..EDGE_LINES {
+                    let b = bs[l / 4];
+                    if b == 0 {
+                        continue;
+                    }
+                    let mut line: [i32; 8] = std::array::from_fn(|k| lanes[k][l]);
+                    filter_line(&mut line, &thresholds[l / 4], false);
+                    for k in 0..8 {
+                        expected[k][l] = line[k];
+                    }
+                }
+                let t = thresholds[0];
+                let before = lanes;
+                filter_luma_lines16(&mut lanes, bs, tc0, t.alpha, t.beta, max);
+                assert_eq!(
+                    lanes, expected,
+                    "bs {bs:?} qp {qp_avg} offsets {off_a} {off_b} depth {bit_depth}"
+                );
+                filtered += usize::from(lanes != before);
+            }
+        }
+        // The draw must reach the filtering paths, not only the unfiltered one.
+        assert!(filtered > 1000, "only {filtered} edges changed");
     }
 
     /// The precomputed-threshold line filter equals [`filter_edge`] for
