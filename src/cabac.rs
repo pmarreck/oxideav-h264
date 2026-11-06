@@ -205,6 +205,9 @@ pub(crate) static TRANS_IDX_MPS: [u8; 64] = [
     49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 62, 63,
 ];
 
+/// Table 9-45's transitions by path, MPS then LPS, for a branch-free lookup.
+static TRANS_IDX: [[u8; 64]; 2] = [TRANS_IDX_MPS, TRANS_IDX_LPS];
+
 /// §5.7 — `Clip3(x, y, z)` = max(x, min(y, z)).
 #[inline]
 fn clip3_i32(lo: i32, hi: i32, v: i32) -> i32 {
@@ -483,29 +486,23 @@ impl<'a> CabacDecoder<'a> {
 
     #[inline(always)]
     fn decision(&mut self, ctx: &mut CtxState) -> CabacResult<u8> {
-        // §9.3.3.2.1 equations (9-25) / (9-26).
+        // §9.3.3.2.1 equations (9-25) / (9-26), choosing between the LPS and
+        // MPS paths without a branch: which one a bin takes is close to
+        // unpredictable. Context states stay within 0..=62 (§9.3.1.1), so the
+        // mask only spares the table its bounds check.
+        let state = usize::from(ctx.state_idx & 63);
         let q_idx = ((self.cod_i_range >> 6) & 0b11) as usize;
-        let cod_i_range_lps = RANGE_TAB_LPS[ctx.state_idx as usize][q_idx] as u32;
-        self.cod_i_range -= cod_i_range_lps;
-
-        let bin_val: u8;
-        let scaled_range = self.scaled_range();
-        if self.window >= scaled_range {
-            // LPS path.
-            bin_val = 1 - ctx.val_mps;
-            self.window -= scaled_range;
-            self.cod_i_range = cod_i_range_lps;
-            // §9.3.3.2.1.1 equation (9-27).
-            if ctx.state_idx == 0 {
-                ctx.val_mps = 1 - ctx.val_mps;
-            }
-            ctx.state_idx = TRANS_IDX_LPS[ctx.state_idx as usize];
-        } else {
-            // MPS path.
-            bin_val = ctx.val_mps;
-            ctx.state_idx = TRANS_IDX_MPS[ctx.state_idx as usize];
-        }
-
+        let range_lps = u32::from(RANGE_TAB_LPS[state][q_idx]);
+        let range_mps = self.cod_i_range - range_lps;
+        let scaled_mps = u64::from(range_mps) << self.ahead;
+        let lps = self.window >= scaled_mps;
+        // LPS: codIOffset -= codIRange (the MPS share), codIRange = codIRangeLPS.
+        self.window -= scaled_mps & u64::from(lps).wrapping_neg();
+        self.cod_i_range = if lps { range_lps } else { range_mps };
+        let bin_val = ctx.val_mps ^ u8::from(lps);
+        // §9.3.3.2.1.1 equation (9-27): an LPS in state 0 swaps valMPS.
+        ctx.val_mps ^= u8::from(lps & (state == 0));
+        ctx.state_idx = TRANS_IDX[usize::from(lps)][state];
         self.renorm_d()?;
         self.bin_count = self.bin_count.wrapping_add(1);
         Ok(bin_val)
@@ -622,12 +619,11 @@ impl<'a> CabacDecoder<'a> {
         // §9.3.3.2.2 — the doubling loop of Figure 9-6, all at once:
         // `codIRange` (≥ 2 here) needs `shift` doublings to reach 256,
         // consuming one bit per doubling.
-        if self.cod_i_range < 256 {
-            let shift = self.cod_i_range.leading_zeros() - 23;
-            self.cod_i_range <<= shift;
-            self.read_into_offset(shift)?;
-        }
-        Ok(())
+        // From 256 up no doubling is needed (`leading_zeros` is at most 23),
+        // and a read of no bits changes nothing.
+        let shift = self.cod_i_range.leading_zeros().saturating_sub(23);
+        self.cod_i_range <<= shift;
+        self.read_into_offset(shift)
     }
 }
 
