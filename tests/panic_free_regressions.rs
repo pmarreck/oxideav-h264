@@ -12,6 +12,9 @@
 //!   sample stage waited for the reference rows by the new picture's
 //!   height while motion compensation read the reference clamped to its
 //!   own, taller planes, past the rows it had waited for.
+//! * `crash-5108308b`, `crash-7cc0a0f5`: a slice naming a parameter set
+//!   of another chroma format than its picture's, so the frame-threaded
+//!   sample stage copied chroma from planes the picture never had.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -28,6 +31,14 @@ const FIXTURES: &[(&str, &[u8])] = &[
     (
         "a50aa2fc (reference of another size)",
         include_bytes!("fixtures/fuzz_regressions/crash-a50aa2fc3bfbe44ec328b2db3773f198b6ec9545"),
+    ),
+    (
+        "5108308b (slice of another chroma format)",
+        include_bytes!("fixtures/fuzz_regressions/crash-5108308b551f7ec9e075da6b0f11b8fec85a9528"),
+    ),
+    (
+        "7cc0a0f5 (slice of another chroma format)",
+        include_bytes!("fixtures/fuzz_regressions/crash-7cc0a0f5928998098c4c67e2bd50f660f334cd3c"),
     ),
 ];
 

@@ -109,6 +109,13 @@ pub enum ReconstructError {
     /// the placeholder would silently fabricate picture content.
     #[error("inter MC against a non-existing (frame_num-gap) reference picture (§8.2.5.2)")]
     NonExistingRef,
+    /// Frame threading — a slice whose SPS gives another chroma format
+    /// than the picture its first slice allocated, or a macroblock
+    /// outside that picture, is refused rather than written past the
+    /// picture's planes (§7.4.1.2.1 keeps one SPS active for a whole
+    /// picture, so only a broken stream mixes them).
+    #[error("slice does not fit its picture (another chroma format or size)")]
+    SliceDoesNotFitPicture,
     /// §8.3.1.2 / §8.3.2.2 / §8.3.3 / §8.3.4 — the bitstream requested
     /// an intra prediction mode whose required neighbour samples are
     /// marked "not available for Intra prediction". Every non-DC mode
@@ -12951,6 +12958,7 @@ pub(crate) fn ft_inter_mb<R: RefPicProvider>(
     scratch: &mut Picture,
     pic: &mut Picture,
 ) -> Result<(), ReconstructError> {
+    ft_fits(sps, pic, job.mb_x, job.mb_y)?;
     let chroma_array_type = sps.chroma_array_type();
     synth_mb_inter(
         &slice_data.macroblocks[job.idx],
@@ -12988,6 +12996,19 @@ pub(crate) fn ft_inter_mb<R: RefPicProvider>(
     Ok(())
 }
 
+/// Frame threading — whether macroblock (`mb_x`, `mb_y`) of a slice
+/// decoded with `sps` fits `pic`: the same chroma format, and inside the
+/// picture's planes (see [`ReconstructError::SliceDoesNotFitPicture`]).
+fn ft_fits(sps: &Sps, pic: &Picture, mb_x: u32, mb_y: u32) -> Result<(), ReconstructError> {
+    let inside = (u64::from(mb_x) + 1) * 16 <= u64::from(pic.width_in_samples)
+        && (u64::from(mb_y) + 1) * 16 <= u64::from(pic.height_in_samples);
+    if inside && sps.chroma_array_type() == pic.chroma_array_type {
+        Ok(())
+    } else {
+        Err(ReconstructError::SliceDoesNotFitPicture)
+    }
+}
+
 /// Frame threading — the §8.3 / §8.5 reconstruction of one intra
 /// macroblock of [`ft_motion_pass`]'s plan.
 #[allow(clippy::too_many_arguments)]
@@ -13000,6 +13021,8 @@ pub(crate) fn ft_intra_mb(
     pic: &mut Picture,
     grid: &mut MbGrid,
 ) -> Result<(), ReconstructError> {
+    let width_in_mbs = grid.width_in_mbs.max(1);
+    ft_fits(sps, pic, addr % width_in_mbs, addr / width_in_mbs)?;
     reconstruct_mb_intra(
         &slice_data.macroblocks[idx],
         addr,
