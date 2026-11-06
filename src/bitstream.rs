@@ -77,6 +77,12 @@ impl<'a> BitReader<'a> {
         (self.byte_pos, self.bit_pos)
     }
 
+    /// The whole buffer and the `(byte_index, bit_index)` of the next bit: for a reader that takes over from here and
+    /// reads the bytes itself (the CABAC engine, §9.3.1.2).
+    pub(crate) fn remaining_source(&self) -> (&'a [u8], usize, u8) {
+        (self.data, self.byte_pos, self.bit_pos)
+    }
+
     pub fn bits_remaining(&self) -> usize {
         if self.byte_pos >= self.data.len() {
             0

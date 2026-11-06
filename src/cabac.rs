@@ -278,20 +278,39 @@ pub fn validate_init_idc(init_idc: Option<u32>) -> CabacResult<Option<u32>> {
 pub struct CabacDecoder<'a> {
     /// §9.3.1.2 — `codIRange`, initialised to 510.
     cod_i_range: u32,
-    /// §9.3.1.2 — `codIOffset`, initialised from `read_bits(9)`.
-    cod_i_offset: u32,
-    reader: BitReader<'a>,
+    /// §9.3.1.2 — `codIOffset` (initialized from `read_bits(9)`), held with the
+    /// next `ahead` bits of the stream already read below it:
+    /// `window = codIOffset * 2^ahead + those bits`. Comparing or subtracting
+    /// `codIRange * 2^ahead` against `window` is comparing or subtracting
+    /// `codIRange` against `codIOffset`, and a read of `n` bits into
+    /// `codIOffset` (§9.3.3.2.2, §9.3.3.2.3) only lowers `ahead` by `n`, so the
+    /// stream is loaded a byte at a time, several bytes at once, rather than
+    /// read bit by bit through a `BitReader`.
+    window: u64,
+    /// Stream bits in `window` below `codIOffset`, at most `MAX_AHEAD`. A
+    /// conforming stream keeps `codIOffset` below `codIRange` (§9.3.1.2 forbids
+    /// starting at 510 or 511), so within 10 bits; one that starts there lets
+    /// it grow past them, and decodes to garbage here, without a panic, as it
+    /// would in any fixed-width engine.
+    ahead: u32,
+    data: &'a [u8],
+    /// The next byte of `data` to load into `window`.
+    next_byte: usize,
     /// Running count of bins decoded (decision + bypass + terminate).
     /// Used only for debug instrumentation, never affects decoding.
     bin_count: u64,
 }
 
+/// Stream bits loaded ahead of `codIOffset` at most: `codIOffset` needs 10
+/// bits (§9.3.1.2 NOTE, the bypass doubling), so `window` stays within 64.
+const MAX_AHEAD: u32 = 48;
+
 impl<'a> core::fmt::Debug for CabacDecoder<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("CabacDecoder")
             .field("cod_i_range", &self.cod_i_range)
-            .field("cod_i_offset", &self.cod_i_offset)
-            .field("reader_position", &self.reader.position())
+            .field("cod_i_offset", &self.offset())
+            .field("reader_position", &self.position())
             .finish()
     }
 }
@@ -304,14 +323,67 @@ impl<'a> CabacDecoder<'a> {
     /// `codIOffset == 510` or `codIOffset == 511`, but those are bitstream
     /// conformance requirements rather than decoder preconditions — we
     /// accept any 9-bit value here and let higher layers validate.
-    pub fn new(mut reader: BitReader<'a>) -> CabacResult<Self> {
-        let cod_i_offset = reader.u(9)?;
-        Ok(Self {
+    pub fn new(reader: BitReader<'a>) -> CabacResult<Self> {
+        let (data, byte, bit) = reader.remaining_source();
+        let mut dec = Self {
             cod_i_range: 510,
-            cod_i_offset,
-            reader,
+            window: 0,
+            ahead: 0,
+            data,
+            next_byte: byte,
             bin_count: 0,
-        })
+        };
+        // Starting inside a byte: that byte, without the bits before the
+        // position, is the first loaded.
+        if bit > 0
+            && let Some(&first) = data.get(byte)
+        {
+            dec.window = u64::from(first & (0xFF >> bit));
+            dec.ahead = 8 - u32::from(bit);
+            dec.next_byte = byte + 1;
+        }
+        dec.read_into_offset(9)?;
+        Ok(dec)
+    }
+
+    /// §9.3.1.2 `codIOffset`.
+    #[inline]
+    fn offset(&self) -> u32 {
+        (self.window >> self.ahead) as u32
+    }
+
+    /// Loads whole bytes below `codIOffset` while they fit.
+    #[inline]
+    fn refill(&mut self) {
+        while self.ahead <= MAX_AHEAD - 8 {
+            let Some(&byte) = self.data.get(self.next_byte) else {
+                break;
+            };
+            self.window = (self.window << 8) | u64::from(byte);
+            self.next_byte += 1;
+            self.ahead += 8;
+        }
+    }
+
+    /// `codIOffset = (codIOffset << bits) | read_bits(bits)`, the reads of
+    /// §9.3.3.2.2 and §9.3.3.2.3. Fails with `Eof`, changing nothing, when
+    /// fewer than `bits` bits are left, as `BitReader::u` does.
+    #[inline]
+    fn read_into_offset(&mut self, bits: u32) -> CabacResult<()> {
+        if self.ahead < bits {
+            self.refill();
+            if self.ahead < bits {
+                return Err(CabacError::Bitstream(BitError::Eof));
+            }
+        }
+        self.ahead -= bits;
+        Ok(())
+    }
+
+    /// `codIRange * 2^ahead`, `codIRange` on the scale of `window`.
+    #[inline]
+    fn scaled_range(&self) -> u64 {
+        u64::from(self.cod_i_range) << self.ahead
     }
 
     /// Total number of bins decoded so far (decision + bypass + terminate).
@@ -323,7 +395,8 @@ impl<'a> CabacDecoder<'a> {
     /// Cursor into the underlying reader — exposed for slice-layer code
     /// that needs to know the post-CABAC position (e.g. for debug).
     pub fn position(&self) -> (usize, u8) {
-        self.reader.position()
+        let at = self.next_byte * 8 - self.ahead as usize;
+        (at / 8, (at % 8) as u8)
     }
 
     /// Current `codIRange` — exposed for tests.
@@ -335,7 +408,14 @@ impl<'a> CabacDecoder<'a> {
     /// Current `codIOffset` — exposed for tests.
     #[cfg(test)]
     fn cod_i_offset(&self) -> u32 {
-        self.cod_i_offset
+        self.offset()
+    }
+
+    /// Sets `codIOffset`, keeping the bits read ahead below it.
+    #[cfg(test)]
+    fn set_cod_i_offset(&mut self, offset: u32) {
+        let below = self.window & ((1u64 << self.ahead) - 1);
+        self.window = (u64::from(offset) << self.ahead) | below;
     }
 
     /// Current `codIRange` — exposed for debug-only external callers
@@ -346,7 +426,7 @@ impl<'a> CabacDecoder<'a> {
 
     /// Current `codIOffset` — exposed for debug-only external callers.
     pub fn debug_offset(&self) -> u32 {
-        self.cod_i_offset
+        self.offset()
     }
 
     /// §9.3.3.2.1 — DecodeDecision. Returns the decoded bin (0 or 1)
@@ -376,7 +456,7 @@ impl<'a> CabacDecoder<'a> {
         let pre_state = ctx.state_idx;
         let pre_mps = ctx.val_mps;
         let pre_range = self.cod_i_range;
-        let pre_offset = self.cod_i_offset;
+        let pre_offset = if trace_on { self.offset() } else { 0 };
 
         // §9.3.3.2.1 equations (9-25) / (9-26).
         let q_idx = ((self.cod_i_range >> 6) & 0b11) as usize;
@@ -384,10 +464,11 @@ impl<'a> CabacDecoder<'a> {
         self.cod_i_range -= cod_i_range_lps;
 
         let bin_val: u8;
-        if self.cod_i_offset >= self.cod_i_range {
+        let scaled_range = self.scaled_range();
+        if self.window >= scaled_range {
             // LPS path.
             bin_val = 1 - ctx.val_mps;
-            self.cod_i_offset -= self.cod_i_range;
+            self.window -= scaled_range;
             self.cod_i_range = cod_i_range_lps;
             // §9.3.3.2.1.1 equation (9-27).
             if ctx.state_idx == 0 {
@@ -414,7 +495,7 @@ impl<'a> CabacDecoder<'a> {
                 ctx.state_idx,
                 ctx.val_mps,
                 self.cod_i_range,
-                self.cod_i_offset,
+                self.offset(),
             );
         }
         Ok(bin_val)
@@ -433,10 +514,11 @@ impl<'a> CabacDecoder<'a> {
     pub fn decode_bypass(&mut self) -> CabacResult<u8> {
         let trace_on = bin_trace_enabled();
         let pre_range = self.cod_i_range;
-        let pre_offset = self.cod_i_offset;
-        self.cod_i_offset = (self.cod_i_offset << 1) | self.reader.u(1)?;
-        let bin = if self.cod_i_offset >= self.cod_i_range {
-            self.cod_i_offset -= self.cod_i_range;
+        let pre_offset = if trace_on { self.offset() } else { 0 };
+        self.read_into_offset(1)?;
+        let scaled_range = self.scaled_range();
+        let bin = if self.window >= scaled_range {
+            self.window -= scaled_range;
             1
         } else {
             0
@@ -445,7 +527,12 @@ impl<'a> CabacDecoder<'a> {
         if trace_on {
             eprintln!(
                 "[BIN {:>8}] BP pre_range={:>4} pre_offset={:>4} bin={} post_range={:>4} post_offset={:>4}",
-                self.bin_count, pre_range, pre_offset, bin, self.cod_i_range, self.cod_i_offset,
+                self.bin_count,
+                pre_range,
+                pre_offset,
+                bin,
+                self.cod_i_range,
+                self.offset(),
             );
         }
         Ok(bin)
@@ -464,9 +551,9 @@ impl<'a> CabacDecoder<'a> {
     pub fn decode_terminate(&mut self) -> CabacResult<u8> {
         let trace_on = bin_trace_enabled();
         let pre_range = self.cod_i_range;
-        let pre_offset = self.cod_i_offset;
+        let pre_offset = if trace_on { self.offset() } else { 0 };
         self.cod_i_range -= 2;
-        let bin = if self.cod_i_offset >= self.cod_i_range {
+        let bin = if self.window >= self.scaled_range() {
             // Terminated. Per spec: "no renormalization is carried out, and
             // CABAC decoding is terminated". The last inserted bit is the
             // rbsp_stop_one_bit when decoding end_of_slice_flag.
@@ -479,7 +566,12 @@ impl<'a> CabacDecoder<'a> {
         if trace_on {
             eprintln!(
                 "[BIN {:>8}] TT pre_range={:>4} pre_offset={:>4} bin={} post_range={:>4} post_offset={:>4}",
-                self.bin_count, pre_range, pre_offset, bin, self.cod_i_range, self.cod_i_offset,
+                self.bin_count,
+                pre_range,
+                pre_offset,
+                bin,
+                self.cod_i_range,
+                self.offset(),
             );
         }
         Ok(bin)
@@ -500,7 +592,7 @@ impl<'a> CabacDecoder<'a> {
         if self.cod_i_range < 256 {
             let shift = self.cod_i_range.leading_zeros() - 23;
             self.cod_i_range <<= shift;
-            self.cod_i_offset = (self.cod_i_offset << shift) | self.reader.u(shift)?;
+            self.read_into_offset(shift)?;
         }
         Ok(())
     }
@@ -509,6 +601,171 @@ impl<'a> CabacDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §9.3.3.2 read literally, a bit at a time through a `BitReader`: the
+    /// reference the windowed engine must match bin for bin.
+    struct SpecEngine<'a> {
+        range: u32,
+        offset: u32,
+        reader: BitReader<'a>,
+    }
+
+    impl<'a> SpecEngine<'a> {
+        fn new(mut reader: BitReader<'a>) -> CabacResult<Self> {
+            let offset = reader.u(9)?;
+            Ok(Self {
+                range: 510,
+                offset,
+                reader,
+            })
+        }
+
+        fn renorm(&mut self) -> CabacResult<()> {
+            while self.range < 256 {
+                self.range <<= 1;
+                self.offset = (self.offset << 1) | self.reader.u(1)?;
+            }
+            Ok(())
+        }
+
+        fn decision(&mut self, ctx: &mut CtxState) -> CabacResult<u8> {
+            let lps =
+                RANGE_TAB_LPS[ctx.state_idx as usize][((self.range >> 6) & 3) as usize] as u32;
+            self.range -= lps;
+            let bin = if self.offset >= self.range {
+                let bin = 1 - ctx.val_mps;
+                self.offset -= self.range;
+                self.range = lps;
+                if ctx.state_idx == 0 {
+                    ctx.val_mps = 1 - ctx.val_mps;
+                }
+                ctx.state_idx = TRANS_IDX_LPS[ctx.state_idx as usize];
+                bin
+            } else {
+                ctx.state_idx = TRANS_IDX_MPS[ctx.state_idx as usize];
+                ctx.val_mps
+            };
+            self.renorm()?;
+            Ok(bin)
+        }
+
+        fn bypass(&mut self) -> CabacResult<u8> {
+            self.offset = (self.offset << 1) | self.reader.u(1)?;
+            Ok(if self.offset >= self.range {
+                self.offset -= self.range;
+                1
+            } else {
+                0
+            })
+        }
+
+        fn terminate(&mut self) -> CabacResult<u8> {
+            self.range -= 2;
+            if self.offset >= self.range {
+                return Ok(1);
+            }
+            self.renorm()?;
+            Ok(0)
+        }
+    }
+
+    /// A small seeded generator (xorshift64*), so the test needs no crate and
+    /// every failure reproduces from its seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+    }
+
+    /// The windowed engine against §9.3.3.2 read literally: random streams of
+    /// every length up to 64 bytes, started at every bit offset of their first
+    /// byte, decoded by a random mix of decisions (with random context states),
+    /// bypass bins and terminate bins until the stream runs out. Each bin, each
+    /// `Eof`, and the engine's range, offset and bit position after each call
+    /// must be the reference's.
+    #[test]
+    fn windowed_engine_matches_the_spec_engine_bin_for_bin() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for case in 0..4000u32 {
+            let len = (rng.next() % 65) as usize;
+            let data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+            let start_bit = (rng.next() % 8) as u32;
+            let reader = || {
+                let mut r = BitReader::new(&data);
+                r.u(start_bit).expect("a start inside the first byte");
+                r
+            };
+            if data.is_empty() && start_bit > 0 {
+                continue;
+            }
+            let (fast, spec) = (CabacDecoder::new(reader()), SpecEngine::new(reader()));
+            let (mut fast, mut spec) = match (fast, spec) {
+                (Ok(f), Ok(s)) => (f, s),
+                (Err(f), Err(s)) => {
+                    assert_eq!(f, s, "case {case}: init error");
+                    continue;
+                }
+                (f, s) => panic!("case {case}: init {:?} against {:?}", f.is_ok(), s.is_ok()),
+            };
+            // §9.3.1.2: a conforming stream never starts with codIOffset 510
+            // or 511, so codIOffset stays below codIRange (and within 10 bits)
+            // from there on. A stream that does decodes to garbage in either
+            // engine, though not the same garbage.
+            if spec.offset >= 510 {
+                continue;
+            }
+            let mut contexts: Vec<CtxState> = (0..8)
+                .map(|_| CtxState {
+                    state_idx: (rng.next() % 64) as u8,
+                    val_mps: (rng.next() % 2) as u8,
+                })
+                .collect();
+            for call in 0..2000u32 {
+                let kind = rng.next() % 16;
+                let ctx = (rng.next() % 8) as usize;
+                let (got, want) = match kind {
+                    0..=10 => {
+                        let mut spec_ctx = contexts[ctx];
+                        let got = fast.decode_decision(&mut contexts[ctx]);
+                        let want = spec.decision(&mut spec_ctx);
+                        if got.is_ok() {
+                            assert_eq!(contexts[ctx], spec_ctx, "case {case} call {call}: context");
+                        }
+                        (got, want)
+                    }
+                    11..=14 => (fast.decode_bypass(), spec.bypass()),
+                    _ => (fast.decode_terminate(), spec.terminate()),
+                };
+                assert_eq!(got, want, "case {case} call {call} (kind {kind}): bin");
+                if got.is_err() {
+                    break;
+                }
+                assert_eq!(
+                    fast.cod_i_range(),
+                    spec.range,
+                    "case {case} call {call}: range"
+                );
+                assert_eq!(
+                    fast.cod_i_offset(),
+                    spec.offset,
+                    "case {case} call {call}: offset"
+                );
+                assert_eq!(
+                    fast.position(),
+                    spec.reader.position(),
+                    "case {case} call {call}: position"
+                );
+                if got == Ok(1) && kind == 15 {
+                    break;
+                }
+            }
+        }
+    }
 
     // -----------------------------------------------------------------
     // §9.3.1.1 — context variable initialisation. Tests hand-derive the
@@ -709,7 +966,7 @@ mod tests {
         let data = [0x00, 0x00];
         let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
         dec.cod_i_range = 270;
-        dec.cod_i_offset = 0;
+        dec.set_cod_i_offset(0);
         let mut ctx = CtxState {
             state_idx: 1,
             val_mps: 0,
