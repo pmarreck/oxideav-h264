@@ -67,6 +67,10 @@ pub enum SliceHeaderError {
     /// §7.4.3.2 — `chroma_log2_weight_denom` in range 0..=7.
     #[error("chroma_log2_weight_denom out of range (got {0}, max 7)")]
     ChromaLog2WeightDenomOutOfRange(u32),
+    /// §7.4.3.2 — every luma and chroma weight and offset in range
+    /// -128..=127.
+    #[error("prediction weight or offset out of range (got {0}, must be -128..=127)")]
+    PredWeightOutOfRange(i32),
     /// §7.4.3.3 — `memory_management_control_operation` in range 0..=6.
     #[error("memory_management_control_operation out of range (got {0}, max 6)")]
     MmcoOutOfRange(u32),
@@ -782,11 +786,21 @@ fn parse_weight_list(
     let count = num_ref_idx_minus1 as usize + 1;
     let mut luma = Vec::with_capacity(count);
     let mut chroma = Vec::with_capacity(if chroma_array_type != 0 { count } else { 0 });
+    // §7.4.3.2 — weights and offsets lie in -128..=127; weighted
+    // prediction's arithmetic (and its 16-bit vector path) relies on it.
+    fn weight(r: &mut BitReader<'_>) -> Result<i32, SliceHeaderError> {
+        let v = r.se()?;
+        if (-128..=127).contains(&v) {
+            Ok(v)
+        } else {
+            Err(SliceHeaderError::PredWeightOutOfRange(v))
+        }
+    }
     for _ in 0..count {
         let luma_flag = r.u(1)? == 1;
         luma.push(if luma_flag {
-            let w = r.se()?;
-            let o = r.se()?;
+            let w = weight(r)?;
+            let o = weight(r)?;
             Some((w, o))
         } else {
             None
@@ -794,10 +808,10 @@ fn parse_weight_list(
         if chroma_array_type != 0 {
             let chroma_flag = r.u(1)? == 1;
             if chroma_flag {
-                let wcb = r.se()?;
-                let ocb = r.se()?;
-                let wcr = r.se()?;
-                let ocr = r.se()?;
+                let wcb = weight(r)?;
+                let ocb = weight(r)?;
+                let wcr = weight(r)?;
+                let ocr = weight(r)?;
                 chroma.push(Some([(wcb, ocb), (wcr, ocr)]));
             } else {
                 chroma.push(None);
@@ -1287,6 +1301,64 @@ mod tests {
         assert_eq!(pwt.chroma_weights_l0, vec![None]);
         assert_eq!(pwt.luma_weights_l1, vec![None]);
         assert_eq!(pwt.chroma_weights_l1, vec![Some([(3, 0), (-2, 1)])]);
+    }
+
+    /// §7.4.3.2 — a weight or offset outside -128..=127 refuses the
+    /// slice (a fuzzed stream's huge weight overflowed weighted
+    /// prediction's 32-bit arithmetic); the limits themselves parse.
+    #[test]
+    fn prediction_weights_outside_their_range_refuse_the_slice() {
+        let sps = dummy_sps();
+        let mut pps = dummy_pps();
+        pps.weighted_bipred_idc = 1;
+        pps.num_ref_idx_l0_default_active_minus1 = 0;
+        pps.num_ref_idx_l1_default_active_minus1 = 0;
+        let nh = nal(NalUnitType::SliceNonIdr, 2);
+        // [luma weight, luma offset, Cb weight, Cb offset, Cr weight, Cr
+        // offset] of list 0's one entry.
+        let parse = |values: [i32; 6]| {
+            let mut w = BitWriter::new();
+            w.ue(0); // first_mb_in_slice
+            w.ue(1); // slice_type = 1 (B)
+            w.ue(0); // pps_id
+            w.u(4, 5); // frame_num
+            w.u(4, 10); // pic_order_cnt_lsb
+            w.u(1, 1); // direct_spatial_mv_pred_flag
+            w.u(1, 0); // num_ref_idx_active_override_flag
+            w.u(1, 0); // ref_pic_list_modification_flag_l0
+            w.u(1, 0); // ref_pic_list_modification_flag_l1
+            w.ue(1); // luma_log2_weight_denom
+            w.ue(0); // chroma_log2_weight_denom
+            w.u(1, 1); // luma_weight_l0_flag
+            w.se(values[0]);
+            w.se(values[1]);
+            w.u(1, 1); // chroma_weight_l0_flag
+            for &v in &values[2..] {
+                w.se(v);
+            }
+            w.u(1, 0); // luma_weight_l1_flag
+            w.u(1, 0); // chroma_weight_l1_flag
+            w.u(1, 0); // sliding window
+            w.se(0); // slice_qp_delta
+            SliceHeader::parse(&w.into_bytes(), &sps, &pps, &nh)
+        };
+        let limits = parse([127, -128, -128, 127, 127, -128]).unwrap();
+        let pwt = limits.pred_weight_table.as_ref().unwrap();
+        assert_eq!(pwt.luma_weights_l0, vec![Some((127, -128))]);
+        assert_eq!(
+            pwt.chroma_weights_l0,
+            vec![Some([(-128, 127), (127, -128)])]
+        );
+        for field in 0..6 {
+            for bad in [128, -129, 1 << 20] {
+                let mut values = [1; 6];
+                values[field] = bad;
+                assert!(
+                    matches!(parse(values), Err(SliceHeaderError::PredWeightOutOfRange(v)) if v == bad),
+                    "field {field} = {bad}"
+                );
+            }
+        }
     }
 
     #[test]

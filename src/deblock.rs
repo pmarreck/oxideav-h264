@@ -780,9 +780,9 @@ mod tests {
                 let base = next(max as u32 + 1) as i32;
                 let spread = 1 + next(24) as i32;
                 let mut lanes = [[0i32; EDGE_LINES]; 8];
-                for k in 0..8 {
-                    for l in 0..EDGE_LINES {
-                        lanes[k][l] =
+                for lane in &mut lanes {
+                    for sample in lane.iter_mut() {
+                        *sample =
                             (base + next(2 * spread as u32 + 1) as i32 - spread).clamp(0, max);
                     }
                 }

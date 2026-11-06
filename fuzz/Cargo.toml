@@ -63,3 +63,10 @@ name = "deep_roundtrip"
 path = "fuzz_targets/deep_roundtrip.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "panic_free_decode_threaded"
+path = "fuzz_targets/panic_free_decode_threaded.rs"
+test = false
+doc = false
+bench = false

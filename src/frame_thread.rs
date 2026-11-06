@@ -510,6 +510,15 @@ pub(crate) fn run_pixels(
             let w = &works[si];
             w.plan.inter[ji].ref_bands(cat, height, chroma_band_rows, |list, ref_idx, band| {
                 if let Some(p) = w.refs.ref_planes(list, ref_idx as u32) {
+                    // The bands follow this picture's geometry. A
+                    // reference of another height or chroma format
+                    // (only a broken stream mixes them, as a fuzzed
+                    // SPS change without an IDR did) is read clamped
+                    // to its own planes, so all of it is waited for.
+                    let same = w.refs.ref_pic(list, ref_idx as u32).is_some_and(|r| {
+                        r.height_in_samples == height && r.chroma_array_type == cat
+                    });
+                    let band = if same { band } else { usize::MAX };
                     let key = p as *const SharedPlanes;
                     match needs.iter_mut().find(|n| n.0 == key) {
                         Some(n) => n.1 = n.1.max(band),

@@ -5693,8 +5693,9 @@ fn weighted_pair_row(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        // pred_weight_table weights are not range-checked by the parser:
-        // a malformed stream's out-of-range weight takes the 32-bit path.
+        // The slice header parser refuses pred_weight_table weights
+        // outside -128..=127 (§7.4.3.2); any other caller's wider
+        // weight still takes the 32-bit path.
         if i16::try_from(wa).is_ok() && i16::try_from(wb).is_ok() && max <= i32::from(i16::MAX) {
             weighted_pair_row_sse2(d, a, b, wa, wb, round, shift, off, max);
         } else {
@@ -13103,12 +13104,13 @@ mod tests {
     };
 
     /// The weighted-pair row kernel (scalar, and the SSE2 form on
-    /// x86-64) equals `Clip3(0, max, ((a * wa + b * wb + round) >> shift)
-    /// + off)` per sample, with `b` an array or the constant 1, for every
-    /// row length from 1 to 17 (vector tails), every shift used by
-    /// eqs. 8-274..8-276, weights over -128..=128 (and out-of-range ones a
-    /// malformed stream can carry), offsets past both clip bounds, and 8-,
-    /// 10- and 14-bit samples.
+    /// x86-64) equals
+    /// `Clip3(0, max, ((a * wa + b * wb + round) >> shift) + off)` per
+    /// sample, with `b` an array or the constant 1, for every row length
+    /// from 1 to 17 (vector tails), every shift used by eqs.
+    /// 8-274..8-276, weights over -128..=128 (and out-of-range ones, which
+    /// the slice header parser now refuses), offsets past both clip
+    /// bounds, and 8-, 10- and 14-bit samples.
     #[test]
     fn weighted_pair_rows_match_the_per_sample_equation() {
         let mut seed = 0x7f4a_7c15u32;
@@ -13125,9 +13127,9 @@ mod tests {
             let a: Vec<i32> = (0..len).map(|_| next(max as u32 + 1) as i32).collect();
             let b: Vec<i32> = (0..len).map(|_| next(max as u32 + 1) as i32).collect();
             let shift = next(9);
-            // Mostly in-range weights; every tenth row carries a weight a
-            // malformed pred_weight_table could hold (it is not range-checked),
-            // which must still give the 32-bit result.
+            // Mostly in-range weights; every tenth row carries a wider
+            // weight (the parser refuses one in a pred_weight_table), which
+            // must still give the 32-bit result.
             let wide = |w: i32| if round_no % 10 == 9 { w * 300 } else { w };
             let (wa, wb) = (wide(next(257) as i32 - 128), wide(next(257) as i32 - 128));
             let round = next(1 << shift.max(1)) as i32;
