@@ -15,6 +15,10 @@
 //! * `crash-5108308b`, `crash-7cc0a0f5`: a slice naming a parameter set
 //!   of another chroma format than its picture's, so the frame-threaded
 //!   sample stage copied chroma from planes the picture never had.
+//! * `crash-9c17665a`: the same with a taller parameter set, on the
+//!   serial path's slice-level threads, which split the picture's rows
+//!   by the slice's own geometry. Such a slice is now refused at every
+//!   thread count (§7.4.1.2.1: one SPS is active for a whole picture).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -39,6 +43,10 @@ const FIXTURES: &[(&str, &[u8])] = &[
     (
         "7cc0a0f5 (slice of another chroma format)",
         include_bytes!("fixtures/fuzz_regressions/crash-7cc0a0f5928998098c4c67e2bd50f660f334cd3c"),
+    ),
+    (
+        "9c17665a (slice of another size, serial slice threads)",
+        include_bytes!("fixtures/fuzz_regressions/crash-9c17665a0ce208fb785aca82d063874c6060ccbc"),
     ),
 ];
 

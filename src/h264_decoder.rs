@@ -1361,19 +1361,24 @@ impl H264CodecDecoder {
         // (§7.3.2.9 partitioned, SP / SI, slice groups) turns the
         // picture serial: reconstruct what the earlier slices planned
         // right here, then carry on with the serial path.
-        let ft_picture = self.in_progress.as_ref().is_some_and(|p| p.ft.is_some());
-        // A continuation slice naming a parameter set of another size or
-        // chroma format than its picture's (§7.4.1.2.1 keeps one SPS
-        // active for a picture, so only a broken stream does) turns the
-        // picture serial too: the serial path is what handles it, and
-        // the pool's output stays the serial output.
-        let fits = self.in_progress.as_ref().is_some_and(|p| {
+        // §7.4.1.2.1 keeps one SPS active for a whole picture: a slice
+        // naming a parameter set of another size or chroma format than
+        // its picture's (a broken stream re-sending a changed SPS without
+        // an IDR) is refused, at every thread count alike, rather than
+        // reconstructed into planes laid out for another geometry.
+        let fits = self.in_progress.as_ref().is_none_or(|p| {
             p.pic.chroma_array_type == sps.chroma_array_type()
                 && p.pic.width_in_samples == sps.pic_width_in_mbs() * 16
                 && p.pic.height_in_samples == sps.pic_height_in_mbs(header.field_pic_flag) * 16
         });
+        if !fits {
+            return Err(Error::invalid(
+                "h264 slice: its SPS gives another picture size or chroma format than its picture's (§7.4.1.2.1)",
+            ));
+        }
+        let ft_picture = self.in_progress.as_ref().is_some_and(|p| p.ft.is_some());
         let ft_slice =
-            ft_picture && fits && dp.is_none() && reconstruct::ft_eligible_slice(header, sps, pps);
+            ft_picture && dp.is_none() && reconstruct::ft_eligible_slice(header, sps, pps);
         if ft_picture && !ft_slice {
             self.ft_convert_in_progress();
         }
