@@ -401,6 +401,12 @@ pub fn select_scaling_list_4x4(list_idx: usize, sps: &Sps, pps: &Pps) -> [i32; 1
     // with the appropriate fall-back rule set.
     let ext = pps.extension.as_ref();
     let pic_present = ext.is_some_and(|e| e.pic_scaling_matrix_present_flag);
+    // Neither the SPS nor the PPS carries scaling matrices: every list is
+    // Flat_4x4_16 (eq. 7-8), which the inverse scan leaves as it is.
+    // Reconstruction asks for the lists once per macroblock.
+    if !pic_present && !sps.seq_scaling_matrix_present_flag {
+        return FLAT_4X4_16;
+    }
     // §8.5.9 — the derived list is in bitstream scan order; weightScale
     // is its §8.5.6 inverse scan (row-major). Flat lists are invariant.
     let scan_list = if !pic_present {
@@ -427,6 +433,10 @@ pub fn select_scaling_list_8x8(list_idx: usize, sps: &Sps, pps: &Pps) -> [i32; 6
     }
     let ext = pps.extension.as_ref();
     let pic_present = ext.is_some_and(|e| e.pic_scaling_matrix_present_flag);
+    // No scaling matrices anywhere: Flat_8x8_16, unchanged by the scan.
+    if !pic_present && !sps.seq_scaling_matrix_present_flag {
+        return FLAT_8X8_16;
+    }
     // §8.5.9 — inverse-scan the derived scan-order list into the
     // row-major weightScale8x8 every consumer indexes.
     let scan_list = if !pic_present {
