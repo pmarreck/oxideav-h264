@@ -31,6 +31,11 @@ Five `cargo-fuzz` (libFuzzer) targets live in `fuzz_targets/`:
     for a different codec entirely;
   * it is opened with `err_detect=explode` so oracle frames are never
     concealment output;
+  * it is also opened with `flags=+unaligned`, so it applies the SPS
+    frame-cropping window in full: by default it crops left and top only
+    as far as keeps its plane pointers aligned, and an 8-column left
+    crop came back as the full 16-column picture (fixture
+    `crash-46181c67...`, 2026-11-08);
   * our side is classified before parity asserts: output produced with
     `decode_error_count() > 0` is *concealed* (never pixel-compared),
     and streams whose stored SPSes use >8-bit depths / monochrome /

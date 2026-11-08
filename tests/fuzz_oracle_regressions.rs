@@ -266,3 +266,36 @@ fn long_session_reference_store_stays_dpb_bounded() {
          must stay bounded by the DPB (pre-round-430 bug held one per reference frame)"
     );
 }
+
+/// Round 3 of the speed work (2026-11-08 local fuzz run) — the input
+/// carries a second SPS for a 16x16 picture with
+/// `frame_crop_left_offset = 4`, a spec-valid window of
+/// CropUnitX * 4 = 8 luma columns (§7.4.2.1.1, 4:2:0 frame), so the
+/// cropped picture is 8x16. The reference decoder returned all 16
+/// columns because by default it moves plane pointers only as far as
+/// keeps them aligned; the harness now opens it with the public
+/// `unaligned` codec flag. This pins our side: the IDR coded under that
+/// SPS comes out cropped in full, 8x16 luma and 4x8 chroma, cleanly.
+#[test]
+fn unaligned_left_crop_is_applied_in_full() {
+    let data =
+        include_bytes!("fixtures/fuzz_regressions/crash-46181c67aa60a4447c4d64e0f3aa17a9ebc6a951");
+    let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 30), data.to_vec());
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    let mut shapes = Vec::new();
+    while let Ok(Frame::Video(f)) = dec.receive_frame() {
+        let dims: Vec<(usize, usize)> = f
+            .planes
+            .iter()
+            .map(|p| (p.stride, p.data.len() / p.stride.max(1)))
+            .collect();
+        shapes.push(dims);
+    }
+    assert_eq!(dec.decode_error_count(), 0, "the stream decodes cleanly");
+    assert!(
+        shapes.contains(&vec![(8, 16), (4, 8), (4, 8)]),
+        "expected an 8x16 frame with 4x8 chroma (left crop of 8 columns applied), got {shapes:?}"
+    );
+}

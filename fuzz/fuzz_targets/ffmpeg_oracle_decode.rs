@@ -43,6 +43,10 @@
 //!   oracle frame is never concealment output; our side is gated on
 //!   `decode_error_count() == 0` for the same reason. Concealed samples
 //!   are implementation-defined and must never reach pixel asserts.
+//! - The oracle decoder is also opened with `flags=+unaligned`, so it
+//!   applies the §7.4.2.1.1 frame-cropping window in full (by default
+//!   a left or top crop stops short of an unaligned plane offset and the
+//!   frame comes back wider or taller than the cropped picture).
 //!
 //! Skips silently when libavcodec isn't loadable so the harness still
 //! runs against the panic_free coverage even on hosts without ffmpeg

@@ -309,6 +309,16 @@ pub mod libavcodec {
                     // it defers error reporting across frames, which
                     // blunts err_detect=explode.
                     let _ = ds(&mut opts, c"threads".as_ptr(), c"1".as_ptr(), 0);
+                    // Apply the SPS frame-cropping window in full. By
+                    // default the reference moves the plane pointers
+                    // only as far as keeps them aligned, so a left or
+                    // top crop that is not a multiple of its alignment
+                    // comes back partly unapplied (an 8-sample left crop
+                    // of a 16x16 picture returns all 16 columns). The
+                    // public `unaligned` codec flag lifts that, which
+                    // makes the reference frame's geometry the cropped
+                    // geometry of §7.4.2.1.1 that our decoder emits.
+                    let _ = ds(&mut opts, c"flags".as_ptr(), c"+unaligned".as_ptr(), 0);
                 }
                 let rc = open2(ctx, codec, &mut opts);
                 if let Some(ref df) = dict_free {
