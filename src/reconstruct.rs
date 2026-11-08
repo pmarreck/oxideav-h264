@@ -35,9 +35,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::deblock::{
-    BsInputs, EDGE_LINES, EdgeSamples, EdgeThresholds, FilterParams, Plane, alpha_from_index,
-    beta_from_index, derive_boundary_strength, filter_edge, filter_line, filter_luma_lines16,
-    tc0_from,
+    BsInputs, CHROMA_EDGE_LINES, EDGE_LINES, EdgeSamples, EdgeThresholds, FilterParams, Plane,
+    alpha_from_index, beta_from_index, derive_boundary_strength, filter_chroma_lines16,
+    filter_edge, filter_line, filter_luma_lines16, tc0_from,
 };
 use crate::inter_pred::{BiPredMode, WeightedEntry, weighted_pred_explicit};
 use crate::intra_pred::{
@@ -11524,6 +11524,211 @@ fn deblock_chroma_mb(
     mb_field_flags: &[bool],
     luma_bs: &[u8],
 ) {
+    if !mbaff_frame_flag
+        && deblock_chroma_mb_frame_420(
+            pic,
+            y_base,
+            cw,
+            ch,
+            grid,
+            plane,
+            mb_x,
+            mb_y,
+            alpha_off,
+            beta_off,
+            bit_depth,
+            if plane == 0 { cb_offset } else { cr_offset },
+            luma_bs,
+        )
+    {
+        return;
+    }
+    deblock_chroma_mb_by_segment(
+        pic,
+        y_base,
+        cw,
+        ch,
+        grid,
+        plane,
+        mb_x,
+        mb_y,
+        alpha_off,
+        beta_off,
+        bit_depth,
+        cb_offset,
+        cr_offset,
+        mbaff_frame_flag,
+        field_pic,
+        mb_field_flags,
+        luma_bs,
+    );
+}
+
+/// [`deblock_chroma_mb`] for a frame macroblock (no MBAFF) of a 4:2:0
+/// picture whose 8x8 chroma block lies inside the picture: both vertical
+/// edges' sixteen lines at once, then both horizontal edges'
+/// ([`filter_chroma_lines16`]), instead of two lines at a time. The two
+/// edges of a direction share no sample (each reads two samples on either
+/// side and the edges are four apart), so filtering them together is
+/// filtering them in turn.
+/// Line pair `k` of an edge takes the bS recorded for luma segment `k` of
+/// the corresponding luma edge (§8.7.2.1, last paragraph), and an edge's
+/// qPav comes from its two macroblocks (eq. 8-452 with eq. 8-319's QPC),
+/// as in [`deblock_chroma_mb_by_segment`].
+///
+/// Returns `false`, changing nothing, when the macroblock is not that case,
+/// when the deblocking trace is on, when an edge it would filter has a
+/// segment without a recorded bS, or when an edge's eight-sample windows
+/// reach past the rows `pic` holds; [`deblock_chroma_mb_by_segment`] then
+/// filters it.
+#[allow(clippy::too_many_arguments)]
+fn deblock_chroma_mb_frame_420(
+    pic: &mut Picture,
+    y_base: i32,
+    cw: i32,
+    ch: i32,
+    grid: &MbGrid,
+    plane: u8,
+    mb_x: i32,
+    mb_y: i32,
+    alpha_off: i32,
+    beta_off: i32,
+    bit_depth: u32,
+    qp_offset: i32,
+    luma_bs: &[u8],
+) -> bool {
+    let mb_w = grid.width_in_mbs as i32;
+    let (x0, y0) = (mb_x * 8, mb_y * 8);
+    if pic.chroma_array_type != 1
+        || deblock_trace_enabled()
+        || mb_x < 0
+        || mb_y < 0
+        || mb_x >= mb_w
+        || mb_y >= grid.height_in_mbs as i32
+        || x0 + 8 > cw
+        || y0 + 8 > ch
+        || luma_bs.len() < 32
+    {
+        return false;
+    }
+    let addr = mb_y * mb_w + mb_x;
+    let Some(q_info) = grid.get(addr as u32) else {
+        return false;
+    };
+    let (buf_w, buf_h) = (pic.chroma_width() as i32, pic.chroma_height() as i32);
+    // Vertical edges (columns x0, x0 + 4), then horizontal (rows y0, y0 + 4):
+    // the edge, its p macroblock and its four segments' bS.
+    let mut edges: [Option<(i32, &MbInfo, [u8; 4])>; 4] = [None; 4];
+    for (i, edge_slot) in edges.iter_mut().enumerate() {
+        let vertical = i < 2;
+        let off = (i as i32 % 2) * 4;
+        let edge = if vertical { x0 } else { y0 } + off;
+        if edge == 0 {
+            continue;
+        }
+        let rec = luma_bs_index(0, 0, 0, !vertical, off / 2, 0);
+        let bs: [u8; 4] = luma_bs[rec..rec + 4].try_into().expect("four segments");
+        if bs == [0; 4] {
+            continue;
+        }
+        let p_info = if off != 0 {
+            Some(q_info)
+        } else if vertical {
+            grid.get((addr - 1) as u32)
+        } else {
+            grid.get((addr - mb_w) as u32)
+        };
+        let p_info = match p_info {
+            Some(p) if p.available && q_info.available => p,
+            _ => continue,
+        };
+        if bs.contains(&BS_NOT_DERIVED) {
+            return false;
+        }
+        // The by-segment filters' in-buffer condition for each segment.
+        let inside = if vertical {
+            edge + 4 <= buf_w && y0 - y_base >= 0 && y0 - y_base + 8 <= buf_h
+        } else {
+            x0 + 8 <= buf_w && edge - y_base >= 4 && edge - y_base + 4 <= buf_h
+        };
+        if !inside {
+            return false;
+        }
+        *edge_slot = Some((edge, p_info, bs));
+    }
+    let qp_bd_offset_c = qp_bd_offset(bit_depth.saturating_sub(8));
+    let max = (1i32 << bit_depth) - 1;
+    let stride = buf_w as usize;
+    let buf: &mut [Sample] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+    for (vertical, pair) in [(true, &edges[..2]), (false, &edges[2..])] {
+        if pair.iter().all(Option::is_none) {
+            continue;
+        }
+        // Sample k (p1, p0, q0, q1) of line l across `edge`, as an index
+        // into `buf`.
+        let at = |edge: i32, k: usize, l: usize| -> usize {
+            if vertical {
+                (y0 - y_base) as usize * stride + l * stride + edge as usize - 2 + k
+            } else {
+                (edge - y_base - 2) as usize * stride + k * stride + x0 as usize + l
+            }
+        };
+        let mut lanes = [[0i32; 2 * CHROMA_EDGE_LINES]; 4];
+        let (mut bs8, mut tc0) = ([0u8; 8], [0i32; 8]);
+        let (mut alpha, mut beta) = ([0i32; 2], [0i32; 2]);
+        for (h, slot) in pair.iter().enumerate() {
+            let Some((edge, p_info, bs)) = *slot else {
+                continue;
+            };
+            let qp_avg = chroma_qp_avg(p_info.qp_y, q_info.qp_y, qp_offset, qp_bd_offset_c);
+            let thresholds =
+                bs.map(|b| EdgeThresholds::new(b.max(1), qp_avg, alpha_off, beta_off, bit_depth));
+            bs8[4 * h..4 * h + 4].copy_from_slice(&bs);
+            tc0[4 * h..4 * h + 4].copy_from_slice(&thresholds.map(|t| t.tc0));
+            (alpha[h], beta[h]) = (thresholds[0].alpha, thresholds[0].beta);
+            for (k, lane) in lanes.iter_mut().enumerate() {
+                for l in 0..CHROMA_EDGE_LINES {
+                    lane[CHROMA_EDGE_LINES * h + l] = i32::from(buf[at(edge, k, l)]);
+                }
+            }
+        }
+        filter_chroma_lines16(&mut lanes, bs8, tc0, alpha, beta, max);
+        for (h, slot) in pair.iter().enumerate() {
+            let Some((edge, _, _)) = *slot else {
+                continue;
+            };
+            for (k, lane) in lanes.iter().enumerate().take(3).skip(1) {
+                for l in 0..CHROMA_EDGE_LINES {
+                    buf[at(edge, k, l)] = to_sample(lane[CHROMA_EDGE_LINES * h + l]);
+                }
+            }
+        }
+    }
+    true
+}
+
+/// [`deblock_chroma_mb`] two lines (4:2:0) or four (4:2:2) at a time, each
+/// segment's bS taken from the luma record or derived, for every case.
+#[allow(clippy::too_many_arguments)]
+fn deblock_chroma_mb_by_segment(
+    pic: &mut Picture,
+    y_base: i32,
+    cw: i32,
+    ch: i32,
+    grid: &MbGrid,
+    plane: u8,
+    mb_x: i32,
+    mb_y: i32,
+    alpha_off: i32,
+    beta_off: i32,
+    bit_depth: u32,
+    cb_offset: i32,
+    cr_offset: i32,
+    mbaff_frame_flag: bool,
+    field_pic: bool,
+    mb_field_flags: &[bool],
+    luma_bs: &[u8],
+) {
     // §7.4.2.1.1 eq. 7-6 / §8.5.8 eq. 8-311 — QpBdOffsetC = 6 *
     // bit_depth_chroma_minus8. Threaded into chroma_qp_avg so the §8.7.2
     // QPC derivation runs with the extended `−QpBdOffsetC..=51` qPI
@@ -13481,6 +13686,201 @@ mod tests {
             assert_eq!(pic.luma, want_pic.luma, "case {case}: samples");
         }
         assert!(nonzero_bs > 2_000, "only {nonzero_bs} filtered segments");
+    }
+
+    /// [`deblock_chroma_mb`], which takes [`deblock_chroma_mb_frame_420`]
+    /// where it applies, filters both chroma planes exactly as
+    /// [`deblock_chroma_mb_by_segment`] alone does, over random 4:2:0 frame
+    /// and field pictures (cropped or not, 8- and 10-bit) with the luma bS
+    /// records the luma pass leaves: intra, SP and inter macroblocks, coded
+    /// coefficients, split motion, unavailable macroblocks, QPs, both chroma
+    /// QP offsets and filter offsets.
+    #[test]
+    fn frame_420_chroma_deblocking_matches_the_per_segment_walker() {
+        let mut seed = 0x51ed_270bu32;
+        let mut next = |m: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % m
+        };
+        let (mut fast_mbs, mut changed) = (0usize, 0usize);
+        for case in 0..200 {
+            let (mb_w, mb_h) = (1 + next(4) as i32, 1 + next(4) as i32);
+            let bit_depth = if case % 3 == 0 { 10 } else { 8 };
+            let max = (1u32 << bit_depth) - 1;
+            let field_pic = case % 5 == 0;
+            let w = mb_w * 16 - if case % 4 == 1 { 6 } else { 0 };
+            let h = mb_h * 16 - if case % 4 == 2 { 10 } else { 0 };
+            let mut grid = MbGrid::new(mb_w as u32, mb_h as u32);
+            for info in grid.info.iter_mut() {
+                info.available = next(10) != 0;
+                let kind = next(10);
+                info.is_intra = kind < 2;
+                info.in_sp_si_slice = kind == 2;
+                info.qp_y = next(52) as i32;
+                info.transform_size_8x8_flag = next(3) == 0;
+                info.luma_nonzero_4x4 = match next(4) {
+                    0 => 0,
+                    1 => 0xffff,
+                    _ => next(0x1_0000) as u16,
+                };
+                let uniform = next(2) == 0;
+                for k in 0..4 {
+                    let r = if uniform { 0 } else { next(3) as i8 - 1 };
+                    info.ref_idx_l0[k] = r;
+                    info.ref_idx_l1[k] = -1;
+                    info.ref_poc_l0[k] = i32::from(r) * 2;
+                    info.ref_poc_l1[k] = 0;
+                }
+                let base = (next(9) as i16 - 4, next(9) as i16 - 4);
+                for k in 0..16 {
+                    info.mv_l0[k] = if uniform {
+                        base
+                    } else {
+                        (base.0 + next(9) as i16 - 4, base.1 + next(9) as i16 - 4)
+                    };
+                }
+            }
+            let mut pic = Picture::new(w as u32, h as u32, 1, bit_depth, bit_depth);
+            let level = next(max) as i32;
+            for s in pic
+                .luma
+                .iter_mut()
+                .chain(pic.cb.iter_mut())
+                .chain(pic.cr.iter_mut())
+            {
+                *s = (level + next(9) as i32 - 4).clamp(0, max as i32) as Sample;
+            }
+            let (alpha_off, beta_off) = (next(13) as i32 * 2 - 12, next(13) as i32 * 2 - 12);
+            let (cb_offset, cr_offset) = (next(25) as i32 - 12, next(25) as i32 - 12);
+            let (cw, ch) = (pic.chroma_width() as i32, pic.chroma_height() as i32);
+            let mut luma_bs = vec![BS_NOT_DERIVED; (mb_w * mb_h) as usize * 32];
+            let mut want = pic.clone();
+            let unfiltered = pic.clone();
+            for mb_y in 0..mb_h {
+                for mb_x in 0..mb_w {
+                    let base = luma_bs_index(mb_w, mb_x, mb_y, false, 0, 0);
+                    let bs = &mut luma_bs[base..base + 32];
+                    deblock_luma_mb_frame(
+                        &mut pic, 0, w, h, &grid, mb_x, mb_y, alpha_off, beta_off, bit_depth,
+                        field_pic, bs,
+                    );
+                    want.luma.copy_from_slice(&pic.luma);
+                    for plane in 0..2u8 {
+                        let qp_offset = if plane == 0 { cb_offset } else { cr_offset };
+                        deblock_chroma_mb_by_segment(
+                            &mut want,
+                            0,
+                            cw,
+                            ch,
+                            &grid,
+                            plane,
+                            mb_x,
+                            mb_y,
+                            alpha_off,
+                            beta_off,
+                            bit_depth,
+                            cb_offset,
+                            cr_offset,
+                            false,
+                            field_pic,
+                            &[],
+                            bs,
+                        );
+                        let mut probe = pic.clone();
+                        fast_mbs += usize::from(deblock_chroma_mb_frame_420(
+                            &mut probe, 0, cw, ch, &grid, plane, mb_x, mb_y, alpha_off, beta_off,
+                            bit_depth, qp_offset, bs,
+                        ));
+                        deblock_chroma_mb(
+                            &mut pic,
+                            0,
+                            cw,
+                            ch,
+                            &grid,
+                            plane,
+                            mb_x,
+                            mb_y,
+                            alpha_off,
+                            beta_off,
+                            bit_depth,
+                            cb_offset,
+                            cr_offset,
+                            false,
+                            field_pic,
+                            &[],
+                            bs,
+                        );
+                    }
+                }
+            }
+            changed += usize::from(want.cb != unfiltered.cb);
+            assert_eq!(pic.cb, want.cb, "case {case}: Cb");
+            assert_eq!(pic.cr, want.cr, "case {case}: Cr");
+        }
+        assert!(
+            fast_mbs > 500,
+            "only {fast_mbs} macroblocks took the fast path"
+        );
+        assert!(changed > 100, "{changed}");
+    }
+
+    /// [`deblock_chroma_mb_frame_420`] leaves a macroblock to the walker when
+    /// an edge it would filter has a segment without a recorded bS, and
+    /// filters nothing across an edge whose neighbor is unavailable, even
+    /// with a recorded bS, as the walker does.
+    #[test]
+    fn frame_420_chroma_fast_path_defers_and_skips_like_the_walker() {
+        let mut grid = MbGrid::new(2, 1);
+        for (i, info) in grid.info.iter_mut().enumerate() {
+            info.available = true;
+            info.qp_y = 30 + i as i32;
+        }
+        let mut pic = Picture::new(32, 16, 1, 8, 8);
+        for (i, s) in pic.cb.iter_mut().chain(pic.cr.iter_mut()).enumerate() {
+            *s = (100 + (i * 7) % 5) as Sample;
+        }
+        let (cw, ch) = (pic.chroma_width() as i32, pic.chroma_height() as i32);
+        let mut bs = [0u8; 32];
+        let left_edge = luma_bs_index(0, 0, 0, false, 0, 0);
+        bs[left_edge..left_edge + 4].copy_from_slice(&[2, BS_NOT_DERIVED, 2, 2]);
+        let before = pic.clone();
+        assert!(!deblock_chroma_mb_frame_420(
+            &mut pic, 0, cw, ch, &grid, 0, 1, 0, 0, 0, 8, 0, &bs
+        ));
+        assert_eq!(pic.cb, before.cb, "deferring changes nothing");
+
+        bs[left_edge..left_edge + 4].fill(2);
+        grid.info[0].available = false;
+        let mut want = pic.clone();
+        deblock_chroma_mb_by_segment(
+            &mut want,
+            0,
+            cw,
+            ch,
+            &grid,
+            0,
+            1,
+            0,
+            0,
+            0,
+            8,
+            0,
+            0,
+            false,
+            false,
+            &[],
+            &bs,
+        );
+        assert!(deblock_chroma_mb_frame_420(
+            &mut pic, 0, cw, ch, &grid, 0, 1, 0, 0, 0, 8, 0, &bs
+        ));
+        assert_eq!(pic.cb, want.cb);
+        assert_eq!(
+            pic.cb, before.cb,
+            "nothing filtered across the unavailable edge"
+        );
     }
 
     /// §8.4.2.3 — every combine operation equals the per-sample

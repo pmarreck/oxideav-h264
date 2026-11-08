@@ -714,6 +714,64 @@ pub(crate) fn filter_luma_lines16(
     *s = out;
 }
 
+/// Lines across one 4:2:0 chroma macroblock edge: four segments of two.
+pub(crate) const CHROMA_EDGE_LINES: usize = 8;
+
+/// [`filter_line`] in chroma style (`chromaStyleFilteringFlag` = 1) for the
+/// lines across two 4:2:0 chroma macroblock edges at once, lane by lane:
+/// `s[k][l]` is sample `k` (`p1, p0, q0, q1`) of line `l`, the only samples
+/// chroma-style filtering reads; it changes only `p0` and `q0`. Lines
+/// `0..8` cross one edge and `8..16` the other, with that edge's α and β
+/// (`alpha[l / 8]`, `beta[l / 8]`, one qPav per edge); line pair `l / 2`
+/// has strength `bs[l / 2]` (0 leaves its lines alone) and `tc0[l / 2]`,
+/// those of its luma segment (§8.7.2.1, last paragraph). Every lane
+/// computes both the bS < 4 and the bS == 4 results and keeps the one its
+/// strength selects with masks, so the loop carries no branches and
+/// compiles to vector arithmetic (written with `&&` or `if`, the compiler
+/// keeps it scalar). Equal to [`filter_line`] (chroma style) on every line.
+#[inline(always)]
+pub(crate) fn filter_chroma_lines16(
+    s: &mut [[i32; 2 * CHROMA_EDGE_LINES]; 4],
+    bs: [u8; 8],
+    tc0: [i32; 8],
+    alpha: [i32; 2],
+    beta: [i32; 2],
+    max: i32,
+) {
+    const N: usize = 2 * CHROMA_EDGE_LINES;
+    let lane_bs: [i32; N] = std::array::from_fn(|l| i32::from(bs[l / 2]));
+    let lane_tc: [i32; N] = std::array::from_fn(|l| tc0[l / 2] + 1);
+    let lane_alpha: [i32; N] = std::array::from_fn(|l| alpha[l / CHROMA_EDGE_LINES]);
+    let lane_beta: [i32; N] = std::array::from_fn(|l| beta[l / CHROMA_EDGE_LINES]);
+    let [p1, p0, q0, q1] = *s;
+    for l in 0..N {
+        let (p1, p0, q0, q1) = (p1[l], p0[l], q0[l], q1[l]);
+        let (b, alpha, beta) = (lane_bs[l], lane_alpha[l], lane_beta[l]);
+        // eq. 8-460 — filterSamplesFlag (and bS != 0).
+        let filter = (b != 0)
+            & ((p0 - q0).abs() < alpha)
+            & ((p1 - p0).abs() < beta)
+            & ((q1 - q0).abs() < beta);
+        // §8.7.2.3 — bS < 4, chroma style: tC = tC0 + 1 (eq. 8-468). Clip3
+        // as max-then-min: `i32::clamp` asserts its bounds are ordered, and
+        // that panic branch keeps the loop scalar.
+        let tc = lane_tc[l];
+        let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).max(-tc).min(tc);
+        let n_p0 = (p0 + delta).max(0).min(max);
+        let n_q0 = (q0 - delta).max(0).min(max);
+        // §8.7.2.4 — bS == 4, chroma style (eqs. 8-479, 8-486).
+        let s_p0 = (2 * p1 + p0 + q1 + 2) >> 2;
+        let s_q0 = (2 * q1 + q0 + p1 + 2) >> 2;
+        // All ones where bS == 4, and where the line is filtered.
+        let strong = -i32::from(b == 4);
+        let filtered = -i32::from(filter);
+        let f_p0 = n_p0 ^ ((n_p0 ^ s_p0) & strong);
+        let f_q0 = n_q0 ^ ((n_q0 ^ s_q0) & strong);
+        s[1][l] = p0 ^ ((p0 ^ f_p0) & filtered);
+        s[2][l] = q0 ^ ((q0 ^ f_q0) & filtered);
+    }
+}
+
 // --------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------
@@ -810,6 +868,80 @@ mod tests {
         }
         // The draw must reach the filtering paths, not only the unfiltered one.
         assert!(filtered > 1000, "only {filtered} edges changed");
+    }
+
+    /// The two-edge chroma lane filter equals [`filter_line`] in chroma style
+    /// on every line, for random strengths per line pair (0..=4, mixed
+    /// within an edge), a QP and filter offsets per edge over every indexA
+    /// / indexB, 8- and 10-bit samples, with samples drawn near the edge so
+    /// the unfiltered, normal and strong paths all occur. The lines' outer
+    /// samples (p3, p2, q2, q3), which chroma-style filtering neither reads
+    /// nor writes, are drawn too.
+    #[test]
+    fn two_edge_chroma_filter_matches_the_line_filter() {
+        const N: usize = 2 * CHROMA_EDGE_LINES;
+        let mut seed = 0x6c07_8965u32;
+        let mut next = |m: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % m
+        };
+        let mut filtered = 0usize;
+        for bit_depth in [8u32, 10] {
+            let max = (1i32 << bit_depth) - 1;
+            for _ in 0..4000 {
+                let bs: [u8; 8] = std::array::from_fn(|_| next(5) as u8);
+                let edge_params: [(i32, i32, i32); 2] = std::array::from_fn(|_| {
+                    (next(52) as i32, next(25) as i32 - 12, next(25) as i32 - 12)
+                });
+                let thresholds: [EdgeThresholds; 8] = std::array::from_fn(|i| {
+                    let (qp, off_a, off_b) = edge_params[i / 4];
+                    EdgeThresholds::new(bs[i].max(1), qp, off_a, off_b, bit_depth)
+                });
+                let base = next(max as u32 + 1) as i32;
+                let spread = 1 + next(24) as i32;
+                let lines: [[i32; 8]; N] = std::array::from_fn(|_| {
+                    std::array::from_fn(|_| {
+                        (base + next(2 * spread as u32 + 1) as i32 - spread).clamp(0, max)
+                    })
+                });
+                let mut lanes: [[i32; N]; 4] =
+                    std::array::from_fn(|k| std::array::from_fn(|l| lines[l][k + 2]));
+                let mut expected = lanes;
+                for l in 0..N {
+                    if bs[l / 2] == 0 {
+                        continue;
+                    }
+                    let mut line = lines[l];
+                    filter_line(&mut line, &thresholds[l / 2], true);
+                    let outer = |s: &[i32; 8]| [s[0], s[1], s[2], s[5], s[6], s[7]];
+                    assert_eq!(
+                        outer(&line),
+                        outer(&lines[l]),
+                        "chroma style changes only p0, q0"
+                    );
+                    for k in 0..4 {
+                        expected[k][l] = line[k + 2];
+                    }
+                }
+                let before = lanes;
+                filter_chroma_lines16(
+                    &mut lanes,
+                    bs,
+                    thresholds.map(|t| t.tc0),
+                    [thresholds[0].alpha, thresholds[4].alpha],
+                    [thresholds[0].beta, thresholds[4].beta],
+                    max,
+                );
+                assert_eq!(
+                    lanes, expected,
+                    "bs {bs:?} edges {edge_params:?} depth {bit_depth}"
+                );
+                filtered += usize::from(lanes != before);
+            }
+        }
+        assert!(filtered > 1000, "only {filtered} edge pairs changed");
     }
 
     /// The precomputed-threshold line filter equals [`filter_edge`] for
