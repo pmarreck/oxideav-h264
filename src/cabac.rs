@@ -544,8 +544,11 @@ impl<'a> CabacDecoder<'a> {
         let scaled_mps = u64::from(range_mps) << self.ahead;
         let lps = self.window >= scaled_mps;
         // LPS: codIOffset -= codIRange (the MPS share), codIRange = codIRangeLPS.
-        self.window -= scaled_mps & u64::from(lps).wrapping_neg();
-        self.cod_i_range = if lps { range_lps } else { range_mps };
+        // Unpredictable selects: where the decision is inlined into a loop,
+        // the compiler would otherwise turn them into a branch on the path,
+        // which mispredicts about as often as a bin is close to even odds.
+        self.window -= core::hint::select_unpredictable(lps, scaled_mps, 0);
+        self.cod_i_range = core::hint::select_unpredictable(lps, range_lps, range_mps);
         let bin_val = ctx.val_mps ^ u8::from(lps);
         // §9.3.3.2.1.1 equation (9-27): an LPS in state 0 swaps valMPS.
         ctx.val_mps ^= u8::from(lps & (state == 0));
