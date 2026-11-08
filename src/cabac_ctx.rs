@@ -2079,12 +2079,7 @@ impl CabacContexts {
         slice_qp_y: i32,
     ) -> CabacResult<Self> {
         let table = init_table();
-        let mut ctx = Box::new(
-            [CtxState {
-                state_idx: 0,
-                val_mps: 0,
-            }; NUM_CTX_IDX],
-        );
+        let mut ctx = Box::new([CtxState::new(0, 0); NUM_CTX_IDX]);
         for (idx, cell) in table.iter().enumerate() {
             if let Some((m, n)) = cell.pick(slice_kind, cabac_init_idc) {
                 ctx[idx] = CtxState::init(m, n, slice_qp_y)?;
@@ -2092,10 +2087,7 @@ impl CabacContexts {
         }
         // §9.3.1.1 NOTE 2 — ctxIdx 276 is hardcoded as pStateIdx=63,
         // valMPS=0 (used by end_of_slice_flag and I_PCM terminator).
-        ctx[276] = CtxState {
-            state_idx: 63,
-            val_mps: 0,
-        };
+        ctx[276] = CtxState::new(63, 0);
         Ok(Self {
             contexts: ctx,
             slice_kind,
@@ -2474,14 +2466,14 @@ pub fn decode_mb_type_p(
         let c17 = ctxs.at(17);
         eprintln!(
             "[CTX17] pre mb_type_p: c14=({},{}) c15=({},{}) c16=({},{}) c17=({},{})",
-            c14.state_idx,
-            c14.val_mps,
-            c15.state_idx,
-            c15.val_mps,
-            c16.state_idx,
-            c16.val_mps,
-            c17.state_idx,
-            c17.val_mps,
+            c14.state_idx(),
+            c14.val_mps(),
+            c15.state_idx(),
+            c15.val_mps(),
+            c16.state_idx(),
+            c16.val_mps(),
+            c17.state_idx(),
+            c17.val_mps(),
         );
     }
     // Table 9-39 (08/2024) row ctxIdxOffset=14:
@@ -3989,13 +3981,7 @@ mod tests {
         // `ctx_init_table_9_12_ctx0_mid_qp` in cabac.rs — expected
         // state_idx=46, val_mps=0).
         let ctxs = CabacContexts::init(SliceKind::I, None, 26).unwrap();
-        assert_eq!(
-            ctxs.at(0),
-            &CtxState {
-                state_idx: 46,
-                val_mps: 0
-            }
-        );
+        assert_eq!(ctxs.at(0), &CtxState::new(46, 0));
     }
 
     #[test]
@@ -4003,26 +3989,14 @@ mod tests {
         // Table 9-13 ctxIdx=11 init_idc=0 → m=23, n=33. SliceQPY=30.
         // ((23*30)>>4)+33 = (690>>4)+33 = 43+33 = 76 → >63 → state_idx=12, val_mps=1.
         let ctxs = CabacContexts::init(SliceKind::P, Some(0), 30).unwrap();
-        assert_eq!(
-            ctxs.at(11),
-            &CtxState {
-                state_idx: 12,
-                val_mps: 1
-            }
-        );
+        assert_eq!(ctxs.at(11), &CtxState::new(12, 1));
     }
 
     #[test]
     fn ctx_init_ctx_276_is_non_adapting() {
         let ctxs = CabacContexts::init(SliceKind::I, None, 26).unwrap();
         // §9.3.1.1 NOTE 2.
-        assert_eq!(
-            ctxs.at(276),
-            &CtxState {
-                state_idx: 63,
-                val_mps: 0
-            }
-        );
+        assert_eq!(ctxs.at(276), &CtxState::new(63, 0));
     }
 
     #[test]
@@ -4030,13 +4004,7 @@ mod tests {
         // Table 9-13 ctxIdx=11 init_idc=2 → m=29, n=16. SliceQPY=26.
         // ((29*26)>>4)+16 = (754>>4)+16 = 47+16 = 63 → state_idx=0, val_mps=0.
         let ctxs = CabacContexts::init(SliceKind::B, Some(2), 26).unwrap();
-        assert_eq!(
-            ctxs.at(11),
-            &CtxState {
-                state_idx: 0,
-                val_mps: 0
-            }
-        );
+        assert_eq!(ctxs.at(11), &CtxState::new(0, 0));
     }
 
     // -----------------------------------------------------------------
@@ -4065,15 +4033,9 @@ mod tests {
         let clipped_qp = qp.clamp(0, 51);
         let pre = (((m * clipped_qp) >> 4) + n).clamp(1, 126);
         if pre <= 63 {
-            CtxState {
-                state_idx: (63 - pre) as u8,
-                val_mps: 0,
-            }
+            CtxState::new((63 - pre) as u8, 0)
         } else {
-            CtxState {
-                state_idx: (pre - 64) as u8,
-                val_mps: 1,
-            }
+            CtxState::new((pre - 64) as u8, 1)
         }
     }
 
@@ -4123,10 +4085,7 @@ mod tests {
         // state_idx=62 collapse). Assert no entry in 402..=459 hits
         // that state when the table is wired.
         let ctxs = CabacContexts::init(SliceKind::B, Some(0), 26).unwrap();
-        let neutral = CtxState {
-            state_idx: 62,
-            val_mps: 0,
-        };
+        let neutral = CtxState::new(62, 0);
         // At least one entry would normally hit (62, 0) by coincidence
         // (e.g. when the spec-derived preCtxState happens to be 1) so
         // we don't assert "none". Instead require diversity: the 58
@@ -4624,21 +4583,25 @@ mod tests {
         /// §9.3.4.2 Figure 9-7 — EncodeDecision. Mirrors
         /// `CabacDecoder::decode_decision` state transitions.
         fn encode_decision(&mut self, ctx: &mut crate::cabac::CtxState, bin: u8) {
+            // Field by field from the spec tables, not through the packed
+            // lookups the decoder uses, so the round trip checks them.
+            let (mut state_idx, mut val_mps) = (ctx.state_idx(), ctx.val_mps());
             let q_idx = ((self.cod_i_range >> 6) & 0b11) as usize;
-            let cod_i_range_lps = crate::cabac::RANGE_TAB_LPS[ctx.state_idx as usize][q_idx] as u32;
+            let cod_i_range_lps = crate::cabac::RANGE_TAB_LPS[state_idx as usize][q_idx] as u32;
             self.cod_i_range -= cod_i_range_lps;
-            if bin != ctx.val_mps {
+            if bin != val_mps {
                 // LPS branch.
                 self.cod_i_low += self.cod_i_range;
                 self.cod_i_range = cod_i_range_lps;
-                if ctx.state_idx == 0 {
-                    ctx.val_mps = 1 - ctx.val_mps;
+                if state_idx == 0 {
+                    val_mps = 1 - val_mps;
                 }
-                ctx.state_idx = crate::cabac::TRANS_IDX_LPS[ctx.state_idx as usize];
+                state_idx = crate::cabac::TRANS_IDX_LPS[state_idx as usize];
             } else {
                 // MPS branch.
-                ctx.state_idx = crate::cabac::TRANS_IDX_MPS[ctx.state_idx as usize];
+                state_idx = crate::cabac::TRANS_IDX_MPS[state_idx as usize];
             }
+            *ctx = crate::cabac::CtxState::new(state_idx, val_mps);
             self.renorm_e();
         }
 

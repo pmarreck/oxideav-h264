@@ -396,8 +396,8 @@ fn parse_slice_data_impl(
                 slice_header.cabac_init_idc,
                 slice_qp_y,
                 slice_header.num_ref_idx_l0_active_minus1,
-                c17.state_idx,
-                c17.val_mps
+                c17.state_idx(),
+                c17.val_mps()
             );
         }
 

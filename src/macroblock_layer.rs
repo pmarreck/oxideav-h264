@@ -8635,10 +8635,7 @@ mod cabac_residual_block_tests {
     fn random_contexts(rng: &mut Rng) -> CabacContexts {
         let mut ctxs = CabacContexts::init(SliceKind::I, None, 26).unwrap();
         for c in ctxs.contexts.iter_mut() {
-            *c = CtxState {
-                state_idx: rng.below(63) as u8,
-                val_mps: rng.below(2) as u8,
-            };
+            *c = CtxState::new(rng.below(63) as u8, rng.below(2) as u8);
         }
         ctxs
     }

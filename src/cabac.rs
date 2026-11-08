@@ -205,9 +205,6 @@ pub(crate) static TRANS_IDX_MPS: [u8; 64] = [
     49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 62, 63,
 ];
 
-/// Table 9-45's transitions by path, MPS then LPS, for a branch-free lookup.
-static TRANS_IDX: [[u8; 64]; 2] = [TRANS_IDX_MPS, TRANS_IDX_LPS];
-
 /// §5.7 — `Clip3(x, y, z)` = max(x, min(y, z)).
 #[inline]
 fn clip3_i32(lo: i32, hi: i32, v: i32) -> i32 {
@@ -220,16 +217,99 @@ fn clip3_i32(lo: i32, hi: i32, v: i32) -> i32 {
     }
 }
 
-/// One context model — `(StateIdx, valMPS)` per §9.3.1.1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CtxState {
-    /// §9.3.1.1 — `pStateIdx`, range 0..=63.
-    pub state_idx: u8,
-    /// §9.3.1.1 — `valMPS`, either 0 or 1.
-    pub val_mps: u8,
+/// Table 9-44 by packed context state ([`CtxState`]) and `qCodIRangeIdx`:
+/// entry `qCodIRangeIdx * 128 + s` is `rangeTabLPS[s >> 1][qCodIRangeIdx]`.
+/// With `qCodIRangeIdx = (codIRange >> 6) & 3` (eq. 9-25), the entry's index
+/// is `(codIRange & 0xC0) << 1 | s`: one mask and shift of `codIRange`
+/// rather than a shift, a mask and a scaled add. Derived from
+/// [`RANGE_TAB_LPS`] at compile time.
+static RANGE_LPS_BY_CTX: [u8; 512] = {
+    let mut t = [0u8; 512];
+    let mut i = 0;
+    while i < 512 {
+        // i = qCodIRangeIdx * 128 + (pStateIdx << 1 | valMPS).
+        t[i] = RANGE_TAB_LPS[(i & 127) >> 1][i >> 7];
+        i += 1;
+    }
+    t
+};
+
+/// Table 9-45 by packed context state ([`CtxState`]): entry `lps << 7 | s`
+/// is the state after decoding an MPS (`lps` 0) or an LPS (`lps` 1) in
+/// state `s`, the `valMPS` swap of eq. 9-27 included. Derived from
+/// [`TRANS_IDX_MPS`] and [`TRANS_IDX_LPS`] at compile time.
+static TRANS_CTX: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        // i = lps << 7 | pStateIdx << 1 | valMPS.
+        let (lps, state, mps) = (i >> 7, (i & 127) >> 1, (i & 1) as u8);
+        t[i] = if lps == 0 {
+            (TRANS_IDX_MPS[state] << 1) | mps
+        } else {
+            (TRANS_IDX_LPS[state] << 1) | (mps ^ (state == 0) as u8)
+        };
+        i += 1;
+    }
+    t
+};
+
+/// One context model, `(pStateIdx, valMPS)` per §9.3.1.1, packed in one
+/// byte as `pStateIdx << 1 | valMPS`: a decision loads it once, steps both
+/// fields with one lookup in [`TRANS_CTX`] and stores it once, and finds
+/// `codIRangeLPS` with the packed value as the index ([`RANGE_LPS_BY_CTX`]).
+/// Always below 128.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CtxState(u8);
+
+impl core::fmt::Debug for CtxState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CtxState")
+            .field("state_idx", &self.state_idx())
+            .field("val_mps", &self.val_mps())
+            .finish()
+    }
 }
 
 impl CtxState {
+    /// The context with `pStateIdx` `state_idx` (0..=63) and `valMPS`
+    /// `val_mps` (0 or 1).
+    #[inline]
+    pub const fn new(state_idx: u8, val_mps: u8) -> Self {
+        debug_assert!(state_idx <= 63 && val_mps <= 1);
+        Self(((state_idx & 63) << 1) | (val_mps & 1))
+    }
+
+    /// §9.3.1.1 — `pStateIdx`, 0..=63.
+    #[inline]
+    pub const fn state_idx(self) -> u8 {
+        self.0 >> 1
+    }
+
+    /// §9.3.1.1 — `valMPS`, 0 or 1.
+    #[inline]
+    pub const fn val_mps(self) -> u8 {
+        self.0 & 1
+    }
+
+    /// The packed byte, `pStateIdx << 1 | valMPS`, as a table index.
+    #[inline(always)]
+    fn index(self) -> usize {
+        usize::from(self.0 & 127)
+    }
+
+    /// `codIRangeLPS` (eq. 9-25, 9-26) for this context at `cod_i_range`.
+    #[inline(always)]
+    pub(crate) fn range_lps(self, cod_i_range: u32) -> u32 {
+        u32::from(RANGE_LPS_BY_CTX[(((cod_i_range & 0xC0) << 1) as usize) | self.index()])
+    }
+
+    /// This context after decoding an LPS (`lps`) or an MPS (§9.3.3.2.1.1).
+    #[inline(always)]
+    pub(crate) fn next(self, lps: bool) -> Self {
+        Self(TRANS_CTX[(usize::from(lps) << 7) | self.index()])
+    }
+
     /// §9.3.1.1 — equation 9-5 (preState clipped to 1..=126, then split
     /// into `(pStateIdx, valMPS)`).
     ///
@@ -254,7 +334,7 @@ impl CtxState {
         } else {
             ((pre - 64) as u8, 1u8)
         };
-        Ok(Self { state_idx, val_mps })
+        Ok(Self::new(state_idx, val_mps))
     }
 }
 
@@ -512,7 +592,7 @@ impl<'a> CabacDecoder<'a> {
         // `ctx` does not carry a ctxIdx (we only see the `(state, mps)` pair),
         // so the caller is responsible for any richer trace line. This one
         // covers every decision bin with the engine-visible state.
-        let (pre_state, pre_mps) = (ctx.state_idx, ctx.val_mps);
+        let (pre_state, pre_mps) = (ctx.state_idx(), ctx.val_mps());
         let (pre_range, pre_offset) = (self.cod_i_range, self.offset());
         let bin_val = self.decision(ctx)?;
         eprintln!(
@@ -523,8 +603,8 @@ impl<'a> CabacDecoder<'a> {
             pre_range,
             pre_offset,
             bin_val,
-            ctx.state_idx,
-            ctx.val_mps,
+            ctx.state_idx(),
+            ctx.val_mps(),
             self.cod_i_range,
             self.offset(),
         );
@@ -535,11 +615,10 @@ impl<'a> CabacDecoder<'a> {
     fn decision(&mut self, ctx: &mut CtxState) -> CabacResult<u8> {
         // §9.3.3.2.1 equations (9-25) / (9-26), choosing between the LPS and
         // MPS paths without a branch: which one a bin takes is close to
-        // unpredictable. Context states stay within 0..=62 (§9.3.1.1), so the
-        // mask only spares the table its bounds check.
-        let state = usize::from(ctx.state_idx & 63);
-        let q_idx = ((self.cod_i_range >> 6) & 0b11) as usize;
-        let range_lps = u32::from(RANGE_TAB_LPS[state][q_idx]);
+        // unpredictable. The context is one byte, loaded once here and
+        // stored once below.
+        let state = *ctx;
+        let range_lps = state.range_lps(self.cod_i_range);
         let range_mps = self.cod_i_range - range_lps;
         let scaled_mps = u64::from(range_mps) << self.ahead;
         let lps = self.window >= scaled_mps;
@@ -549,10 +628,10 @@ impl<'a> CabacDecoder<'a> {
         // which mispredicts about as often as a bin is close to even odds.
         self.window -= core::hint::select_unpredictable(lps, scaled_mps, 0);
         self.cod_i_range = core::hint::select_unpredictable(lps, range_lps, range_mps);
-        let bin_val = ctx.val_mps ^ u8::from(lps);
-        // §9.3.3.2.1.1 equation (9-27): an LPS in state 0 swaps valMPS.
-        ctx.val_mps ^= u8::from(lps & (state == 0));
-        ctx.state_idx = TRANS_IDX[usize::from(lps)][state];
+        let bin_val = state.val_mps() ^ u8::from(lps);
+        // §9.3.3.2.1.1: Table 9-45's step and eq. (9-27)'s valMPS swap on an
+        // LPS in state 0, in one lookup.
+        *ctx = state.next(lps);
         self.renorm_d()?;
         self.bin_count = self.bin_count.wrapping_add(1);
         Ok(bin_val)
@@ -681,8 +760,23 @@ impl<'a> CabacDecoder<'a> {
 mod tests {
     use super::*;
 
-    /// §9.3.3.2 read literally, a bit at a time through a `BitReader`: the
-    /// reference the windowed engine must match bin for bin.
+    /// A context model as §9.3.1.1 states it, two fields: the reference the
+    /// packed one-byte [`CtxState`] must track.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SpecCtx {
+        state_idx: u8,
+        val_mps: u8,
+    }
+
+    impl SpecCtx {
+        fn packed(self) -> CtxState {
+            CtxState::new(self.state_idx, self.val_mps)
+        }
+    }
+
+    /// §9.3.3.2 read literally, a bit at a time through a `BitReader`, with
+    /// two-field contexts stepped by Table 9-45's two columns and eq. 9-27:
+    /// the reference the windowed engine must match bin for bin.
     struct SpecEngine<'a> {
         range: u32,
         offset: u32,
@@ -707,7 +801,7 @@ mod tests {
             Ok(())
         }
 
-        fn decision(&mut self, ctx: &mut CtxState) -> CabacResult<u8> {
+        fn decision(&mut self, ctx: &mut SpecCtx) -> CabacResult<u8> {
             let lps =
                 RANGE_TAB_LPS[ctx.state_idx as usize][((self.range >> 6) & 3) as usize] as u32;
             self.range -= lps;
@@ -798,22 +892,29 @@ mod tests {
             if spec.offset >= 510 {
                 continue;
             }
-            let mut contexts: Vec<CtxState> = (0..8)
-                .map(|_| CtxState {
+            // Each context twice: packed for the windowed engine, two fields
+            // for the reference, each stepped only by its own engine.
+            let mut spec_contexts: Vec<SpecCtx> = (0..8)
+                .map(|_| SpecCtx {
                     state_idx: (rng.next() % 64) as u8,
                     val_mps: (rng.next() % 2) as u8,
                 })
                 .collect();
+            let mut contexts: Vec<CtxState> = spec_contexts.iter().map(|c| c.packed()).collect();
             for call in 0..2000u32 {
                 let kind = rng.next() % 16;
                 let ctx = (rng.next() % 8) as usize;
                 let (got, want) = match kind {
                     0..=10 => {
-                        let mut spec_ctx = contexts[ctx];
                         let got = fast.decode_decision(&mut contexts[ctx]);
-                        let want = spec.decision(&mut spec_ctx);
+                        let want = spec.decision(&mut spec_contexts[ctx]);
                         if got.is_ok() {
-                            assert_eq!(contexts[ctx], spec_ctx, "case {case} call {call}: context");
+                            let spec_ctx = spec_contexts[ctx];
+                            assert_eq!(
+                                (contexts[ctx].state_idx(), contexts[ctx].val_mps()),
+                                (spec_ctx.state_idx, spec_ctx.val_mps),
+                                "case {case} call {call}: context"
+                            );
                         }
                         (got, want)
                     }
@@ -846,6 +947,69 @@ mod tests {
         }
     }
 
+    /// Every `(pStateIdx, valMPS)` pair packs into its own byte below 128 and
+    /// unpacks to itself.
+    #[test]
+    fn ctx_state_packs_and_unpacks_every_pair() {
+        let mut seen = [false; 128];
+        for state_idx in 0..=63u8 {
+            for val_mps in 0..=1u8 {
+                let ctx = CtxState::new(state_idx, val_mps);
+                assert_eq!((ctx.state_idx(), ctx.val_mps()), (state_idx, val_mps));
+                assert!(
+                    !seen[ctx.index()],
+                    "{state_idx},{val_mps} packs onto another pair"
+                );
+                seen[ctx.index()] = true;
+            }
+        }
+    }
+
+    /// The packed transition, for every state and both paths, is Table 9-45's
+    /// column for the path, with eq. 9-27's valMPS swap after an LPS in state
+    /// 0 and valMPS kept otherwise.
+    #[test]
+    fn packed_transitions_match_table_9_45_and_eq_9_27() {
+        for state_idx in 0..=63u8 {
+            for val_mps in 0..=1u8 {
+                let ctx = CtxState::new(state_idx, val_mps);
+                let mps = ctx.next(false);
+                assert_eq!(
+                    (mps.state_idx(), mps.val_mps()),
+                    (TRANS_IDX_MPS[usize::from(state_idx)], val_mps),
+                    "MPS from {state_idx},{val_mps}"
+                );
+                let lps = ctx.next(true);
+                let swapped = if state_idx == 0 { 1 - val_mps } else { val_mps };
+                assert_eq!(
+                    (lps.state_idx(), lps.val_mps()),
+                    (TRANS_IDX_LPS[usize::from(state_idx)], swapped),
+                    "LPS from {state_idx},{val_mps}"
+                );
+            }
+        }
+    }
+
+    /// `codIRangeLPS` by packed state is Table 9-44 at eq. 9-25's
+    /// qCodIRangeIdx, for every state, both valMPS and every codIRange a
+    /// decision can start from (256..=510).
+    #[test]
+    fn packed_range_lookup_matches_table_9_44() {
+        for state_idx in 0..=63u8 {
+            for val_mps in 0..=1u8 {
+                let ctx = CtxState::new(state_idx, val_mps);
+                for range in 256..=510u32 {
+                    let q = ((range >> 6) & 3) as usize;
+                    assert_eq!(
+                        ctx.range_lps(range),
+                        u32::from(RANGE_TAB_LPS[usize::from(state_idx)][q]),
+                        "state {state_idx},{val_mps} range {range}"
+                    );
+                }
+            }
+        }
+    }
+
     // -----------------------------------------------------------------
     // §9.3.1.1 — context variable initialisation. Tests hand-derive the
     // expected (pStateIdx, valMPS) from equation (9-5) using known
@@ -859,13 +1023,7 @@ mod tests {
         // Clip3(1,126,17) = 17; preCtxState <= 63 so
         //   pStateIdx = 63 - 17 = 46, valMPS = 0.
         let c = CtxState::init(20, -15, 26).unwrap();
-        assert_eq!(
-            c,
-            CtxState {
-                state_idx: 46,
-                val_mps: 0
-            }
-        );
+        assert_eq!(c, CtxState::new(46, 0));
     }
 
     #[test]
@@ -874,13 +1032,7 @@ mod tests {
         // ((2*26)>>4)+54 = (52>>4)+54 = 3 + 54 = 57.
         // 57 <= 63 → pStateIdx = 63 - 57 = 6, valMPS = 0.
         let c = CtxState::init(2, 54, 26).unwrap();
-        assert_eq!(
-            c,
-            CtxState {
-                state_idx: 6,
-                val_mps: 0
-            }
-        );
+        assert_eq!(c, CtxState::new(6, 0));
     }
 
     #[test]
@@ -891,13 +1043,7 @@ mod tests {
         // (floor division). -46 + 127 = 81. Clip3(1,126,81)=81.
         // 81 > 63 → pStateIdx = 81 - 64 = 17, valMPS = 1.
         let c = CtxState::init(-28, 127, 26).unwrap();
-        assert_eq!(
-            c,
-            CtxState {
-                state_idx: 17,
-                val_mps: 1
-            }
-        );
+        assert_eq!(c, CtxState::new(17, 1));
     }
 
     #[test]
@@ -906,13 +1052,7 @@ mod tests {
         // ((20*0)>>4) + (-15) = -15. Clip3(1,126,-15) = 1.
         // preCtxState=1 <= 63 → pStateIdx = 63-1 = 62, valMPS=0.
         let c = CtxState::init(20, -15, 0).unwrap();
-        assert_eq!(
-            c,
-            CtxState {
-                state_idx: 62,
-                val_mps: 0
-            }
-        );
+        assert_eq!(c, CtxState::new(62, 0));
     }
 
     #[test]
@@ -921,13 +1061,7 @@ mod tests {
         // ((20*51)>>4)+(-15) = (1020>>4)-15 = 63 - 15 = 48.
         // preCtxState=48 <= 63 → pStateIdx = 63-48 = 15, valMPS=0.
         let c = CtxState::init(20, -15, 51).unwrap();
-        assert_eq!(
-            c,
-            CtxState {
-                state_idx: 15,
-                val_mps: 0
-            }
-        );
+        assert_eq!(c, CtxState::new(15, 0));
     }
 
     #[test]
@@ -952,13 +1086,7 @@ mod tests {
         let c = CtxState::init(20, -15, -12).expect("negative SliceQPY at high bit depth");
         // Clip3(0, 51, -12) = 0; ((20*0)>>4) + (-15) = -15; clip to 1..126 = 1.
         // pre = 1 → state_idx = 63-1 = 62, val_mps = 0.
-        assert_eq!(
-            c,
-            CtxState {
-                state_idx: 62,
-                val_mps: 0,
-            }
-        );
+        assert_eq!(c, CtxState::new(62, 0));
     }
 
     #[test]
@@ -1013,19 +1141,10 @@ mod tests {
     fn decode_decision_mps_path_no_renorm() {
         let data = [0x00, 0x00];
         let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
-        let mut ctx = CtxState {
-            state_idx: 0,
-            val_mps: 0,
-        };
+        let mut ctx = CtxState::new(0, 0);
         let bin = dec.decode_decision(&mut ctx).unwrap();
         assert_eq!(bin, 0);
-        assert_eq!(
-            ctx,
-            CtxState {
-                state_idx: 1,
-                val_mps: 0
-            }
-        );
+        assert_eq!(ctx, CtxState::new(1, 0));
         assert_eq!(dec.cod_i_range(), 270);
         assert_eq!(dec.cod_i_offset(), 0);
     }
@@ -1046,19 +1165,10 @@ mod tests {
         let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
         dec.cod_i_range = 270;
         dec.set_cod_i_offset(0);
-        let mut ctx = CtxState {
-            state_idx: 1,
-            val_mps: 0,
-        };
+        let mut ctx = CtxState::new(1, 0);
         let bin = dec.decode_decision(&mut ctx).unwrap();
         assert_eq!(bin, 0);
-        assert_eq!(
-            ctx,
-            CtxState {
-                state_idx: 2,
-                val_mps: 0
-            }
-        );
+        assert_eq!(ctx, CtxState::new(2, 0));
         assert_eq!(dec.cod_i_range(), 284);
         assert_eq!(dec.cod_i_offset(), 0);
     }
@@ -1085,19 +1195,10 @@ mod tests {
         let data = [0b1111_1110u8, 0b1000_0000];
         let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
         assert_eq!(dec.cod_i_offset(), 509);
-        let mut ctx = CtxState {
-            state_idx: 0,
-            val_mps: 0,
-        };
+        let mut ctx = CtxState::new(0, 0);
         let bin = dec.decode_decision(&mut ctx).unwrap();
         assert_eq!(bin, 1);
-        assert_eq!(
-            ctx,
-            CtxState {
-                state_idx: 0,
-                val_mps: 1
-            }
-        );
+        assert_eq!(ctx, CtxState::new(0, 1));
         assert_eq!(dec.cod_i_range(), 480);
         assert_eq!(dec.cod_i_offset(), 478);
     }
@@ -1257,20 +1358,11 @@ mod tests {
         //    range=240. state_idx=0 → valMPS=1, transIdxLPS[0]=0.
         //    RenormD: 240<256 → read 1 bit (next byte bit 6 = 0).
         //      range=480, offset=(239<<1)|0=478.
-        let mut ctx1 = CtxState {
-            state_idx: 0,
-            val_mps: 0,
-        };
+        let mut ctx1 = CtxState::new(0, 0);
         assert_eq!(dec.decode_decision(&mut ctx1).unwrap(), 1);
         assert_eq!(dec.cod_i_range(), 480);
         assert_eq!(dec.cod_i_offset(), 478);
-        assert_eq!(
-            ctx1,
-            CtxState {
-                state_idx: 0,
-                val_mps: 1
-            }
-        );
+        assert_eq!(ctx1, CtxState::new(0, 1));
         assert_eq!(dec.bin_count(), 1);
 
         // 2) Now with range=480, pick state_idx=5 val_mps=1:
@@ -1279,20 +1371,11 @@ mod tests {
         //    offset=478-295=183, range=185, state_idx=transIdxLPS[5]=4.
         //    RenormD: 185<256 → read 1 bit (byte 1 bit 5 = 0).
         //      range=370, offset=(183<<1)|0=366.
-        let mut ctx2 = CtxState {
-            state_idx: 5,
-            val_mps: 1,
-        };
+        let mut ctx2 = CtxState::new(5, 1);
         assert_eq!(dec.decode_decision(&mut ctx2).unwrap(), 0);
         assert_eq!(dec.cod_i_range(), 370);
         assert_eq!(dec.cod_i_offset(), 366);
-        assert_eq!(
-            ctx2,
-            CtxState {
-                state_idx: TRANS_IDX_LPS[5],
-                val_mps: 1
-            }
-        );
+        assert_eq!(ctx2, CtxState::new(TRANS_IDX_LPS[5], 1));
         assert_eq!(dec.bin_count(), 2);
     }
 
@@ -1344,10 +1427,7 @@ mod tests {
         // Next decision should still decode correctly: state_idx=0,
         // val_mps=0 → codIRangeLPS=240 (from row 0 col 3 since
         // (508>>6)&3 = 7&3 = 3). 508-240=268 ≥ codIOffset=0 → MPS.
-        let mut ctx = CtxState {
-            state_idx: 0,
-            val_mps: 0,
-        };
+        let mut ctx = CtxState::new(0, 0);
         assert_eq!(dec.decode_decision(&mut ctx).unwrap(), 0);
         assert_eq!(dec.cod_i_range(), 268);
         assert_eq!(dec.cod_i_offset(), 0);

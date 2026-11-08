@@ -8,11 +8,11 @@
 //! * §9.3.4.5 — `EncodeTerminate` (the inverse of §9.3.3.2.4).
 //! * §9.3.4.4 — `RenormE` + carry-propagation handling.
 //!
-//! The state-transition tables and per-syntax (`m`, `n`) initialisation
-//! tables are shared with the decoder via [`crate::cabac::TRANS_IDX_MPS`],
-//! [`crate::cabac::TRANS_IDX_LPS`], and [`crate::cabac::RANGE_TAB_LPS`]
-//! — the encoder advances the same state machine in the same direction
-//! after each bin, just from the writer's perspective.
+//! The state-transition and range tables are shared with the decoder through
+//! the packed context state [`crate::cabac::CtxState`] (Tables 9-44 and 9-45
+//! by `pStateIdx << 1 | valMPS`) — the encoder advances the same state
+//! machine in the same direction after each bin, just from the writer's
+//! perspective.
 //!
 //! Output is the byte stream that, when fed back to the decoder engine
 //! in [`crate::cabac::CabacDecoder`], reproduces the exact bin sequence
@@ -29,7 +29,7 @@
 
 #![allow(dead_code)]
 
-use crate::cabac::{CtxState, RANGE_TAB_LPS, TRANS_IDX_LPS, TRANS_IDX_MPS};
+use crate::cabac::CtxState;
 
 /// When `OXIDEAV_H264_BIN_TRACE` is set, emit one line per encoded bin
 /// in the same format as the decoder's trace so the two can be diff'd.
@@ -119,40 +119,35 @@ impl CabacEncoder {
     pub fn encode_decision(&mut self, ctx: &mut CtxState, bin: u8) {
         debug_assert!(bin <= 1);
         let trace_on = bin_trace_enabled();
-        let pre_state = ctx.state_idx;
-        let pre_mps = ctx.val_mps;
+        let state = *ctx;
         let pre_range = self.cod_i_range;
         let pre_low = self.cod_i_low;
 
-        let q_idx = ((self.cod_i_range >> 6) & 0b11) as usize;
-        let cod_i_range_lps = RANGE_TAB_LPS[ctx.state_idx as usize][q_idx] as u32;
+        // Eq. 9-25 / 9-26 and Table 9-44 by the packed context state.
+        let cod_i_range_lps = state.range_lps(self.cod_i_range);
         self.cod_i_range -= cod_i_range_lps;
 
-        if bin != ctx.val_mps {
+        let lps = bin != state.val_mps();
+        if lps {
             // LPS path.
             self.cod_i_low += self.cod_i_range;
             self.cod_i_range = cod_i_range_lps;
-            if ctx.state_idx == 0 {
-                ctx.val_mps = 1 - ctx.val_mps;
-            }
-            ctx.state_idx = TRANS_IDX_LPS[ctx.state_idx as usize];
-        } else {
-            // MPS path.
-            ctx.state_idx = TRANS_IDX_MPS[ctx.state_idx as usize];
         }
+        // Table 9-45 and eq. 9-27's valMPS swap, as the decoder steps it.
+        *ctx = state.next(lps);
         self.renorm_e();
         self.bin_count = self.bin_count.wrapping_add(1);
         if trace_on {
             eprintln!(
                 "[ENC {:>8}] DD pre_state={:>2} pre_mps={} pre_range={:>4} pre_low={:>4} bin={} post_state={:>2} post_mps={} post_range={:>4} post_low={:>4}",
                 self.bin_count,
-                pre_state,
-                pre_mps,
+                state.state_idx(),
+                state.val_mps(),
                 pre_range,
                 pre_low,
                 bin,
-                ctx.state_idx,
-                ctx.val_mps,
+                ctx.state_idx(),
+                ctx.val_mps(),
                 self.cod_i_range,
                 self.cod_i_low,
             );
@@ -380,28 +375,19 @@ mod tests {
 
     #[test]
     fn round_trip_single_mps_decision() {
-        let ctx = CtxState {
-            state_idx: 0,
-            val_mps: 0,
-        };
+        let ctx = CtxState::new(0, 0);
         round_trip_decisions(&[(ctx, 0)]);
     }
 
     #[test]
     fn round_trip_single_lps_decision() {
-        let ctx = CtxState {
-            state_idx: 0,
-            val_mps: 0,
-        };
+        let ctx = CtxState::new(0, 0);
         round_trip_decisions(&[(ctx, 1)]);
     }
 
     #[test]
     fn round_trip_alternating_bins() {
-        let ctx = CtxState {
-            state_idx: 30,
-            val_mps: 0,
-        };
+        let ctx = CtxState::new(30, 0);
         let bins: Vec<_> = (0..32).map(|i| (ctx, (i & 1) as u8)).collect();
         round_trip_decisions(&bins);
     }
@@ -410,10 +396,7 @@ mod tests {
     fn round_trip_long_lps_run() {
         // Force lots of LPS decisions at low state — exercises the
         // outstanding-bits / carry path.
-        let ctx = CtxState {
-            state_idx: 0,
-            val_mps: 0,
-        };
+        let ctx = CtxState::new(0, 0);
         let bins: Vec<_> = (0..16).map(|_| (ctx, 1)).collect();
         round_trip_decisions(&bins);
     }
@@ -421,14 +404,8 @@ mod tests {
     #[test]
     fn round_trip_mixed_with_bypass() {
         // Encode: dec(0), bypass(1), bypass(0), dec(1), bypass(1), terminate(1).
-        let mut ctx_a = CtxState {
-            state_idx: 10,
-            val_mps: 0,
-        };
-        let mut ctx_b = CtxState {
-            state_idx: 0,
-            val_mps: 1,
-        };
+        let mut ctx_a = CtxState::new(10, 0);
+        let mut ctx_b = CtxState::new(0, 1);
         let mut enc = CabacEncoder::new();
         let mut a1 = ctx_a;
         let mut b1 = ctx_b;
@@ -453,10 +430,7 @@ mod tests {
     #[test]
     fn round_trip_terminate_zero_then_more_decisions() {
         // EncodeTerminate(0) + more decisions + EncodeTerminate(1).
-        let mut ctx = CtxState {
-            state_idx: 5,
-            val_mps: 1,
-        };
+        let mut ctx = CtxState::new(5, 1);
         let mut enc = CabacEncoder::new();
         for _ in 0..5 {
             enc.encode_terminate(0);
@@ -467,10 +441,7 @@ mod tests {
         enc.encode_terminate(1);
         let bytes = enc.finish_no_trailing();
 
-        let mut dec_ctx = CtxState {
-            state_idx: 5,
-            val_mps: 1,
-        };
+        let mut dec_ctx = CtxState::new(5, 1);
         let mut dec = CabacDecoder::new(BitReader::new(&bytes)).unwrap();
         for _ in 0..5 {
             assert_eq!(dec.decode_terminate().unwrap(), 0);
@@ -489,16 +460,7 @@ mod tests {
         };
         let mut enc = CabacEncoder::new();
         // Use a couple of contexts that adapt as the bins go by.
-        let mut ctxs = [
-            CtxState {
-                state_idx: 20,
-                val_mps: 0,
-            },
-            CtxState {
-                state_idx: 40,
-                val_mps: 1,
-            },
-        ];
+        let mut ctxs = [CtxState::new(20, 0), CtxState::new(40, 1)];
         let mut record: Vec<(usize, u8)> = Vec::new();
         for _ in 0..200 {
             let r = rng();
@@ -526,16 +488,7 @@ mod tests {
         let bytes = enc.finish_no_trailing();
 
         // Replay through the decoder.
-        let mut dec_ctxs = [
-            CtxState {
-                state_idx: 20,
-                val_mps: 0,
-            },
-            CtxState {
-                state_idx: 40,
-                val_mps: 1,
-            },
-        ];
+        let mut dec_ctxs = [CtxState::new(20, 0), CtxState::new(40, 1)];
         let mut dec = CabacDecoder::new(BitReader::new(&bytes)).unwrap();
         for (i, (which, bin)) in record.iter().enumerate() {
             if *which == 100 {

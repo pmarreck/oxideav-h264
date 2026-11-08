@@ -1573,8 +1573,8 @@ impl TrellisCtxCosts {
         };
         let cost = |ctx_idx: usize, bin: u32| -> i64 {
             let st = ctxs.at(ctx_idx);
-            let mps = u32::from(st.val_mps);
-            let row = tab[st.state_idx as usize];
+            let mps = u32::from(st.val_mps());
+            let row = tab[usize::from(st.state_idx())];
             if bin == mps { row[1] } else { row[0] }
         };
         let mut sig = [[0i64; 2]; 16];
