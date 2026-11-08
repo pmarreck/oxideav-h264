@@ -1082,6 +1082,85 @@ impl<'a> MbView<'a> {
     }
 }
 
+/// Up to `N` values held in place: the per-partition syntax elements of
+/// `mb_pred()` (`NumMbPart` is at most 2 on that path) and of
+/// `sub_mb_pred()` (`NumSubMbPart` is at most 4). Reads as a slice of the
+/// values pushed so far.
+#[derive(Clone, Copy)]
+pub struct PartVec<T: Copy + Default, const N: usize> {
+    len: u8,
+    items: [T; N],
+}
+
+// Equal when the pushed values are; the unused slots never matter.
+impl<T: Copy + Default + PartialEq, const N: usize> PartialEq for PartVec<T, N> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<T: Copy + Default + Eq, const N: usize> Eq for PartVec<T, N> {}
+
+impl<T: Copy + Default, const N: usize> Default for PartVec<T, N> {
+    fn default() -> Self {
+        Self {
+            len: 0,
+            items: [T::default(); N],
+        }
+    }
+}
+
+impl<T: Copy + Default, const N: usize> PartVec<T, N> {
+    /// Append `v`. The syntax bounds the count by `N`; a push past it is
+    /// dropped (and asserts in debug builds) rather than panicking.
+    #[inline]
+    pub fn push(&mut self, v: T) {
+        let i = self.len as usize;
+        debug_assert!(i < N, "PartVec capacity {N} exceeded");
+        if let Some(slot) = self.items.get_mut(i) {
+            *slot = v;
+            self.len += 1;
+        }
+    }
+}
+
+impl<T: Copy + Default, const N: usize> std::ops::Deref for PartVec<T, N> {
+    type Target = [T];
+    #[inline]
+    fn deref(&self) -> &[T] {
+        &self.items[..self.len as usize]
+    }
+}
+
+impl<T: Copy + Default + std::fmt::Debug, const N: usize> std::fmt::Debug for PartVec<T, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<T: Copy + Default, const N: usize> From<&[T]> for PartVec<T, N> {
+    /// The first `N` values of `s`.
+    fn from(s: &[T]) -> Self {
+        let mut p = Self::default();
+        for &v in s.iter().take(N) {
+            p.push(v);
+        }
+        p
+    }
+}
+
+impl<T: Copy + Default, const N: usize, const M: usize> From<[T; M]> for PartVec<T, N> {
+    fn from(a: [T; M]) -> Self {
+        Self::from(&a[..])
+    }
+}
+
+impl<T: Copy + Default, const N: usize> From<Vec<T>> for PartVec<T, N> {
+    fn from(v: Vec<T>) -> Self {
+        Self::from(&v[..])
+    }
+}
+
 /// §7.3.5.1 / §7.4.5.1 — `mb_pred()` for non-sub_mb path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MbPred {
@@ -1096,11 +1175,11 @@ pub struct MbPred {
     pub intra_chroma_pred_mode: u8,
     /// For inter prediction: ref_idx_l0 / ref_idx_l1 for each of the
     /// `NumMbPart` partitions.
-    pub ref_idx_l0: Vec<u32>,
-    pub ref_idx_l1: Vec<u32>,
+    pub ref_idx_l0: PartVec<u32, 2>,
+    pub ref_idx_l1: PartVec<u32, 2>,
     /// MVD[mb_part][component] per partition (list 0 / list 1).
-    pub mvd_l0: Vec<[i32; 2]>,
-    pub mvd_l1: Vec<[i32; 2]>,
+    pub mvd_l0: PartVec<[i32; 2], 2>,
+    pub mvd_l1: PartVec<[i32; 2], 2>,
 }
 
 /// §7.3.5.2 / §7.4.5.2 — `sub_mb_pred()` payload.
@@ -1112,8 +1191,8 @@ pub struct SubMbPred {
     /// `mvd_lX[mbPart][subMbPart]` with mvd stored as `[x, y]`.
     /// Length 4 per partition (max case of 4x4 subdivision); shorter
     /// partitions populate only the first N entries.
-    pub mvd_l0: [Vec<[i32; 2]>; 4],
-    pub mvd_l1: [Vec<[i32; 2]>; 4],
+    pub mvd_l0: [PartVec<[i32; 2], 4>; 4],
+    pub mvd_l1: [PartVec<[i32; 2], 4>; 4],
 }
 
 // Required because `SubMbType` doesn't derive Default — but the fixed-
@@ -1134,9 +1213,9 @@ pub struct Macroblock {
     /// `Some` for the non-sub, non-PCM path.
     pub mb_pred: Option<MbPred>,
     /// `Some` when `NumMbPart == 4` and not an I_NxN / Intra_16x16 MB.
-    pub sub_mb_pred: Option<SubMbPred>,
+    pub sub_mb_pred: Option<Box<SubMbPred>>,
     /// `Some` for I_PCM.
-    pub pcm_samples: Option<PcmSamples>,
+    pub pcm_samples: Option<Box<PcmSamples>>,
     /// Derived `CodedBlockPattern` — bits 0..=3 luma, bits 4..=5 chroma.
     /// Equal to the Intra_16x16 derived values when that mb_type, and
     /// equal to 0 on P_Skip / B_Skip.
@@ -3162,11 +3241,11 @@ pub fn parse_macroblock_dp(
             mb_type_raw,
             mb_pred: None,
             sub_mb_pred: None,
-            pcm_samples: Some(PcmSamples {
+            pcm_samples: Some(Box::new(PcmSamples {
                 luma,
                 chroma_cb: cb,
                 chroma_cr: cr,
-            }),
+            })),
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
@@ -3186,11 +3265,11 @@ pub fn parse_macroblock_dp(
     // coded_block_pattern.
     // ---------------------------------------------------------------
     let mut mb_pred: Option<MbPred> = None;
-    let mut sub_mb_pred: Option<SubMbPred> = None;
+    let mut sub_mb_pred: Option<Box<SubMbPred>> = None;
     let mut transform_size_8x8_flag = false;
 
     if mb_type.is_sub_mb_path() {
-        sub_mb_pred = Some(parse_sub_mb_pred(r, entropy, &mb_type)?);
+        sub_mb_pred = Some(Box::new(parse_sub_mb_pred(r, entropy, &mb_type)?));
     } else {
         // §7.3.5 — read transform_size_8x8_flag for I_NxN when allowed.
         if matches!(mb_type, MbType::INxN) && entropy.transform_8x8_mode_flag {
@@ -8114,6 +8193,25 @@ mod arena_tests {
         assert!(v.residual_chroma_ac_cr().is_empty());
         assert!(v.residual_cb_luma_like().is_empty());
         assert_eq!(v.residual_cb_16x16_dc(), None);
+    }
+
+    /// A PartVec reads as exactly the values pushed, compares by them, and
+    /// a conversion keeps at most its capacity.
+    #[test]
+    fn part_vec_reads_as_its_pushed_values() {
+        let mut p = PartVec::<u32, 2>::default();
+        assert!(p.is_empty());
+        p.push(7);
+        assert_eq!(&p[..], &[7]);
+        p.push(9);
+        assert_eq!(&p[..], &[7, 9]);
+        assert_eq!(p.get(2), None);
+        let q: PartVec<u32, 2> = [7, 9, 11].into();
+        assert_eq!(p, q);
+        let r: PartVec<u32, 2> = vec![7].into();
+        assert_ne!(p, r);
+        assert_eq!(format!("{p:?}"), "[7, 9]");
+        assert!(std::mem::size_of::<PartVec<[i32; 2], 2>>() <= 20);
     }
 
     /// A pooled arena hands its chunks back when dropped, and the next

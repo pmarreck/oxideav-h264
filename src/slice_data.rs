@@ -333,6 +333,12 @@ fn parse_slice_data_impl(
     // so the product fits in u32 by construction. Used downstream to
     // bound `mb_skip_run` and to detect MB-address overflow.
     let pic_size_in_mbs = pic_w_mbs.saturating_mul(pic_h_mbs);
+    // The slice holds at most the picture's remaining macroblocks: room
+    // for them up front, so the vector never grows by reallocating and
+    // moving the macroblocks already parsed.
+    let remaining_mbs = (pic_size_in_mbs as usize).saturating_sub(curr_mb_addr as usize);
+    macroblocks.reserve(remaining_mbs);
+    mb_field_decoding_flags.reserve(remaining_mbs);
     let mut cavlc_nc = CavlcNcGrid::new_mbaff(pic_w_mbs, pic_h_mbs, mbaff_frame_flag);
 
     if pps.entropy_coding_mode_flag {
@@ -831,11 +837,11 @@ fn parse_slice_data_impl(
                             mb_type_raw: 25,
                             mb_pred: None,
                             sub_mb_pred: None,
-                            pcm_samples: Some(PcmSamples {
+                            pcm_samples: Some(Box::new(PcmSamples {
                                 luma,
                                 chroma_cb: cb,
                                 chroma_cr: cr,
-                            }),
+                            })),
                             coded_block_pattern: 0,
                             transform_size_8x8_flag: false,
                             mb_qp_delta: 0,

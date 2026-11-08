@@ -13834,11 +13834,11 @@ mod tests {
             mb_type_raw: 25,
             mb_pred: None,
             sub_mb_pred: None,
-            pcm_samples: Some(PcmSamples {
+            pcm_samples: Some(Box::new(PcmSamples {
                 luma,
                 chroma_cb: cb,
                 chroma_cr: cr,
-            }),
+            })),
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
@@ -13969,11 +13969,11 @@ mod tests {
             mb_type_raw: 25,
             mb_pred: None,
             sub_mb_pred: None,
-            pcm_samples: Some(PcmSamples {
+            pcm_samples: Some(Box::new(PcmSamples {
                 luma,
                 chroma_cb: cb,
                 chroma_cr: cr,
-            }),
+            })),
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
@@ -14535,11 +14535,11 @@ mod tests {
             mb_type_raw: 25,
             mb_pred: None,
             sub_mb_pred: None,
-            pcm_samples: Some(PcmSamples {
+            pcm_samples: Some(Box::new(PcmSamples {
                 luma,
                 chroma_cb: cb.clone(),
                 chroma_cr: cr.clone(),
-            }),
+            })),
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
@@ -14759,8 +14759,8 @@ mod tests {
     /// Build a P_L0_16x16 MB with zero residual.
     fn make_p_l0_16x16(ref_idx: u32, mvd: [i32; 2]) -> Macroblock {
         let pred = MbPred {
-            ref_idx_l0: vec![ref_idx],
-            mvd_l0: vec![mvd],
+            ref_idx_l0: [ref_idx].into(),
+            mvd_l0: [mvd].into(),
             ..MbPred::default()
         };
         Macroblock {
@@ -14905,14 +14905,14 @@ mod tests {
             smp.sub_mb_type[i] = SubMbType::BDirect8x8;
             smp.ref_idx_l0[i] = 0;
             smp.ref_idx_l1[i] = 0;
-            smp.mvd_l0[i] = vec![[0, 0]];
-            smp.mvd_l1[i] = vec![[0, 0]];
+            smp.mvd_l0[i] = [[0, 0]].into();
+            smp.mvd_l1[i] = [[0, 0]].into();
         }
         let mb = Macroblock {
             mb_type: MbType::P8x8,
             mb_type_raw: 3,
             mb_pred: None,
-            sub_mb_pred: Some(smp),
+            sub_mb_pred: Some(Box::new(smp)),
             pcm_samples: None,
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
@@ -15024,8 +15024,8 @@ mod tests {
 
         // Build a P_L0_L0_16x8 MB with top MVD=(16,0), bottom MVD=(0,0).
         let pred = crate::macroblock_layer::MbPred {
-            ref_idx_l0: vec![0, 0],
-            mvd_l0: vec![[16, 0], [0, 0]],
+            ref_idx_l0: [0, 0].into(),
+            mvd_l0: [[16, 0], [0, 0]].into(),
             ..crate::macroblock_layer::MbPred::default()
         };
         let mb = Macroblock {
@@ -15377,10 +15377,10 @@ mod tests {
     /// indices.
     fn make_b_bi_16x16(ref_idx_l0: u32, ref_idx_l1: u32) -> Macroblock {
         let pred = MbPred {
-            ref_idx_l0: vec![ref_idx_l0],
-            ref_idx_l1: vec![ref_idx_l1],
-            mvd_l0: vec![[0, 0]],
-            mvd_l1: vec![[0, 0]],
+            ref_idx_l0: [ref_idx_l0].into(),
+            ref_idx_l1: [ref_idx_l1].into(),
+            mvd_l0: [[0, 0]].into(),
+            mvd_l1: [[0, 0]].into(),
             ..MbPred::default()
         };
         Macroblock {
