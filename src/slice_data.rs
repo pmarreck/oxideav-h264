@@ -47,8 +47,8 @@ use crate::cabac_ctx::{
     CabacContexts, NeighbourCtx, SliceKind, decode_end_of_slice_flag, decode_mb_skip_flag,
 };
 use crate::macroblock_layer::{
-    CabacNeighbourGrid, CavlcNcGrid, ChunkPool, CoeffArena, DpResidualReaders, EntropyState,
-    Macroblock, MacroblockLayerError, MbType, MbView, PcmSamples, parse_macroblock,
+    CabacNeighbourGrid, CavlcNcGrid, CoeffArena, DpResidualReaders, EntropyState, Macroblock,
+    MacroblockLayerError, MbType, MbView, PcmSamples, SlicePool, parse_macroblock,
     parse_macroblock_dp,
 };
 use crate::mb_address::mbaff_pair_neighbour_addrs;
@@ -127,6 +127,19 @@ pub struct SliceData {
     pub coeffs: CoeffArena,
 }
 
+impl Drop for SliceData {
+    /// Hand the macroblock and field-flag vectors to the stream's pool
+    /// (the arena returns its own chunks), when the slice came from one.
+    fn drop(&mut self) {
+        if let Some(pool) = self.coeffs.pool() {
+            pool.put_macroblocks(
+                std::mem::take(&mut self.macroblocks),
+                std::mem::take(&mut self.mb_field_decoding_flags),
+            );
+        }
+    }
+}
+
 impl SliceData {
     /// Macroblock `idx` with its residual lists.
     #[inline]
@@ -192,7 +205,7 @@ pub fn parse_slice_data_pooled(
     slice_header: &SliceHeader,
     sps: &Sps,
     pps: &Pps,
-    pool: &std::sync::Arc<ChunkPool>,
+    pool: &std::sync::Arc<SlicePool>,
 ) -> SliceDataResult<SliceData> {
     parse_slice_data_impl(
         rbsp,
@@ -279,7 +292,7 @@ fn parse_slice_data_impl(
     slice_header: &SliceHeader,
     sps: &Sps,
     pps: &Pps,
-    pool: Option<std::sync::Arc<ChunkPool>>,
+    pool: Option<std::sync::Arc<SlicePool>>,
 ) -> SliceDataResult<SliceData> {
     // §7.3.4 — MbaffFrameFlag = mb_adaptive_frame_field_flag &&
     // !field_pic_flag. Phase 1: the walker steps in MB pairs and
@@ -305,12 +318,16 @@ fn parse_slice_data_impl(
         return Err(SliceDataError::SliceQpOutOfRange(slice_qp_y));
     }
 
-    let mut macroblocks: Vec<Macroblock> = Vec::new();
-    let mut coeffs = match pool {
-        Some(p) => CoeffArena::with_pool(p),
+    // The macroblock vectors, arena chunks and neighbor grids of an
+    // earlier slice of the stream, when the decoder pools them.
+    let (mut macroblocks, mut mb_field_decoding_flags) = match &pool {
+        Some(p) => p.take_macroblocks(),
+        None => (Vec::new(), Vec::new()),
+    };
+    let mut coeffs = match &pool {
+        Some(p) => CoeffArena::with_pool(p.clone()),
         None => CoeffArena::default(),
     };
-    let mut mb_field_decoding_flags: Vec<bool> = Vec::new();
     let mut curr_mb_addr: u32 = slice_header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag));
     // §8.2.2 / §7.3.4 — FMO slice group map (round-453): NextMbAddress
     // walks the current slice group instead of the raster successor.
@@ -339,7 +356,10 @@ fn parse_slice_data_impl(
     let remaining_mbs = (pic_size_in_mbs as usize).saturating_sub(curr_mb_addr as usize);
     macroblocks.reserve(remaining_mbs);
     mb_field_decoding_flags.reserve(remaining_mbs);
-    let mut cavlc_nc = CavlcNcGrid::new_mbaff(pic_w_mbs, pic_h_mbs, mbaff_frame_flag);
+    let mut cavlc_nc = match &pool {
+        Some(p) => p.take_cavlc_grid(pic_w_mbs, pic_h_mbs, mbaff_frame_flag),
+        None => CavlcNcGrid::new_mbaff(pic_w_mbs, pic_h_mbs, mbaff_frame_flag),
+    };
 
     if pps.entropy_coding_mode_flag {
         // ---------------------------------------------------------
@@ -396,7 +416,10 @@ fn parse_slice_data_impl(
         // §9.3.3.1.1.9 — CABAC residual neighbour grid; populated per MB
         // as the walker steps, and consulted when deriving `ctxIdxInc`
         // for coded_block_flag / ref_idx / mvd on subsequent MBs.
-        let mut cabac_nb = CabacNeighbourGrid::new_mbaff(pic_w_mbs, pic_h_mbs, mbaff_frame_flag);
+        let mut cabac_nb = match &pool {
+            Some(p) => p.take_cabac_grid(pic_w_mbs, pic_h_mbs, mbaff_frame_flag),
+            None => CabacNeighbourGrid::new_mbaff(pic_w_mbs, pic_h_mbs, mbaff_frame_flag),
+        };
         loop {
             // Debug marker for bin-level trace: emit a MB-boundary line
             // (gated on OXIDEAV_H264_BIN_TRACE) so downstream tooling can
@@ -907,6 +930,9 @@ fn parse_slice_data_impl(
                 return Err(SliceDataError::MbAddrOverflow(pic_size_in_mbs));
             }
         }
+        if let Some(p) = &pool {
+            p.put_cabac_grid(cabac_nb);
+        }
     } else {
         // ---------------------------------------------------------
         // CAVLC path (§7.3.4).
@@ -1105,6 +1131,9 @@ fn parse_slice_data_impl(
         mb_field_decoding_flags.len(),
         "mb_field_decoding_flags must be parallel to macroblocks"
     );
+    if let Some(p) = &pool {
+        p.put_cavlc_grid(cavlc_nc);
+    }
     Ok(SliceData {
         macroblocks,
         mb_field_decoding_flags,

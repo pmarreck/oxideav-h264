@@ -181,6 +181,20 @@ impl RefPicStore {
         self.pictures.retain(|k, _| live.contains(k));
     }
 
+    /// [`Self::retain_keys`], handing back the dropped pictures (for the
+    /// decoder to reuse their buffers).
+    pub fn take_unlisted(&mut self, live: &[u32]) -> Vec<Arc<Picture>> {
+        let dead: Vec<u32> = self
+            .pictures
+            .keys()
+            .filter(|k| !live.contains(k))
+            .copied()
+            .collect();
+        dead.iter()
+            .filter_map(|k| self.pictures.remove(k))
+            .collect()
+    }
+
     /// Number of pictures currently stored. Exposed for the decoder's
     /// bounded-memory accounting (and its regression tests).
     pub fn stored_count(&self) -> usize {

@@ -88,7 +88,7 @@ struct SdInput {
     header: SliceHeader,
     sps: Sps,
     pps: crate::pps::Pps,
-    pool: Arc<crate::macroblock_layer::ChunkPool>,
+    pool: Arc<crate::macroblock_layer::SlicePool>,
 }
 
 type SdResult = std::result::Result<slice_data::SliceData, String>;
@@ -440,7 +440,12 @@ pub struct H264CodecDecoder {
     pending_sd: Option<Arc<SdTask>>,
     /// Spare residual-coefficient arena chunks, shared by this stream's
     /// slice-data parses (serial or queued on the pool).
-    chunk_pool: Arc<crate::macroblock_layer::ChunkPool>,
+    chunk_pool: Arc<crate::macroblock_layer::SlicePool>,
+    /// Sample planes and macroblock grid of finished pictures, reused by
+    /// the next pictures of the same geometry instead of being freed and
+    /// allocated (and page-faulted) again. At most two pictures.
+    spare_pictures: Vec<Picture>,
+    spare_grid: Option<MbGrid>,
     /// The parameter-set NAL units of the `avcC` record, replayed into
     /// the fresh NAL driver of a `reset` (a seek keeps the stream's
     /// out-of-band SPS / PPS).
@@ -491,6 +496,8 @@ impl H264CodecDecoder {
             ft: None,
             pending_sd: None,
             chunk_pool: Arc::default(),
+            spare_pictures: Vec::new(),
+            spare_grid: None,
             extradata_nals: Vec::new(),
             emitted_shape: None,
             params_generation: 0,
@@ -1315,14 +1322,14 @@ impl H264CodecDecoder {
             let width_samples = sps.pic_width_in_mbs() * 16;
             let height_samples = pic_height_in_mbs * 16;
             let chroma_array_type = sps.chroma_array_type();
-            let pic = Picture::new(
+            let pic = self.fresh_picture(
                 width_samples,
                 height_samples,
                 chroma_array_type,
                 sps.bit_depth_luma_minus8 + 8,
                 sps.bit_depth_chroma_minus8 + 8,
             );
-            let grid = MbGrid::new(sps.pic_width_in_mbs(), pic_height_in_mbs);
+            let grid = self.fresh_grid(sps.pic_width_in_mbs(), pic_height_in_mbs);
             let structure =
                 pic_structure_from_flags(header.field_pic_flag, header.bottom_field_flag);
 
@@ -1888,7 +1895,7 @@ impl H264CodecDecoder {
                 &mut in_progress.grid,
                 self.threads,
             )
-            .map(|()| sd.mb_field_decoding_flags)
+            .map(|()| sd.mb_field_decoding_flags.clone())
         };
         let mb_field_decoding_flags =
             recon.map_err(|e| Error::invalid(format!("h264 reconstruct: {e}")))?;
@@ -2364,14 +2371,17 @@ impl H264CodecDecoder {
         // the reference store, or to the frame-threading pool): its
         // size is the SPS frame size (§7.4.2.1.1).
         let shape = OutShape::of_sps(&sps, self.scp_plane_mode);
-        let pic = match (&ft_planes, early_vf.take()) {
+        let out_pic = match (&ft_planes, early_vf.take()) {
             (Some(planes), _) => OutPic::Pending(planes.clone()),
             (None, Some(vf)) => OutPic::Ready(vf),
             (None, None) => {
                 OutPic::Ready(picture_to_video_frame(&pic, pts, sps.frame_crop_margins()))
             }
         };
-        let out = OutFrame { pic, shape };
+        let out = OutFrame {
+            pic: out_pic,
+            shape,
+        };
         let entry = OutputEntry {
             picture: out,
             pic_order_cnt: output_poc,
@@ -2381,6 +2391,7 @@ impl H264CodecDecoder {
         if let Some(bumped) = self.output_dpb.push(entry) {
             self.ready.push_back(bumped.picture);
         }
+        self.recycle_picture(pic, grid);
 
         Ok(())
     }
@@ -2527,9 +2538,73 @@ impl H264CodecDecoder {
     /// with each reference picture decoded in the session.
     fn prune_ref_store(&mut self) {
         let live: Vec<u32> = self.dpb_entries.iter().map(|e| e.dpb_key).collect();
-        self.ref_store.retain_keys(&live);
+        for dead in self.ref_store.take_unlisted(&live) {
+            if let Ok(pic) = Arc::try_unwrap(dead) {
+                self.recycle_picture(pic, None);
+            }
+        }
         if let Some(ft) = self.ft.as_mut() {
             ft.slots.retain(|k, _| live.contains(k));
+        }
+    }
+
+    /// A new zero-filled picture (as [`Picture::new`]), on the planes of
+    /// a finished one of the same geometry when there is one. With one
+    /// thread the reused planes are not zeroed: the serial reconstruction
+    /// marks a macroblock available only after writing its samples, and
+    /// a picture with any macroblock unavailable is never output or
+    /// stored, so no earlier sample can show. The threaded paths mark
+    /// availability before the samples land, so there the planes are
+    /// zeroed as before.
+    fn fresh_picture(
+        &mut self,
+        width: u32,
+        height: u32,
+        chroma_array_type: u32,
+        bit_depth_luma: u32,
+        bit_depth_chroma: u32,
+    ) -> Picture {
+        let spare = self.spare_pictures.iter().position(|p| {
+            p.has_shape(
+                width,
+                height,
+                chroma_array_type,
+                bit_depth_luma,
+                bit_depth_chroma,
+            )
+        });
+        match spare {
+            Some(i) => Picture::recycled(self.spare_pictures.swap_remove(i), self.threads > 1),
+            None => Picture::new(
+                width,
+                height,
+                chroma_array_type,
+                bit_depth_luma,
+                bit_depth_chroma,
+            ),
+        }
+    }
+
+    /// A new all-unavailable macroblock grid (as [`MbGrid::new`]), on the
+    /// allocation of a finished picture's grid when there is one.
+    fn fresh_grid(&mut self, width_in_mbs: u32, height_in_mbs: u32) -> MbGrid {
+        match self.spare_grid.take() {
+            Some(mut g) => {
+                g.reset(width_in_mbs, height_in_mbs);
+                g
+            }
+            None => MbGrid::new(width_in_mbs, height_in_mbs),
+        }
+    }
+
+    /// Keep a finished picture's planes (if it still has them) and grid
+    /// for [`Self::fresh_picture`] / [`Self::fresh_grid`].
+    fn recycle_picture(&mut self, pic: Picture, grid: Option<MbGrid>) {
+        if !pic.luma.is_empty() && self.spare_pictures.len() < 2 {
+            self.spare_pictures.push(pic);
+        }
+        if let Some(g) = grid {
+            self.spare_grid = Some(g);
         }
     }
 
@@ -3550,14 +3625,19 @@ fn snapshot_grid_into_picture(pic: &mut Picture, grid: &MbGrid) {
     let h = grid.height_in_mbs as usize;
     let nmb = w * h;
     pic.mb_width_in_picture = grid.width_in_mbs;
-    pic.mv_l0_grid = vec![(0i16, 0i16); nmb * 16];
-    pic.mv_l1_grid = vec![(0i16, 0i16); nmb * 16];
-    pic.ref_idx_l0_grid = vec![-1i8; nmb * 4];
-    pic.ref_idx_l1_grid = vec![-1i8; nmb * 4];
-    pic.is_intra_grid = vec![false; nmb];
+    // Refilled in place: a recycled picture keeps its grids' allocations.
+    fn refill<T: Clone>(v: &mut Vec<T>, n: usize, x: T) {
+        v.clear();
+        v.resize(n, x);
+    }
+    refill(&mut pic.mv_l0_grid, nmb * 16, (0i16, 0i16));
+    refill(&mut pic.mv_l1_grid, nmb * 16, (0i16, 0i16));
+    refill(&mut pic.ref_idx_l0_grid, nmb * 4, -1i8);
+    refill(&mut pic.ref_idx_l1_grid, nmb * 4, -1i8);
+    refill(&mut pic.is_intra_grid, nmb, false);
     // §6.4.12.2 / Table 8-8 — `fieldDecodingFlagX` of every MB, for
     // AFRM pictures serving as colPic.
-    pic.mb_field_flags = vec![false; nmb];
+    refill(&mut pic.mb_field_flags, nmb, false);
     for (addr, info) in grid.info.iter().enumerate() {
         let base_mv = addr * 16;
         let base_r = addr * 4;

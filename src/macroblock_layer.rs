@@ -697,24 +697,95 @@ const MAX_MB_BLOCKS: usize = 69;
 /// afresh for every slice.)
 const ARENA_CHUNK_BLOCKS: usize = 1024;
 
-/// Spare [`CoeffArena`] chunks shared by the slices of one decoder: an
-/// arena hands its chunks back when dropped and the next slice's arena
-/// takes them, so a stream's coefficient memory is allocated once
-/// rather than per slice (freed per-slice chunks went back to the OS
-/// and were page-faulted in again). Holds at most
-/// [`ChunkPool::MAX_SPARE`] chunks.
+/// Buffers the slices of one decoder hand on to the next slice instead
+/// of freeing them: coefficient arena chunks, the macroblock vector and
+/// the CAVLC and CABAC neighbor grids. Allocated afresh, they were
+/// mapped and page-faulted again for every slice (megabytes per 1080p
+/// slice). A dropped [`CoeffArena`] returns its chunks and a dropped
+/// [`crate::slice_data::SliceData`] its macroblock vector; the slice
+/// walker returns the grids itself. Holds at most
+/// [`SlicePool::MAX_SPARE_CHUNKS`] chunks, two macroblock vectors and one
+/// grid of each kind.
 #[derive(Debug, Default)]
-pub struct ChunkPool {
-    spare: std::sync::Mutex<Vec<Vec<CoeffBlock16>>>,
+pub struct SlicePool {
+    spare: std::sync::Mutex<Spares>,
 }
 
-impl ChunkPool {
+#[derive(Debug, Default)]
+struct Spares {
+    chunks: Vec<Vec<CoeffBlock16>>,
+    macroblocks: Vec<(Vec<Macroblock>, Vec<bool>)>,
+    cavlc: Option<CavlcNcGrid>,
+    cabac: Option<CabacNeighbourGrid>,
+}
+
+impl SlicePool {
     /// 32 MiB of spare chunks: one 1080p slice at a very high bitrate.
-    pub const MAX_SPARE: usize = 512;
+    pub const MAX_SPARE_CHUNKS: usize = 512;
+    /// Spare macroblock vectors (frame threading parses ahead).
+    const MAX_SPARE_MB_VECS: usize = 2;
+
+    fn with_spares<T>(&self, f: impl FnOnce(&mut Spares) -> T) -> Option<T> {
+        self.spare.lock().ok().map(|mut s| f(&mut s))
+    }
 
     /// Number of spare chunks held.
     pub fn spare_chunks(&self) -> usize {
-        self.spare.lock().map_or(0, |s| s.len())
+        self.with_spares(|s| s.chunks.len()).unwrap_or(0)
+    }
+
+    /// An empty macroblock vector and field-flag vector, spares when
+    /// there are any.
+    pub fn take_macroblocks(&self) -> (Vec<Macroblock>, Vec<bool>) {
+        self.with_spares(|s| s.macroblocks.pop())
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    /// Keep a slice's macroblock and field-flag vectors (emptied) for a
+    /// later slice.
+    pub fn put_macroblocks(&self, mut macroblocks: Vec<Macroblock>, mut flags: Vec<bool>) {
+        macroblocks.clear();
+        flags.clear();
+        self.with_spares(|s| {
+            if s.macroblocks.len() < Self::MAX_SPARE_MB_VECS {
+                s.macroblocks.push((macroblocks, flags));
+            }
+        });
+    }
+
+    /// An all-unavailable CAVLC neighbor grid of the given shape: the
+    /// spare one reset, or a new one.
+    pub fn take_cavlc_grid(&self, width: u32, height: u32, mbaff: bool) -> CavlcNcGrid {
+        match self.with_spares(|s| s.cavlc.take()).flatten() {
+            Some(mut g) => {
+                g.reset_mbaff(width, height, mbaff);
+                g
+            }
+            None => CavlcNcGrid::new_mbaff(width, height, mbaff),
+        }
+    }
+
+    /// Keep a slice's CAVLC neighbor grid for a later slice.
+    pub fn put_cavlc_grid(&self, g: CavlcNcGrid) {
+        self.with_spares(|s| s.cavlc = Some(g));
+    }
+
+    /// An all-unavailable CABAC neighbor grid of the given shape: the
+    /// spare one reset, or a new one.
+    pub fn take_cabac_grid(&self, width: u32, height: u32, mbaff: bool) -> CabacNeighbourGrid {
+        match self.with_spares(|s| s.cabac.take()).flatten() {
+            Some(mut g) => {
+                g.reset_mbaff(width, height, mbaff);
+                g
+            }
+            None => CabacNeighbourGrid::new_mbaff(width, height, mbaff),
+        }
+    }
+
+    /// Keep a slice's CABAC neighbor grid for a later slice.
+    pub fn put_cabac_grid(&self, g: CabacNeighbourGrid) {
+        self.with_spares(|s| s.cabac = Some(g));
     }
 }
 
@@ -726,7 +797,7 @@ impl ChunkPool {
 pub struct CoeffArena {
     chunks: Vec<Vec<CoeffBlock16>>,
     /// Where new chunks come from and dropped ones go, if anywhere.
-    pool: Option<std::sync::Arc<ChunkPool>>,
+    pool: Option<std::sync::Arc<SlicePool>>,
 }
 
 impl Drop for CoeffArena {
@@ -734,32 +805,38 @@ impl Drop for CoeffArena {
         let Some(pool) = self.pool.as_ref() else {
             return;
         };
-        if let Ok(mut spare) = pool.spare.lock() {
-            for mut chunk in self.chunks.drain(..) {
-                if spare.len() >= ChunkPool::MAX_SPARE {
+        let chunks = &mut self.chunks;
+        pool.with_spares(|s| {
+            for mut chunk in chunks.drain(..) {
+                if s.chunks.len() >= SlicePool::MAX_SPARE_CHUNKS {
                     break;
                 }
                 chunk.clear();
-                spare.push(chunk);
+                s.chunks.push(chunk);
             }
-        }
+        });
     }
 }
 
 impl CoeffArena {
     /// An empty arena whose chunks come from (and return to) `pool`.
-    pub fn with_pool(pool: std::sync::Arc<ChunkPool>) -> Self {
+    pub fn with_pool(pool: std::sync::Arc<SlicePool>) -> Self {
         Self {
             chunks: Vec::new(),
             pool: Some(pool),
         }
     }
 
+    /// The pool this arena's buffers return to, if any.
+    pub fn pool(&self) -> Option<&std::sync::Arc<SlicePool>> {
+        self.pool.as_ref()
+    }
+
     /// A fresh chunk: a spare from the pool, or a new allocation.
     fn new_chunk(&self) -> Vec<CoeffBlock16> {
         self.pool
             .as_ref()
-            .and_then(|p| p.spare.lock().ok().and_then(|mut s| s.pop()))
+            .and_then(|p| p.with_spares(|s| s.chunks.pop()).flatten())
             .unwrap_or_else(|| Vec::with_capacity(ARENA_CHUNK_BLOCKS))
     }
 
@@ -1418,6 +1495,17 @@ impl CavlcNcGrid {
         g
     }
 
+    /// Make this grid what [`Self::new_mbaff`] would return, reusing its
+    /// allocation.
+    pub fn reset_mbaff(&mut self, pic_width_in_mbs: u32, pic_height_in_mbs: u32, mbaff: bool) {
+        let len = (pic_width_in_mbs as usize) * (pic_height_in_mbs as usize);
+        self.pic_width_in_mbs = pic_width_in_mbs;
+        self.pic_height_in_mbs = pic_height_in_mbs;
+        self.mbs.clear();
+        self.mbs.resize(len, CavlcMbNc::default());
+        self.mbaff_frame_flag = mbaff;
+    }
+
     /// §6.4.12 — resolve a neighbouring sample location `(xN, yN)` to
     /// `(mbAddrN, xW, yW)`, honouring the §6.4.12.2 Table 6-4 process
     /// in MBAFF frames (mirror of
@@ -2073,6 +2161,17 @@ impl CabacNeighbourGrid {
         let mut g = Self::new(width_in_mbs, height_in_mbs);
         g.mbaff_frame_flag = mbaff_frame_flag;
         g
+    }
+
+    /// Make this grid what [`Self::new_mbaff`] would return, reusing its
+    /// allocation.
+    pub fn reset_mbaff(&mut self, width_in_mbs: u32, height_in_mbs: u32, mbaff_frame_flag: bool) {
+        let len = (width_in_mbs as usize) * (height_in_mbs as usize);
+        self.width_in_mbs = width_in_mbs;
+        self.height_in_mbs = height_in_mbs;
+        self.mbs.clear();
+        self.mbs.resize(len, CabacMbNeighbourInfo::default());
+        self.mbaff_frame_flag = mbaff_frame_flag;
     }
 
     /// §6.4.9 — raster-scan `(mbAddrA, mbAddrB)` pair. Non-MBAFF only.
@@ -8214,11 +8313,61 @@ mod arena_tests {
         assert!(std::mem::size_of::<PartVec<[i32; 2], 2>>() <= 20);
     }
 
+    /// The pool hands back emptied macroblock vectors (at most two kept)
+    /// and neighbor grids reset to exactly what a fresh grid holds.
+    #[test]
+    fn slice_pool_reuses_vectors_and_resets_grids() {
+        let pool = SlicePool::default();
+        let (mut mbs, mut flags) = pool.take_macroblocks();
+        assert!(mbs.is_empty() && flags.is_empty());
+        mbs.extend((0..100).map(|_| Macroblock::new_skip(SliceType::P)));
+        flags.resize(100, true);
+        let ptr = mbs.as_ptr();
+        pool.put_macroblocks(mbs, flags);
+        for _ in 0..3 {
+            pool.put_macroblocks(Vec::with_capacity(1), Vec::new());
+        }
+        let (mbs, flags) = pool.take_macroblocks();
+        let (mbs2, _) = pool.take_macroblocks();
+        let (mbs3, _) = pool.take_macroblocks();
+        assert!(mbs.is_empty() && flags.is_empty() && mbs2.is_empty());
+        assert!(
+            mbs.as_ptr() == ptr || mbs2.as_ptr() == ptr,
+            "the vector is reused"
+        );
+        assert_eq!(mbs3.capacity(), 0, "only two vectors are kept");
+
+        let mut cabac = pool.take_cabac_grid(4, 3, false);
+        for (i, s) in cabac.mbs.iter_mut().enumerate() {
+            s.available = true;
+            s.cbf_luma_4x4 = [true; 16];
+            s.mvd_l0_x[i % 16] = 9;
+        }
+        pool.put_cabac_grid(cabac);
+        let cabac = pool.take_cabac_grid(5, 2, true);
+        assert_eq!(
+            format!("{cabac:?}"),
+            format!("{:?}", CabacNeighbourGrid::new_mbaff(5, 2, true))
+        );
+
+        let mut cavlc = pool.take_cavlc_grid(4, 3, true);
+        for s in cavlc.mbs.iter_mut() {
+            s.is_available = true;
+            s.luma_total_coeff = [3; 16];
+        }
+        pool.put_cavlc_grid(cavlc);
+        let cavlc = pool.take_cavlc_grid(2, 6, false);
+        assert_eq!(
+            format!("{cavlc:?}"),
+            format!("{:?}", CavlcNcGrid::new_mbaff(2, 6, false))
+        );
+    }
+
     /// A pooled arena hands its chunks back when dropped, and the next
     /// arena reuses them; the pool keeps at most its cap.
     #[test]
     fn pooled_chunks_are_reused_and_capped() {
-        let pool = Arc::new(ChunkPool::default());
+        let pool = Arc::new(SlicePool::default());
         let mut a = CoeffArena::with_pool(pool.clone());
         for mb in 0..40 {
             owned(mb, true).append_to(&mut a);
@@ -8239,10 +8388,10 @@ mod arena_tests {
         drop(b);
         // More chunks than the cap: the excess is freed.
         let mut c = CoeffArena::with_pool(pool.clone());
-        for _ in 0..ChunkPool::MAX_SPARE + 4 {
+        for _ in 0..SlicePool::MAX_SPARE_CHUNKS + 4 {
             c.chunks.push(Vec::with_capacity(ARENA_CHUNK_BLOCKS));
         }
         drop(c);
-        assert_eq!(pool.spare_chunks(), ChunkPool::MAX_SPARE);
+        assert_eq!(pool.spare_chunks(), SlicePool::MAX_SPARE_CHUNKS);
     }
 }

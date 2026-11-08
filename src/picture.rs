@@ -243,6 +243,62 @@ impl Picture {
         }
     }
 
+    /// [`Picture::new`] of `old`'s geometry, reusing its allocations: the
+    /// sample planes, and the motion grids emptied as `new` leaves them.
+    /// The planes keep `old`'s samples unless `zero` is set; a caller may
+    /// leave it unset only when every sample of the new picture is
+    /// written before anything reads it.
+    pub fn recycled(old: Picture, zero: bool) -> Self {
+        let mut p = Picture::new(
+            0,
+            0,
+            old.chroma_array_type,
+            old.bit_depth_luma,
+            old.bit_depth_chroma,
+        );
+        p.width_in_samples = old.width_in_samples;
+        p.height_in_samples = old.height_in_samples;
+        p.luma = old.luma;
+        p.cb = old.cb;
+        p.cr = old.cr;
+        if zero {
+            p.luma.fill(0);
+            p.cb.fill(0);
+            p.cr.fill(0);
+        }
+        fn emptied<T>(mut v: Vec<T>) -> Vec<T> {
+            v.clear();
+            v
+        }
+        p.mv_l0_grid = emptied(old.mv_l0_grid);
+        p.mv_l1_grid = emptied(old.mv_l1_grid);
+        p.ref_idx_l0_grid = emptied(old.ref_idx_l0_grid);
+        p.ref_idx_l1_grid = emptied(old.ref_idx_l1_grid);
+        p.is_intra_grid = emptied(old.is_intra_grid);
+        p.mb_field_flags = emptied(old.mb_field_flags);
+        p
+    }
+
+    /// True when `self` has the geometry and sample format given.
+    pub fn has_shape(
+        &self,
+        width_in_samples: u32,
+        height_in_samples: u32,
+        chroma_array_type: u32,
+        bit_depth_luma: u32,
+        bit_depth_chroma: u32,
+    ) -> bool {
+        let (cw, ch) = chroma_dims(chroma_array_type, width_in_samples, height_in_samples);
+        self.width_in_samples == width_in_samples
+            && self.height_in_samples == height_in_samples
+            && self.chroma_array_type == chroma_array_type
+            && self.bit_depth_luma == bit_depth_luma
+            && self.bit_depth_chroma == bit_depth_chroma
+            && self.luma.len() == (width_in_samples as usize) * (height_in_samples as usize)
+            && self.cb.len() == (cw as usize) * (ch as usize)
+            && self.cr.len() == self.cb.len()
+    }
+
     /// §8.4.2.1 / §8.2.4.2.5 — extract one parity field of this FRAME
     /// picture as a standalone half-height picture (top field = even
     /// sample rows of every plane, bottom = odd rows; the chroma planes
@@ -494,6 +550,35 @@ fn clip3_i32(x: i32, y: i32, z: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recycled picture is a new picture of the same geometry: zeroed
+    /// planes when asked, the old samples otherwise, and every other field
+    /// (motion grids included) as `new` leaves it.
+    #[test]
+    fn recycled_equals_new() {
+        let mut old = Picture::new(32, 16, 1, 8, 8);
+        old.set_luma(3, 4, 200);
+        old.pic_order_cnt = 7;
+        old.frame_num = 3;
+        old.non_existing = true;
+        old.mv_l0_grid = vec![(1, 2); 32];
+        old.is_intra_grid = vec![true; 2];
+        old.ref_list_0_pocs = vec![4];
+        let zeroed = Picture::recycled(old.clone(), true);
+        assert_eq!(
+            format!("{zeroed:?}"),
+            format!("{:?}", Picture::new(32, 16, 1, 8, 8))
+        );
+        assert!(zeroed.mv_l0_grid.capacity() >= 32, "grid allocation kept");
+        let kept = Picture::recycled(old, false);
+        assert_eq!(kept.luma_at(3, 4), 200);
+        let mut expect = Picture::new(32, 16, 1, 8, 8);
+        expect.set_luma(3, 4, 200);
+        assert_eq!(format!("{kept:?}"), format!("{expect:?}"));
+        assert!(kept.has_shape(32, 16, 1, 8, 8));
+        assert!(!kept.has_shape(32, 16, 2, 8, 8));
+        assert!(!kept.has_shape(16, 16, 1, 8, 8));
+    }
 
     #[test]
     fn allocation_monochrome() {

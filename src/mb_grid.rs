@@ -224,6 +224,17 @@ impl MbGrid {
         }
     }
 
+    /// Make this grid what [`Self::new`] would return, reusing its
+    /// allocation.
+    pub fn reset(&mut self, width_in_mbs: u32, height_in_mbs: u32) {
+        let len = (width_in_mbs as usize) * (height_in_mbs as usize);
+        self.width_in_mbs = width_in_mbs;
+        self.height_in_mbs = height_in_mbs;
+        self.info.clear();
+        self.info.resize(len, MbInfo::default());
+        self.mbaff_frame_flag = false;
+    }
+
     /// Immutable access by address, bounds-checked.
     pub fn get(&self, mb_addr: u32) -> Option<&MbInfo> {
         self.info.get(mb_addr as usize)
@@ -284,6 +295,20 @@ impl MbGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A used grid reset to another shape is exactly a fresh grid.
+    #[test]
+    fn reset_equals_new() {
+        let mut g = MbGrid::new(4, 3);
+        g.mbaff_frame_flag = true;
+        for (i, e) in g.info.iter_mut().enumerate() {
+            e.available = true;
+            e.qp_y = i as i32;
+            e.is_intra = true;
+        }
+        g.reset(5, 2);
+        assert_eq!(format!("{g:?}"), format!("{:?}", MbGrid::new(5, 2)));
+    }
 
     #[test]
     fn new_allocates_correct_count() {
