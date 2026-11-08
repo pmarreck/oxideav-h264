@@ -3056,8 +3056,10 @@ fn reconstruct_chroma_intra(
         );
         let out_len = (mbw_c as usize) * (mbh_c as usize);
         require_intra_chroma_mode(chroma_mode, &samples.availability)?;
-        let mut pred_samples = vec![0i32; out_len];
-        predict_chroma(chroma_mode, &samples, ct, bit_depth_c, &mut pred_samples);
+        // On the stack: at most an 8x16 chroma macroblock (4:2:2).
+        let mut pred_buf = [0i32; 256];
+        let pred_samples = &mut pred_buf[..out_len];
+        predict_chroma(chroma_mode, &samples, ct, bit_depth_c, pred_samples);
 
         let qp_c = if plane == 0 { qp_cb } else { qp_cr };
         let sl4 = if plane == 0 { &sl4_cb } else { &sl4_cr };
@@ -3072,7 +3074,7 @@ fn reconstruct_chroma_intra(
                 mb,
                 plane,
                 cbp_chroma,
-                &pred_samples,
+                pred_samples,
                 true,
                 qp_c,
                 qs_c,
@@ -3146,7 +3148,8 @@ fn reconstruct_chroma_intra(
         // §8.5.4 step 2 — assemble the (MbWidthC)x(MbHeightC) rMb
         // (eq. 8-307) first: the §8.5.15 lossless DPCM (§8.5.4 step 3)
         // spans the WHOLE chroma MB, crossing 4x4 block boundaries.
-        let mut rmb = vec![0i32; out_len];
+        let mut rmb_buf = [0i32; 256];
+        let rmb = &mut rmb_buf[..out_len];
         for blk in 0..n_ac {
             // DC coefficient for this 4x4 block.
             let dc_c = if chroma_array_type == 1 {
@@ -3184,12 +3187,7 @@ fn reconstruct_chroma_intra(
         // §8.5.4 step 3 — lossless chroma DPCM: intra_chroma_pred_mode
         // 1 (horizontal) / 2 (vertical) → horPredFlag = 2 − mode.
         if bypass && (chroma_mode_idx == 1 || chroma_mode_idx == 2) {
-            intra_bypass_dpcm(
-                &mut rmb,
-                mbw_c as usize,
-                mbh_c as usize,
-                chroma_mode_idx == 1,
-            );
+            intra_bypass_dpcm(rmb, mbw_c as usize, mbh_c as usize, chroma_mode_idx == 1);
         }
 
         // §8.5.4 step 4 (eq. 8-308) — prediction add + clip + write.
@@ -4904,8 +4902,12 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     let mut pred_luma = [0i32; 256];
     // Chroma prediction samples: sized per chroma MB dims.
     let (mbw_c, mbh_c) = chroma_mb_dims(chroma_array_type);
-    let mut pred_cb = vec![0i32; (mbw_c as usize) * (mbh_c as usize)];
-    let mut pred_cr = vec![0i32; (mbw_c as usize) * (mbh_c as usize)];
+    // On the stack: at most a 16x16 chroma macroblock (4:4:4).
+    let n_c = (mbw_c as usize) * (mbh_c as usize);
+    let mut pred_cb_buf = [0i32; 256];
+    let mut pred_cr_buf = [0i32; 256];
+    let pred_cb = &mut pred_cb_buf[..n_c];
+    let pred_cr = &mut pred_cr_buf[..n_c];
 
     // §6.4.8 — stamp the current MB's slice identity eagerly so that
     // later partitions' MVpred neighbour lookups (within the same MB)
@@ -4965,8 +4967,8 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             pic.pic_order_cnt,
             (pic.top_field_order_cnt, pic.bottom_field_order_cnt),
             &mut pred_luma,
-            &mut pred_cb,
-            &mut pred_cr,
+            pred_cb,
+            pred_cr,
             inter_debug,
             field_parity,
         )?;
@@ -4989,8 +4991,8 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
             sps,
             pps,
             &pred_luma,
-            &pred_cb,
-            &pred_cr,
+            pred_cb,
+            pred_cr,
             &writer,
             pic,
             (mbaff_frame_flag && mb_field_decoding_flag) || slice_header.field_pic_flag,
@@ -5010,8 +5012,8 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
         pps,
         &writer,
         &pred_luma,
-        &pred_cb,
-        &pred_cr,
+        pred_cb,
+        pred_cr,
         pic,
         mbaff_frame_flag && mb_field_decoding_flag,
         inter_debug,
