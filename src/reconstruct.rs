@@ -45,7 +45,7 @@ use crate::intra_pred::{
     IntraChromaMode, Neighbour4x4Availability, Samples4x4, Samples8x8, Samples16x16, SamplesChroma,
     filter_samples_8x8, predict_4x4, predict_8x8, predict_16x16, predict_chroma,
 };
-use crate::macroblock_layer::{Macroblock, MbType, SubMbType};
+use crate::macroblock_layer::{Macroblock, MbType, MbView, SubMbType};
 use crate::mb_grid::{MbGrid, MbInfo};
 use crate::mv_deriv::{
     Mv, MvpredInputs, MvpredShape, NeighbourMv, derive_b_spatial_direct_with_d,
@@ -794,7 +794,8 @@ pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
     // §8.2.2 — FMO slice group map (round-453).
     let mb_map = crate::mb_address::slice_mb_to_slice_group_map(sps, pps, slice_header);
     let total = slice_data.macroblocks.len();
-    for (idx, mb) in slice_data.macroblocks.iter().enumerate() {
+    for (idx, mb) in slice_data.mbs().enumerate() {
+        let mb = &mb;
         // §7.4.4 — per-MB mb_field_decoding_flag (shared within an
         // MBAFF pair, `false` for non-MBAFF).
         let mb_field_decoding_flag = slice_data
@@ -989,7 +990,7 @@ fn derive_mb_inter_motion<R: RefPicProvider>(
 /// picture (luma 16x16, chroma one MB) addressed from its origin.
 #[allow(clippy::too_many_arguments)]
 fn synth_mb_inter<R: RefPicProvider>(
-    mb: &Macroblock,
+    mb: &MbView<'_>,
     job: &InterMbJob,
     chroma_array_type: u32,
     bit_depth_y: u32,
@@ -1152,7 +1153,8 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
     let mut intra_mbs: Vec<(usize, u32, i32)> = Vec::new();
     let mut failed: Option<(usize, ReconstructError)> = None;
     let addrs = slice_header.first_mb_in_slice..;
-    for (curr_addr, (idx, mb)) in addrs.zip(slice_data.macroblocks.iter().enumerate()) {
+    for (curr_addr, (idx, mb)) in addrs.zip(slice_data.mbs().enumerate()) {
+        let mb = &mb;
         if curr_addr as usize >= grid.info.len() {
             break;
         }
@@ -1269,7 +1271,7 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let (bands, next, errors, rows, jobs) = (&bands, &next, &errors, &rows, &jobs);
-            let mbs = &slice_data.macroblocks;
+            let mbs = slice_data;
             scope.spawn(move || {
                 let mut scratch = Picture::new(16, 16, chroma_array_type, bit_depth_y, bit_depth_c);
                 loop {
@@ -1283,7 +1285,7 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
                     debug_assert_eq!(band.mb_y, rows[k].0);
                     for job in &jobs[rows[k].1.clone()] {
                         if let Err(e) = synth_mb_inter(
-                            &mbs[job.idx],
+                            &mbs.mb(job.idx),
                             job,
                             chroma_array_type,
                             bit_depth_y,
@@ -1331,7 +1333,7 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
             break;
         }
         reconstruct_mb_intra(
-            &slice_data.macroblocks[idx],
+            &slice_data.mb(idx),
             addr,
             qp_y,
             chroma_array_type,
@@ -1562,7 +1564,7 @@ fn sp_si_ctx_for_slice(
 /// (eqs. 8-333, 8-426, 8-438 — the prediction is not added again).
 #[allow(clippy::too_many_arguments)]
 fn sp_reconstruct_chroma_plane(
-    mb: &Macroblock,
+    mb: &MbView<'_>,
     plane: u8,
     cbp_chroma: u8,
     pred: &[i32],
@@ -1585,9 +1587,9 @@ fn sp_reconstruct_chroma_plane(
     let mut dc_levels = [0i32; 4];
     if cbp_chroma > 0 {
         let dc_block = if plane == 0 {
-            &mb.residual_chroma_dc_cb
+            mb.residual_chroma_dc_cb()
         } else {
-            &mb.residual_chroma_dc_cr
+            mb.residual_chroma_dc_cr()
         };
         for (k, v) in dc_block.iter().take(4).enumerate() {
             dc_levels[k] = *v;
@@ -1596,9 +1598,9 @@ fn sp_reconstruct_chroma_plane(
     let mut ac = [[0i32; 16]; 4];
     if cbp_chroma == 2 {
         let ac_blocks = if plane == 0 {
-            &mb.residual_chroma_ac_cb
+            mb.residual_chroma_ac_cb()
         } else {
-            &mb.residual_chroma_ac_cr
+            mb.residual_chroma_ac_cr()
         };
         for (blk, dst) in ac.iter_mut().enumerate() {
             let scan = ac_blocks.get(blk).copied().unwrap_or([0i32; 16]);
@@ -1633,7 +1635,7 @@ fn sp_reconstruct_chroma_plane(
 
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_mb_intra(
-    mb: &Macroblock,
+    mb: &MbView<'_>,
     mb_addr: u32,
     qp_y: i32,
     chroma_array_type: u32,
@@ -1827,7 +1829,7 @@ fn reconstruct_mb_intra(
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_intra_16x16(
     luma_plane: usize,
-    mb: &Macroblock,
+    mb: &MbView<'_>,
     pred_mode_idx: u8,
     cbp_luma: u8,
     _cbp_chroma: u8,
@@ -1876,7 +1878,7 @@ fn reconstruct_intra_16x16(
     // §7.4.2.1.1 — lossless bypass: all §8.5.10/§8.5.12 stages are the
     // identity and §8.5.15 DPCM applies below for V/H prediction.
     let bypass = transform_bypass_active(sps, qp_prime_y);
-    let dc_levels = mb.residual_luma_dc.as_ref().copied().unwrap_or([0i32; 16]);
+    let dc_levels = mb.residual_luma_dc().copied().unwrap_or([0i32; 16]);
     // DC coefficients are in scan order (§8.5.6: zig-zag for frame
     // MBs, field scan for field MBs); inverse-scan to a 4x4 matrix
     // before the Hadamard.
@@ -1910,7 +1912,7 @@ fn reconstruct_intra_16x16(
         // overwritten with the already-scaled DC entry from dc_y.
         let mut coeffs = if cbp_luma == 15 {
             let ac = mb
-                .residual_luma
+                .residual_luma()
                 .get(block_idx)
                 .copied()
                 .unwrap_or([0i32; 16]);
@@ -2590,7 +2592,7 @@ fn derive_intra_8x8_pred_mode(
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_intra_nxn(
     luma_plane: usize,
-    mb: &Macroblock,
+    mb: &MbView<'_>,
     qp_y: i32,
     bit_depth_y: u32,
     mb_px: i32,
@@ -2698,7 +2700,7 @@ fn reconstruct_intra_nxn(
 
             // §8.5.13 — inverse transform of the 8x8 residual block.
             //
-            // Storage convention: `mb.residual_luma[blk8*4..blk8*4+4]`
+            // Storage convention: `mb.residual_luma()[blk8*4..blk8*4+4]`
             // holds four 16-entry arrays that together contain the 64
             // coefficients of this 8x8 block. The concatenation order
             // (sub 0 → indices 0..=15, sub 1 → 16..=31, ...) is the
@@ -2716,7 +2718,7 @@ fn reconstruct_intra_nxn(
             let coeffs_flat: [i32; 64] = {
                 let bit = (cbp_luma >> blk8) & 1 == 1;
                 if bit {
-                    // `mb.residual_luma` is compacted to only include
+                    // `mb.residual_luma()` is compacted to only include
                     // 8x8 quadrants whose cbp_luma bit is set, so map
                     // `blk8` to the array index by counting set bits
                     // below it in `cbp_luma` (§7.3.5.3 CAVLC / CABAC
@@ -2726,7 +2728,7 @@ fn reconstruct_intra_nxn(
                     let mut scan = [0i32; 64];
                     for sub in 0..4usize {
                         let slot = base_slot + sub;
-                        if let Some(coefs) = mb.residual_luma.get(slot) {
+                        if let Some(coefs) = mb.residual_luma().get(slot) {
                             for (i, c) in coefs.iter().enumerate().take(16) {
                                 scan[sub * 16 + i] = *c;
                             }
@@ -2790,8 +2792,8 @@ fn reconstruct_intra_nxn(
             );
             eprintln!("  prev_flags: {:?}", pred.prev_intra4x4_pred_mode_flag);
             eprintln!("  rem_modes:  {:?}", pred.rem_intra4x4_pred_mode);
-            eprintln!("  residual_luma.len() = {}", mb.residual_luma.len());
-            for (i, blk) in mb.residual_luma.iter().enumerate() {
+            eprintln!("  residual_luma.len() = {}", mb.residual_luma().len());
+            for (i, blk) in mb.residual_luma().iter().enumerate() {
                 let nz = blk.iter().filter(|&&v| v != 0).count();
                 if nz > 0 {
                     eprintln!("  residual_luma[{}] ({} nz): {:?}", i, nz, blk);
@@ -2827,7 +2829,7 @@ fn reconstruct_intra_nxn(
 
             // §8.5.12 — inverse-transform the residual (if any).
             //
-            // `mb.residual_luma` is populated by the macroblock-layer
+            // `mb.residual_luma()` is populated by the macroblock-layer
             // parser only for the 8x8 quadrants whose cbp_luma bit is
             // set (§7.3.5.3 / §7.4.5.3.2), and pushed sequentially in
             // raster-Z order. So for a cbp_luma with gaps (e.g. 0x5 or
@@ -2838,7 +2840,7 @@ fn reconstruct_intra_nxn(
             let coeffs_scan = if (cbp_luma >> blk8) & 1 == 1 {
                 let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
                 let compact_idx = set_before * 4 + (block_idx % 4);
-                mb.residual_luma
+                mb.residual_luma()
                     .get(compact_idx)
                     .copied()
                     .unwrap_or([0i32; 16])
@@ -2926,7 +2928,7 @@ fn pred_block_to_mb(src4: &[i32; 16], bx: i32, by: i32) -> [i32; 256] {
 
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_chroma_intra(
-    mb: &Macroblock,
+    mb: &MbView<'_>,
     qp_y: i32,
     chroma_array_type: u32,
     bit_depth_c: u32,
@@ -3085,9 +3087,9 @@ fn reconstruct_chroma_intra(
 
         // §8.5.11 — chroma DC Hadamard.
         let dc_block = if plane == 0 {
-            &mb.residual_chroma_dc_cb
+            mb.residual_chroma_dc_cb()
         } else {
-            &mb.residual_chroma_dc_cr
+            mb.residual_chroma_dc_cr()
         };
         // Chroma DC arrays (2x2 for 4:2:0, 4x2 for 4:2:2).
         let dc_flat: [i32; 8] = {
@@ -3136,9 +3138,9 @@ fn reconstruct_chroma_intra(
         let num_c8x8 = if chroma_array_type == 1 { 1 } else { 2 };
         let n_ac = 4 * num_c8x8 as usize;
         let ac_blocks = if plane == 0 {
-            &mb.residual_chroma_ac_cb
+            mb.residual_chroma_ac_cb()
         } else {
-            &mb.residual_chroma_ac_cr
+            mb.residual_chroma_ac_cr()
         };
 
         // §8.5.4 step 2 — assemble the (MbWidthC)x(MbHeightC) rMb
@@ -3223,7 +3225,7 @@ fn reconstruct_chroma_intra(
 
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_chroma_intra_444(
-    mb: &Macroblock,
+    mb: &MbView<'_>,
     qp_y: i32,
     bit_depth_c: u32,
     mb_px: i32,
@@ -3294,9 +3296,9 @@ fn reconstruct_chroma_intra_444(
 
         // (2) Inverse Hadamard on the per-plane DC.
         let dc_levels = if plane == 0 {
-            mb.residual_cb_16x16_dc.unwrap_or([0i32; 16])
+            mb.residual_cb_16x16_dc().copied().unwrap_or([0i32; 16])
         } else {
-            mb.residual_cr_16x16_dc.unwrap_or([0i32; 16])
+            mb.residual_cr_16x16_dc().copied().unwrap_or([0i32; 16])
         };
         // DC coefficients are in scan order (§8.5.6 — zig-zag or
         // field). Apply the inverse scan + Hadamard.
@@ -3311,9 +3313,9 @@ fn reconstruct_chroma_intra_444(
         // (3) Per-AC-block inverse 4x4 transform with c[0,0] from DC,
         // add to predictor, write to the picture.
         let ac_blocks = if plane == 0 {
-            &mb.residual_cb_luma_like
+            mb.residual_cb_luma_like()
         } else {
-            &mb.residual_cr_luma_like
+            mb.residual_cr_luma_like()
         };
         // Assemble the 16x16 rMb (eq. 8-301) first so the §8.5.15
         // lossless DPCM can span the whole plane MB (§8.5.2 step 3 via
@@ -3386,7 +3388,7 @@ fn reconstruct_chroma_intra_444(
 /// set-bit-counting index mapping mirrors `reconstruct_intra_nxn`.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_chroma_intra_nxn_444(
-    mb: &Macroblock,
+    mb: &MbView<'_>,
     qp_y: i32,
     bit_depth_c: u32,
     mb_px: i32,
@@ -3437,9 +3439,9 @@ fn reconstruct_chroma_intra_nxn_444(
     for plane in 0..2u8 {
         let qp_c = if plane == 0 { qp_cb } else { qp_cr };
         let ac_blocks = if plane == 0 {
-            &mb.residual_cb_luma_like
+            mb.residual_cb_luma_like()
         } else {
-            &mb.residual_cr_luma_like
+            mb.residual_cr_luma_like()
         };
 
         if mb.transform_size_8x8_flag {
@@ -4802,7 +4804,7 @@ impl Default for InterPartition {
 /// §8.4 — Per-MB inter reconstruction.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_mb_inter<R: RefPicProvider>(
-    mb: &Macroblock,
+    mb: &MbView<'_>,
     mb_addr: u32,
     qp_y: i32,
     chroma_array_type: u32,
@@ -5021,7 +5023,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
 /// write the clipped result through `writer` into `pic`.
 #[allow(clippy::too_many_arguments)]
 fn inter_residual_write(
-    mb: &Macroblock,
+    mb: &MbView<'_>,
     qp_y: i32,
     chroma_array_type: u32,
     bit_depth_y: u32,
@@ -5094,7 +5096,7 @@ fn inter_residual_write(
             let mut scan = [0i32; 64];
             let mut any = false;
             for sub in 0..4usize {
-                if let Some(c) = mb.residual_luma.get(base_slot + sub) {
+                if let Some(c) = mb.residual_luma().get(base_slot + sub) {
                     scan[sub * 16..sub * 16 + 16].copy_from_slice(c);
                     any |= c.iter().any(|&v| v != 0);
                 }
@@ -5129,7 +5131,7 @@ fn inter_residual_write(
             // order, so the array index is (number of set bits below
             // blk8) * 4 + (blk4 % 4), not blk4.
             let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
-            let Some(coeffs_scan) = mb.residual_luma.get(set_before * 4 + (blk4 % 4)) else {
+            let Some(coeffs_scan) = mb.residual_luma().get(set_before * 4 + (blk4 % 4)) else {
                 continue;
             };
             if coeffs_scan.iter().all(|&v| v == 0) {
@@ -8675,7 +8677,7 @@ fn b_sub_mode(t: SubMbType, r0: i8, r1: i8) -> (PartMode, i8, i8) {
 /// still re-quantises its prediction, unlike a P_Skip sample copy).
 #[allow(clippy::too_many_arguments)]
 fn sp_reconstruct_inter_residual(
-    mb: &Macroblock,
+    mb: &MbView<'_>,
     ctx: SpSiCtx,
     qp_y: i32,
     bit_depth_y: u32,
@@ -8711,7 +8713,7 @@ fn sp_reconstruct_inter_residual(
         let coeffs_scan = if (cbp_luma >> blk8) & 1 == 1 {
             let set_before = (cbp_luma & ((1u8 << blk8) - 1)).count_ones() as usize;
             let compact_idx = set_before * 4 + (blk4 % 4);
-            mb.residual_luma
+            mb.residual_luma()
                 .get(compact_idx)
                 .copied()
                 .unwrap_or([0i32; 16])
@@ -8790,7 +8792,7 @@ fn sp_reconstruct_inter_residual(
 /// prediction buffer source.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_inter_chroma_residual(
-    mb: &Macroblock,
+    mb: &MbView<'_>,
     qp_y: i32,
     chroma_array_type: u32,
     bit_depth_c: u32,
@@ -8842,9 +8844,9 @@ fn reconstruct_inter_chroma_residual(
         let qp_c = if plane == 0 { qp_cb } else { qp_cr };
         let sl4 = if plane == 0 { &sl4_cb } else { &sl4_cr };
         let dc_block = if plane == 0 {
-            &mb.residual_chroma_dc_cb
+            mb.residual_chroma_dc_cb()
         } else {
-            &mb.residual_chroma_dc_cr
+            mb.residual_chroma_dc_cr()
         };
         let dc_flat: [i32; 8] = {
             let mut a = [0i32; 8];
@@ -8882,9 +8884,9 @@ fn reconstruct_inter_chroma_residual(
             (Some([0i32; 4]), Some([0i32; 8]))
         };
         let ac_blocks = if plane == 0 {
-            &mb.residual_chroma_ac_cb
+            mb.residual_chroma_ac_cb()
         } else {
-            &mb.residual_chroma_ac_cr
+            mb.residual_chroma_ac_cr()
         };
         let (_, mbh_c) = chroma_mb_dims(chroma_array_type);
         let n_c = (mbw_c * mbh_c) as usize;
@@ -8957,7 +8959,7 @@ fn reconstruct_inter_chroma_residual(
 /// `residual_cr_luma_like`, compacted by the set bits of `cbp_luma`.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_inter_chroma_residual_444(
-    mb: &Macroblock,
+    mb: &MbView<'_>,
     qp_y: i32,
     bit_depth_c: u32,
     writer: &MbWriter,
@@ -8999,9 +9001,9 @@ fn reconstruct_inter_chroma_residual_444(
     for plane in 0..2u8 {
         let qp_c = if plane == 0 { qp_cb } else { qp_cr };
         let ac_blocks = if plane == 0 {
-            &mb.residual_cb_luma_like
+            mb.residual_cb_luma_like()
         } else {
-            &mb.residual_cr_luma_like
+            mb.residual_cr_luma_like()
         };
 
         if mb.transform_size_8x8_flag {
@@ -9113,7 +9115,7 @@ fn _mb_info_marker(_: MbInfo) {}
 /// check, which is too coarse (MBs with a single coded 8x8 quadrant
 /// would incorrectly trigger bS = 2 on edges of the three other
 /// quadrants' coded-block-free 4x4 blocks).
-fn compute_luma_nonzero_mask(mb: &Macroblock) -> u16 {
+fn compute_luma_nonzero_mask(mb: &MbView<'_>) -> u16 {
     // I_PCM — the spec treats I_PCM as having all transform blocks
     // coded for BS purposes (first bullet equivalence, §8.7.2.1).
     if mb.mb_type.is_i_pcm() {
@@ -9130,7 +9132,7 @@ fn compute_luma_nonzero_mask(mb: &Macroblock) -> u16 {
         let mut mask = 0u16;
         if cfg.cbp_luma == 15 {
             // residual_luma has 16 entries in raster-Z order.
-            for (blk_idx, block) in mb.residual_luma.iter().enumerate().take(16) {
+            for (blk_idx, block) in mb.residual_luma().iter().enumerate().take(16) {
                 // AC coefficients at slots 0..=14 (slot 15 is padding).
                 // Slot 0 is spec scan position 1 (AC, not DC).
                 let any_nz = block.iter().take(15).any(|c| *c != 0);
@@ -9163,7 +9165,7 @@ fn compute_luma_nonzero_mask(mb: &Macroblock) -> u16 {
             let mut any_nz = false;
             for sub in 0..4usize {
                 let slot = base_slot + sub;
-                if let Some(c) = mb.residual_luma.get(slot)
+                if let Some(c) = mb.residual_luma().get(slot)
                     && c.iter().any(|v| *v != 0)
                 {
                     any_nz = true;
@@ -9191,7 +9193,7 @@ fn compute_luma_nonzero_mask(mb: &Macroblock) -> u16 {
         let base_slot = set_before * 4;
         for sub in 0..4usize {
             let slot = base_slot + sub;
-            if let Some(c) = mb.residual_luma.get(slot)
+            if let Some(c) = mb.residual_luma().get(slot)
                 && c.iter().any(|v| *v != 0)
             {
                 // Z-scan position of this 4x4 block.
@@ -9210,7 +9212,7 @@ fn compute_luma_nonzero_mask(mb: &Macroblock) -> u16 {
 /// populated (eight 4x4 blocks per plane). ChromaArrayType == 3
 /// (4:4:4) is not modelled here; callers that use the chroma deblock
 /// path for 4:4:4 should consult the luma mask instead.
-fn compute_chroma_nonzero_mask(mb: &Macroblock, chroma_array_type: u32) -> u16 {
+fn compute_chroma_nonzero_mask(mb: &MbView<'_>, chroma_array_type: u32) -> u16 {
     // I_PCM: treat all chroma blocks as coded, consistent with luma.
     if mb.mb_type.is_i_pcm() {
         return 0xFFFF;
@@ -9229,7 +9231,7 @@ fn compute_chroma_nonzero_mask(mb: &Macroblock, chroma_array_type: u32) -> u16 {
     // Per-plane 4x4 count: 4 for 4:2:0, 8 for 4:2:2.
     let num_chroma_blocks = if chroma_array_type == 1 { 4 } else { 8 };
     let mut mask = 0u16;
-    for (plane, ac) in [&mb.residual_chroma_ac_cb, &mb.residual_chroma_ac_cr]
+    for (plane, ac) in [mb.residual_chroma_ac_cb(), mb.residual_chroma_ac_cr()]
         .iter()
         .enumerate()
     {
@@ -12863,7 +12865,8 @@ pub(crate) fn ft_motion_pass<R: RefPicProvider>(
     let current_slice_id = slice_header.first_mb_in_slice as i32;
     let mut plan = FtSlicePlan::default();
     let addrs = slice_header.first_mb_in_slice..;
-    for (curr_addr, (idx, mb)) in addrs.zip(slice_data.macroblocks.iter().enumerate()) {
+    for (curr_addr, (idx, mb)) in addrs.zip(slice_data.mbs().enumerate()) {
+        let mb = &mb;
         if curr_addr as usize >= grid.info.len() {
             break;
         }
@@ -12961,7 +12964,7 @@ pub(crate) fn ft_inter_mb<R: RefPicProvider>(
     ft_fits(sps, pic, job.mb_x, job.mb_y)?;
     let chroma_array_type = sps.chroma_array_type();
     synth_mb_inter(
-        &slice_data.macroblocks[job.idx],
+        &slice_data.mb(job.idx),
         job,
         chroma_array_type,
         8 + sps.bit_depth_luma_minus8,
@@ -13024,7 +13027,7 @@ pub(crate) fn ft_intra_mb(
     let width_in_mbs = grid.width_in_mbs.max(1);
     ft_fits(sps, pic, addr % width_in_mbs, addr / width_in_mbs)?;
     reconstruct_mb_intra(
-        &slice_data.macroblocks[idx],
+        &slice_data.mb(idx),
         addr,
         qp_y,
         sps.chroma_array_type(),
@@ -13839,21 +13842,15 @@ mod tests {
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
-            residual_luma: Vec::new(),
-            residual_luma_dc: None,
-            residual_chroma_dc_cb: Vec::new(),
-            residual_chroma_dc_cr: Vec::new(),
-            residual_chroma_ac_cb: Vec::new(),
-            residual_chroma_ac_cr: Vec::new(),
-            residual_cb_luma_like: Vec::new(),
-            residual_cr_luma_like: Vec::new(),
-            residual_cb_16x16_dc: None,
-            residual_cr_16x16_dc: None,
+            residual: crate::macroblock_layer::MbResidual::default(),
             is_skip: false,
         }
     }
 
-    fn make_intra16x16_dc_mb(pred_mode: u8) -> Macroblock {
+    fn make_intra16x16_dc_mb(
+        pred_mode: u8,
+        coeffs: &mut crate::macroblock_layer::CoeffArena,
+    ) -> Macroblock {
         // No residual at all: cbp_luma = 0 → all-zero DC block; cbp_chroma = 0.
         Macroblock {
             mb_type: MbType::Intra16x16(Intra16x16 {
@@ -13868,16 +13865,13 @@ mod tests {
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
-            residual_luma: Vec::new(),
-            residual_luma_dc: Some([0i32; 16]),
-            residual_chroma_dc_cb: vec![0i32; 4],
-            residual_chroma_dc_cr: vec![0i32; 4],
-            residual_chroma_ac_cb: Vec::new(),
-            residual_chroma_ac_cr: Vec::new(),
-            residual_cb_luma_like: Vec::new(),
-            residual_cr_luma_like: Vec::new(),
-            residual_cb_16x16_dc: None,
-            residual_cr_16x16_dc: None,
+            residual: crate::macroblock_layer::OwnedResidual {
+                luma_dc: Some([0i32; 16]),
+                chroma_dc_cb: vec![0i32; 4],
+                chroma_dc_cr: vec![0i32; 4],
+                ..Default::default()
+            }
+            .append_to(coeffs),
             is_skip: false,
         }
     }
@@ -13892,6 +13886,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -13926,11 +13921,13 @@ mod tests {
         let sps = make_sps(1, 1);
         let pps = make_pps();
         let sh = make_slice_header();
-        let mb = make_intra16x16_dc_mb(2); // pred_mode 2 = DC
+        let mut coeffs = crate::macroblock_layer::CoeffArena::default();
+        let mb = make_intra16x16_dc_mb(2, &mut coeffs); // pred_mode 2 = DC
         let slice_data = SliceData {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs,
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -13980,16 +13977,7 @@ mod tests {
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
-            residual_luma: Vec::new(),
-            residual_luma_dc: None,
-            residual_chroma_dc_cb: Vec::new(),
-            residual_chroma_dc_cr: Vec::new(),
-            residual_chroma_ac_cb: Vec::new(),
-            residual_chroma_ac_cr: Vec::new(),
-            residual_cb_luma_like: Vec::new(),
-            residual_cr_luma_like: Vec::new(),
-            residual_cb_16x16_dc: None,
-            residual_cr_16x16_dc: None,
+            residual: crate::macroblock_layer::MbResidual::default(),
             is_skip: false,
         };
 
@@ -14030,16 +14018,7 @@ mod tests {
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
-            residual_luma: Vec::new(),
-            residual_luma_dc: None,
-            residual_chroma_dc_cb: vec![0i32; 4],
-            residual_chroma_dc_cr: vec![0i32; 4],
-            residual_chroma_ac_cb: Vec::new(),
-            residual_chroma_ac_cr: Vec::new(),
-            residual_cb_luma_like: Vec::new(),
-            residual_cr_luma_like: Vec::new(),
-            residual_cb_16x16_dc: None,
-            residual_cr_16x16_dc: None,
+            residual: crate::macroblock_layer::MbResidual::default(),
             is_skip: false,
         };
 
@@ -14047,6 +14026,7 @@ mod tests {
             macroblocks: vec![mb_top, mb_bot],
             mb_field_decoding_flags: vec![false, false],
             last_mb_addr: 1,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 32, 1, 8, 8);
         let mut grid = MbGrid::new(1, 2);
@@ -14112,22 +14092,14 @@ mod tests {
             coded_block_pattern: 0, // cbp_luma = 0 → no residual.
             transform_size_8x8_flag: true,
             mb_qp_delta: 0,
-            residual_luma: Vec::new(),
-            residual_luma_dc: None,
-            residual_chroma_dc_cb: vec![0i32; 4],
-            residual_chroma_dc_cr: vec![0i32; 4],
-            residual_chroma_ac_cb: Vec::new(),
-            residual_chroma_ac_cr: Vec::new(),
-            residual_cb_luma_like: Vec::new(),
-            residual_cr_luma_like: Vec::new(),
-            residual_cb_16x16_dc: None,
-            residual_cr_16x16_dc: None,
+            residual: crate::macroblock_layer::MbResidual::default(),
             is_skip: false,
         };
         let slice_data = SliceData {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -14571,16 +14543,7 @@ mod tests {
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
-            residual_luma: Vec::new(),
-            residual_luma_dc: None,
-            residual_chroma_dc_cb: Vec::new(),
-            residual_chroma_dc_cr: Vec::new(),
-            residual_chroma_ac_cb: Vec::new(),
-            residual_chroma_ac_cr: Vec::new(),
-            residual_cb_luma_like: Vec::new(),
-            residual_cr_luma_like: Vec::new(),
-            residual_cb_16x16_dc: None,
-            residual_cr_16x16_dc: None,
+            residual: crate::macroblock_layer::MbResidual::default(),
             is_skip: false,
         };
 
@@ -14595,6 +14558,7 @@ mod tests {
             macroblocks: vec![mb0, mb1],
             mb_field_decoding_flags: vec![false, false],
             last_mb_addr: 1,
+            coeffs: Default::default(),
         };
         let mut pic_off = Picture::new(32, 16, 1, 8, 8);
         let mut grid_off = MbGrid::new(2, 1);
@@ -14808,16 +14772,7 @@ mod tests {
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
-            residual_luma: Vec::new(),
-            residual_luma_dc: None,
-            residual_chroma_dc_cb: vec![0i32; 4],
-            residual_chroma_dc_cr: vec![0i32; 4],
-            residual_chroma_ac_cb: Vec::new(),
-            residual_chroma_ac_cr: Vec::new(),
-            residual_cb_luma_like: Vec::new(),
-            residual_cr_luma_like: Vec::new(),
-            residual_cb_16x16_dc: None,
-            residual_cr_16x16_dc: None,
+            residual: crate::macroblock_layer::MbResidual::default(),
             is_skip: false,
         }
     }
@@ -14834,6 +14789,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -14868,6 +14824,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -14917,6 +14874,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -14959,22 +14917,14 @@ mod tests {
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
-            residual_luma: Vec::new(),
-            residual_luma_dc: None,
-            residual_chroma_dc_cb: vec![0i32; 4],
-            residual_chroma_dc_cr: vec![0i32; 4],
-            residual_chroma_ac_cb: Vec::new(),
-            residual_chroma_ac_cr: Vec::new(),
-            residual_cb_luma_like: Vec::new(),
-            residual_cr_luma_like: Vec::new(),
-            residual_cb_16x16_dc: None,
-            residual_cr_16x16_dc: None,
+            residual: crate::macroblock_layer::MbResidual::default(),
             is_skip: false,
         };
         let slice_data = SliceData {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -15009,6 +14959,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -15086,16 +15037,7 @@ mod tests {
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
-            residual_luma: Vec::new(),
-            residual_luma_dc: None,
-            residual_chroma_dc_cb: vec![0i32; 4],
-            residual_chroma_dc_cr: vec![0i32; 4],
-            residual_chroma_ac_cb: Vec::new(),
-            residual_chroma_ac_cr: Vec::new(),
-            residual_cb_luma_like: Vec::new(),
-            residual_cr_luma_like: Vec::new(),
-            residual_cb_16x16_dc: None,
-            residual_cr_16x16_dc: None,
+            residual: crate::macroblock_layer::MbResidual::default(),
             is_skip: false,
         };
         // Add a filler MB 1 (not used in the check).
@@ -15104,6 +15046,7 @@ mod tests {
             macroblocks: vec![mb, mb1],
             mb_field_decoding_flags: vec![false, false],
             last_mb_addr: 1,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 32, 1, 8, 8);
         let mut grid = MbGrid::new(1, 2);
@@ -15251,6 +15194,7 @@ mod tests {
             macroblocks: vec![mb0, mb1],
             mb_field_decoding_flags: vec![false, false],
             last_mb_addr: 1,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(32, 16, 1, 8, 8);
         let mut grid = MbGrid::new(2, 1);
@@ -15291,6 +15235,7 @@ mod tests {
             macroblocks: vec![mb0, mb1],
             mb_field_decoding_flags: vec![false, false],
             last_mb_addr: 1,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(32, 16, 1, 8, 8);
         let mut grid = MbGrid::new(2, 1);
@@ -15360,6 +15305,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -15408,6 +15354,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -15445,16 +15392,7 @@ mod tests {
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
-            residual_luma: Vec::new(),
-            residual_luma_dc: None,
-            residual_chroma_dc_cb: vec![0i32; 4],
-            residual_chroma_dc_cr: vec![0i32; 4],
-            residual_chroma_ac_cb: Vec::new(),
-            residual_chroma_ac_cr: Vec::new(),
-            residual_cb_luma_like: Vec::new(),
-            residual_cr_luma_like: Vec::new(),
-            residual_cb_16x16_dc: None,
-            residual_cr_16x16_dc: None,
+            residual: crate::macroblock_layer::MbResidual::default(),
             is_skip: false,
         }
     }
@@ -15496,6 +15434,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -15544,6 +15483,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -15607,6 +15547,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         pic.pic_order_cnt = 4;
@@ -15662,6 +15603,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 1, 8, 8);
         pic.pic_order_cnt = 2;
@@ -15785,6 +15727,7 @@ mod tests {
             macroblocks: vec![mb0, mb1],
             mb_field_decoding_flags: vec![false, false], // frame-coded pair
             last_mb_addr: 1,
+            coeffs: Default::default(),
         };
         // FrameHeightInMbs = 2 * 1 = 2; picture is 16x32 luma.
         let mut pic = Picture::new(16, 32, 1, 8, 8);
@@ -15815,6 +15758,7 @@ mod tests {
             macroblocks: vec![mb_top, mb_bot],
             mb_field_decoding_flags: vec![false, false],
             last_mb_addr: 1,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 32, 1, 8, 8);
         let mut grid = MbGrid::new(1, 2);
@@ -15861,6 +15805,7 @@ mod tests {
             macroblocks: vec![mb_top, mb_bot],
             mb_field_decoding_flags: vec![true, true], // field-coded pair
             last_mb_addr: 1,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 32, 1, 8, 8);
         let mut grid = MbGrid::new(1, 2);
@@ -15876,12 +15821,14 @@ mod tests {
         let sps = make_mbaff_sps(1, 1);
         let pps = make_pps();
         let sh = make_slice_header();
-        let mb_top = make_intra16x16_dc_mb(2);
-        let mb_bot = make_intra16x16_dc_mb(2);
+        let mut coeffs = crate::macroblock_layer::CoeffArena::default();
+        let mb_top = make_intra16x16_dc_mb(2, &mut coeffs);
+        let mb_bot = make_intra16x16_dc_mb(2, &mut coeffs);
         let slice_data = SliceData {
             macroblocks: vec![mb_top, mb_bot],
             mb_field_decoding_flags: vec![false, false],
             last_mb_addr: 1,
+            coeffs,
         };
         let mut pic = Picture::new(16, 32, 1, 8, 8);
         let mut grid = MbGrid::new(1, 2);
@@ -15934,6 +15881,7 @@ mod tests {
             macroblocks: vec![mb_top, mb_bot],
             mb_field_decoding_flags: vec![true, true], // field-coded pair
             last_mb_addr: 1,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 32, 1, 8, 8);
         let mut grid = MbGrid::new(1, 2);
@@ -16018,12 +15966,14 @@ mod tests {
         let mut sh = make_slice_header();
         sh.disable_deblocking_filter_idc = 0; // enable deblock
         sh.slice_qp_delta = 20; // well into the filter-active region
-        let mb_top = make_intra16x16_dc_mb(2);
-        let mb_bot = make_intra16x16_dc_mb(2);
+        let mut coeffs = crate::macroblock_layer::CoeffArena::default();
+        let mb_top = make_intra16x16_dc_mb(2, &mut coeffs);
+        let mb_bot = make_intra16x16_dc_mb(2, &mut coeffs);
         let slice_data = SliceData {
             macroblocks: vec![mb_top, mb_bot],
             mb_field_decoding_flags: vec![false, false],
             last_mb_addr: 1,
+            coeffs,
         };
         let mut pic = Picture::new(16, 32, 1, 8, 8);
         let mut grid = MbGrid::new(1, 2);
@@ -16043,12 +15993,14 @@ mod tests {
         let mut sh = make_slice_header();
         sh.disable_deblocking_filter_idc = 0;
         sh.slice_qp_delta = 20;
-        let mb_top = make_intra16x16_dc_mb(2);
-        let mb_bot = make_intra16x16_dc_mb(2);
+        let mut coeffs = crate::macroblock_layer::CoeffArena::default();
+        let mb_top = make_intra16x16_dc_mb(2, &mut coeffs);
+        let mb_bot = make_intra16x16_dc_mb(2, &mut coeffs);
         let slice_data = SliceData {
             macroblocks: vec![mb_top, mb_bot],
             mb_field_decoding_flags: vec![true, true], // field pair
             last_mb_addr: 1,
+            coeffs,
         };
         let mut pic = Picture::new(16, 32, 1, 8, 8);
         let mut grid = MbGrid::new(1, 2);
@@ -16174,16 +16126,7 @@ mod tests {
                 coded_block_pattern: 0,
                 transform_size_8x8_flag: false,
                 mb_qp_delta: 0,
-                residual_luma: Vec::new(),
-                residual_luma_dc: None,
-                residual_chroma_dc_cb: vec![0i32; 4],
-                residual_chroma_dc_cr: vec![0i32; 4],
-                residual_chroma_ac_cb: Vec::new(),
-                residual_chroma_ac_cr: Vec::new(),
-                residual_cb_luma_like: Vec::new(),
-                residual_cr_luma_like: Vec::new(),
-                residual_cb_16x16_dc: None,
-                residual_cr_16x16_dc: None,
+                residual: crate::macroblock_layer::MbResidual::default(),
                 is_skip: false,
             }
         };
@@ -16193,6 +16136,7 @@ mod tests {
                 macroblocks: vec![build_nxn_mb()],
                 mb_field_decoding_flags: vec![false],
                 last_mb_addr: 0,
+                coeffs: Default::default(),
             };
             let mut pic = Picture::new(16, 16, 1, 8, 8);
             let mut grid = MbGrid::new(1, 1);
@@ -16334,6 +16278,7 @@ mod tests {
                 intra_chroma_pred_mode: 0,
                 ..MbPred::default()
             };
+            let mut coeffs = crate::macroblock_layer::CoeffArena::default();
             let mb = Macroblock {
                 mb_type: MbType::INxN,
                 mb_type_raw: 0,
@@ -16343,16 +16288,11 @@ mod tests {
                 coded_block_pattern: cbp as u32,
                 transform_size_8x8_flag: false,
                 mb_qp_delta: 0,
-                residual_luma,
-                residual_luma_dc: None,
-                residual_chroma_dc_cb: Vec::new(),
-                residual_chroma_dc_cr: Vec::new(),
-                residual_chroma_ac_cb: Vec::new(),
-                residual_chroma_ac_cr: Vec::new(),
-                residual_cb_luma_like: Vec::new(),
-                residual_cr_luma_like: Vec::new(),
-                residual_cb_16x16_dc: None,
-                residual_cr_16x16_dc: None,
+                residual: crate::macroblock_layer::OwnedResidual {
+                    luma: residual_luma,
+                    ..Default::default()
+                }
+                .append_to(&mut coeffs),
                 is_skip: false,
             };
 
@@ -16361,6 +16301,7 @@ mod tests {
                 macroblocks: vec![mb],
                 mb_field_decoding_flags: vec![false],
                 last_mb_addr: 0,
+                coeffs,
             };
             let mut pic = Picture::new(16, 16, 1, 8, 8);
             let mut grid = MbGrid::new(1, 1);
@@ -16443,16 +16384,7 @@ mod tests {
             coded_block_pattern: 0, // cbp_luma = 0 → no luma/chroma residual.
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
-            residual_luma: Vec::new(),
-            residual_luma_dc: None,
-            residual_chroma_dc_cb: Vec::new(),
-            residual_chroma_dc_cr: Vec::new(),
-            residual_chroma_ac_cb: Vec::new(),
-            residual_chroma_ac_cr: Vec::new(),
-            residual_cb_luma_like: Vec::new(),
-            residual_cr_luma_like: Vec::new(),
-            residual_cb_16x16_dc: None,
-            residual_cr_16x16_dc: None,
+            residual: crate::macroblock_layer::MbResidual::default(),
             is_skip: false,
         };
 
@@ -16460,6 +16392,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         // 4:4:4 → chroma plane is full size (16x16 for a 1-MB picture).
         let mut pic = Picture::new(16, 16, 3, 8, 8);
@@ -16503,16 +16436,7 @@ mod tests {
             coded_block_pattern: 0,
             transform_size_8x8_flag: true,
             mb_qp_delta: 0,
-            residual_luma: Vec::new(),
-            residual_luma_dc: None,
-            residual_chroma_dc_cb: Vec::new(),
-            residual_chroma_dc_cr: Vec::new(),
-            residual_chroma_ac_cb: Vec::new(),
-            residual_chroma_ac_cr: Vec::new(),
-            residual_cb_luma_like: Vec::new(),
-            residual_cr_luma_like: Vec::new(),
-            residual_cb_16x16_dc: None,
-            residual_cr_16x16_dc: None,
+            residual: crate::macroblock_layer::MbResidual::default(),
             is_skip: false,
         };
 
@@ -16520,6 +16444,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 3, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -16600,6 +16525,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 3, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -16651,6 +16577,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 3, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -16804,6 +16731,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 2, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -16874,6 +16802,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 2, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -16930,6 +16859,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 2, 8, 8);
         let mut grid = MbGrid::new(1, 1);
@@ -16984,6 +16914,7 @@ mod tests {
             macroblocks: vec![mb],
             mb_field_decoding_flags: vec![false],
             last_mb_addr: 0,
+            coeffs: Default::default(),
         };
         let mut pic = Picture::new(16, 16, 3, 8, 8);
         let mut grid = MbGrid::new(1, 1);

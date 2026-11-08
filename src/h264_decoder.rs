@@ -88,6 +88,7 @@ struct SdInput {
     header: SliceHeader,
     sps: Sps,
     pps: crate::pps::Pps,
+    pool: Arc<crate::macroblock_layer::ChunkPool>,
 }
 
 type SdResult = std::result::Result<slice_data::SliceData, String>;
@@ -96,8 +97,10 @@ type SdResult = std::result::Result<slice_data::SliceData, String>;
 type SdTask = Deferred<SdInput, SdResult>;
 
 fn parse_sd(i: SdInput) -> SdResult {
-    slice_data::parse_slice_data(&i.rbsp, i.cursor.0, i.cursor.1, &i.header, &i.sps, &i.pps)
-        .map_err(|e| e.to_string())
+    slice_data::parse_slice_data_pooled(
+        &i.rbsp, i.cursor.0, i.cursor.1, &i.header, &i.sps, &i.pps, &i.pool,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// An input event held back so the slice-data parses of the next few
@@ -435,6 +438,9 @@ pub struct H264CodecDecoder {
     ft: Option<FtState>,
     /// The queued slice-data parse of the slice event being handled.
     pending_sd: Option<Arc<SdTask>>,
+    /// Spare residual-coefficient arena chunks, shared by this stream's
+    /// slice-data parses (serial or queued on the pool).
+    chunk_pool: Arc<crate::macroblock_layer::ChunkPool>,
     /// The parameter-set NAL units of the `avcC` record, replayed into
     /// the fresh NAL driver of a `reset` (a seek keeps the stream's
     /// out-of-band SPS / PPS).
@@ -484,6 +490,7 @@ impl H264CodecDecoder {
             threads: 1,
             ft: None,
             pending_sd: None,
+            chunk_pool: Arc::default(),
             extradata_nals: Vec::new(),
             emitted_shape: None,
             params_generation: 0,
@@ -1421,10 +1428,16 @@ impl H264CodecDecoder {
             (None, Some(task)) => task
                 .take()
                 .unwrap_or_else(|| Err("slice data parser panicked".to_string())),
-            (None, None) => {
-                slice_data::parse_slice_data(rbsp, cursor.0, cursor.1, header, sps, pps)
-                    .map_err(|e| e.to_string())
-            }
+            (None, None) => slice_data::parse_slice_data_pooled(
+                rbsp,
+                cursor.0,
+                cursor.1,
+                header,
+                sps,
+                pps,
+                &self.chunk_pool,
+            )
+            .map_err(|e| e.to_string()),
             (Some((b, c)), _) => slice_data::parse_slice_data_partitioned(
                 rbsp,
                 cursor.0,
@@ -3228,6 +3241,7 @@ impl H264CodecDecoder {
                             header: header.clone(),
                             sps: sps.clone(),
                             pps: pps.clone(),
+                            pool: self.chunk_pool.clone(),
                         },
                         parse_sd as fn(SdInput) -> SdResult,
                     ))

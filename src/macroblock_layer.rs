@@ -647,6 +647,441 @@ pub struct PcmSamples {
     pub chroma_cr: Vec<u32>,
 }
 
+/// One residual block's coefficient levels in scan order: a 4x4 block, a
+/// quarter of an 8x8 block's 64 levels, or a DC block (an Intra_16x16 DC
+/// block uses all 16 entries, a chroma DC block its first 4 or 8).
+pub type CoeffBlock16 = [i32; 16];
+
+/// §7.3.5.3 — the residual lists a macroblock can carry. Each list is a
+/// run of [`CoeffBlock16`]s in its slice's coefficient arena
+/// ([`crate::slice_data::SliceData::coeffs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ResidualList {
+    /// Luma 4x4 blocks (16 for Intra_16x16 AC or 4x4 transforms, four
+    /// 16-level quarters per coded 8x8 block), compacted: only the 8x8
+    /// quadrants whose `CodedBlockPatternLuma` bit is set are present.
+    Luma = 0,
+    /// The Intra_16x16 luma DC block.
+    LumaDc,
+    /// The Cb DC block (ChromaArrayType 1 or 2).
+    ChromaDcCb,
+    /// The Cr DC block (ChromaArrayType 1 or 2).
+    ChromaDcCr,
+    /// Cb AC blocks (ChromaArrayType 1 or 2).
+    ChromaAcCb,
+    /// Cr AC blocks (ChromaArrayType 1 or 2).
+    ChromaAcCr,
+    /// Cb blocks coded like luma (ChromaArrayType 3), laid out as `Luma`.
+    CbLumaLike,
+    /// Cr blocks coded like luma (ChromaArrayType 3), laid out as `Luma`.
+    CrLumaLike,
+    /// The Cb Intra_16x16 DC block (ChromaArrayType 3).
+    Cb16x16Dc,
+    /// The Cr Intra_16x16 DC block (ChromaArrayType 3).
+    Cr16x16Dc,
+}
+
+/// Number of [`ResidualList`] variants.
+const RESIDUAL_LISTS: usize = 10;
+
+/// The most blocks one macroblock appends to its slice's arena:
+/// 16 luma + 1 luma DC + 2 chroma DC + 16 chroma AC (4:2:2) at most, or
+/// 16 + 1 for each of the three planes coded like luma (4:4:4).
+const MAX_MB_BLOCKS: usize = 69;
+
+/// Blocks per [`CoeffArena`] chunk: 64 KiB, under glibc's default mmap
+/// threshold, so chunks come from and return to the heap and are reused
+/// from slice to slice. (One arena allocation per slice grew past the
+/// threshold on high-bitrate streams and was mapped, then page-faulted,
+/// afresh for every slice.)
+const ARENA_CHUNK_BLOCKS: usize = 1024;
+
+/// Spare [`CoeffArena`] chunks shared by the slices of one decoder: an
+/// arena hands its chunks back when dropped and the next slice's arena
+/// takes them, so a stream's coefficient memory is allocated once
+/// rather than per slice (freed per-slice chunks went back to the OS
+/// and were page-faulted in again). Holds at most
+/// [`ChunkPool::MAX_SPARE`] chunks.
+#[derive(Debug, Default)]
+pub struct ChunkPool {
+    spare: std::sync::Mutex<Vec<Vec<CoeffBlock16>>>,
+}
+
+impl ChunkPool {
+    /// 32 MiB of spare chunks: one 1080p slice at a very high bitrate.
+    pub const MAX_SPARE: usize = 512;
+
+    /// Number of spare chunks held.
+    pub fn spare_chunks(&self) -> usize {
+        self.spare.lock().map_or(0, |s| s.len())
+    }
+}
+
+/// A slice's residual coefficient blocks, in chunks of
+/// [`ARENA_CHUNK_BLOCKS`]. A macroblock's blocks never straddle two
+/// chunks, so each of its residual lists reads as one slice of blocks.
+/// Blocks are addressed by `chunk * ARENA_CHUNK_BLOCKS + offset`.
+#[derive(Debug, Clone, Default)]
+pub struct CoeffArena {
+    chunks: Vec<Vec<CoeffBlock16>>,
+    /// Where new chunks come from and dropped ones go, if anywhere.
+    pool: Option<std::sync::Arc<ChunkPool>>,
+}
+
+impl Drop for CoeffArena {
+    fn drop(&mut self) {
+        let Some(pool) = self.pool.as_ref() else {
+            return;
+        };
+        if let Ok(mut spare) = pool.spare.lock() {
+            for mut chunk in self.chunks.drain(..) {
+                if spare.len() >= ChunkPool::MAX_SPARE {
+                    break;
+                }
+                chunk.clear();
+                spare.push(chunk);
+            }
+        }
+    }
+}
+
+impl CoeffArena {
+    /// An empty arena whose chunks come from (and return to) `pool`.
+    pub fn with_pool(pool: std::sync::Arc<ChunkPool>) -> Self {
+        Self {
+            chunks: Vec::new(),
+            pool: Some(pool),
+        }
+    }
+
+    /// A fresh chunk: a spare from the pool, or a new allocation.
+    fn new_chunk(&self) -> Vec<CoeffBlock16> {
+        self.pool
+            .as_ref()
+            .and_then(|p| p.spare.lock().ok().and_then(|mut s| s.pop()))
+            .unwrap_or_else(|| Vec::with_capacity(ARENA_CHUNK_BLOCKS))
+    }
+
+    /// The arena index where the next macroblock's blocks begin, opening
+    /// a chunk when the current one could not hold a whole macroblock.
+    fn begin_mb(&mut self) -> u32 {
+        let full = self
+            .chunks
+            .last()
+            .is_none_or(|c| ARENA_CHUNK_BLOCKS - c.len() < MAX_MB_BLOCKS);
+        if full {
+            let chunk = self.new_chunk();
+            self.chunks.push(chunk);
+        }
+        let last = self.chunks.len() - 1;
+        (last * ARENA_CHUNK_BLOCKS + self.chunks[last].len()) as u32
+    }
+
+    /// Append `n` zeroed blocks to the current chunk.
+    fn append(&mut self, n: usize) -> &mut [CoeffBlock16] {
+        if self.chunks.is_empty() {
+            let chunk = self.new_chunk();
+            self.chunks.push(chunk);
+        }
+        let last = self.chunks.len() - 1;
+        let chunk = &mut self.chunks[last];
+        let at = chunk.len();
+        debug_assert!(
+            at + n <= ARENA_CHUNK_BLOCKS,
+            "macroblock straddles an arena chunk"
+        );
+        chunk.resize(at + n, [0; 16]);
+        &mut chunk[at..]
+    }
+
+    /// Blocks `start..start + len`, when the arena holds them in one chunk.
+    #[inline]
+    pub fn get(&self, start: usize, len: usize) -> Option<&[CoeffBlock16]> {
+        let chunk = self.chunks.get(start / ARENA_CHUNK_BLOCKS)?;
+        let off = start % ARENA_CHUNK_BLOCKS;
+        chunk.get(off..off + len)
+    }
+
+    /// Number of blocks held.
+    pub fn blocks(&self) -> usize {
+        self.chunks.iter().map(Vec::len).sum()
+    }
+}
+
+/// Where a macroblock's residual blocks lie in its slice's coefficient
+/// arena. A macroblock's blocks are appended to the arena while it is
+/// parsed, so they are contiguous from `base` (within one chunk), and so
+/// is each list. At most [`MAX_MB_BLOCKS`] blocks, so a list's offset and
+/// length each fit a byte.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MbResidual {
+    /// Arena index of the macroblock's first block.
+    base: u32,
+    /// Per [`ResidualList`]: (first block's offset from `base`, block count).
+    spans: [(u8, u8); RESIDUAL_LISTS],
+    /// Levels in each chroma DC block: 4 (4:2:0) or 8 (4:2:2); 0 when the
+    /// macroblock has no chroma DC blocks.
+    chroma_dc_len: u8,
+}
+
+impl MbResidual {
+    /// The blocks of list `l`, or none when the arena does not hold them.
+    #[inline]
+    pub fn blocks<'a>(&self, coeffs: &'a CoeffArena, l: ResidualList) -> &'a [CoeffBlock16] {
+        let (off, len) = self.spans[l as usize];
+        if len == 0 {
+            return &[];
+        }
+        let got = coeffs.get(self.base as usize + off as usize, len as usize);
+        debug_assert!(got.is_some(), "residual span outside its slice's arena");
+        got.unwrap_or(&[])
+    }
+
+    /// The single block of a DC list (`LumaDc`, `Cb16x16Dc`, `Cr16x16Dc`),
+    /// when present.
+    #[inline]
+    pub fn dc_block<'a>(
+        &self,
+        coeffs: &'a CoeffArena,
+        l: ResidualList,
+    ) -> Option<&'a CoeffBlock16> {
+        self.blocks(coeffs, l).first()
+    }
+
+    /// The chroma DC levels of list `l` (`ChromaDcCb` / `ChromaDcCr`):
+    /// 4 or 8 levels, or none.
+    #[inline]
+    pub fn chroma_dc<'a>(&self, coeffs: &'a CoeffArena, l: ResidualList) -> &'a [i32] {
+        match self.blocks(coeffs, l).first() {
+            Some(b) => &b[..(self.chroma_dc_len as usize).min(16)],
+            None => &[],
+        }
+    }
+}
+
+/// A macroblock's residual being appended to its slice's coefficient arena.
+pub struct ResidualSink<'a> {
+    arena: &'a mut CoeffArena,
+    res: MbResidual,
+    /// Blocks appended so far.
+    used: usize,
+}
+
+impl<'a> ResidualSink<'a> {
+    /// Start a macroblock's residual at the arena's end.
+    pub fn new(arena: &'a mut CoeffArena) -> Self {
+        let base = arena.begin_mb();
+        Self {
+            arena,
+            res: MbResidual {
+                base,
+                ..MbResidual::default()
+            },
+            used: 0,
+        }
+    }
+
+    /// Append `n` zeroed blocks to list `l` and return them for filling.
+    /// A list's blocks must be appended without another list's between
+    /// them.
+    pub fn append(&mut self, l: ResidualList, n: usize) -> &mut [CoeffBlock16] {
+        let rel = self.used;
+        let span = &mut self.res.spans[l as usize];
+        if span.1 == 0 {
+            span.0 = rel as u8;
+        }
+        debug_assert_eq!(
+            span.0 as usize + span.1 as usize,
+            rel,
+            "a residual list's blocks must be contiguous"
+        );
+        debug_assert!(rel + n <= MAX_MB_BLOCKS, "macroblock residual too long");
+        span.1 += n as u8;
+        self.used += n;
+        self.arena.append(n)
+    }
+
+    /// Append one block to list `l`.
+    pub fn push(&mut self, l: ResidualList, blk: CoeffBlock16) {
+        self.append(l, 1)[0] = blk;
+    }
+
+    /// Append a chroma DC block (`ChromaDcCb` / `ChromaDcCr`) holding
+    /// `levels` (4 or 8 of them).
+    pub fn push_chroma_dc(&mut self, l: ResidualList, levels: &[i32]) {
+        let n = levels.len().min(16);
+        self.append(l, 1)[0][..n].copy_from_slice(&levels[..n]);
+        self.res.chroma_dc_len = n as u8;
+    }
+
+    /// Record the levels per chroma DC block, for a block filled in place.
+    pub fn set_chroma_dc_len(&mut self, n: usize) {
+        self.res.chroma_dc_len = n.min(16) as u8;
+    }
+
+    /// The finished macroblock's residual spans.
+    pub fn finish(self) -> MbResidual {
+        self.res
+    }
+}
+
+/// A macroblock's residual lists in vectors of their own: for building a
+/// slice by hand (tests, tools) and for reading a parsed macroblock's
+/// lists back out. [`Self::append_to`] stores them in a coefficient arena.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnedResidual {
+    pub luma: Vec<CoeffBlock16>,
+    pub luma_dc: Option<CoeffBlock16>,
+    /// 4 (4:2:0) or 8 (4:2:2) levels, or empty; Cr must match Cb's length.
+    pub chroma_dc_cb: Vec<i32>,
+    pub chroma_dc_cr: Vec<i32>,
+    pub chroma_ac_cb: Vec<CoeffBlock16>,
+    pub chroma_ac_cr: Vec<CoeffBlock16>,
+    pub cb_luma_like: Vec<CoeffBlock16>,
+    pub cr_luma_like: Vec<CoeffBlock16>,
+    pub cb_16x16_dc: Option<CoeffBlock16>,
+    pub cr_16x16_dc: Option<CoeffBlock16>,
+}
+
+impl OwnedResidual {
+    /// Append the lists to `arena`; the returned spans index into it.
+    pub fn append_to(&self, arena: &mut CoeffArena) -> MbResidual {
+        let mut sink = ResidualSink::new(arena);
+        for (l, blocks) in [
+            (ResidualList::Luma, &self.luma),
+            (ResidualList::ChromaAcCb, &self.chroma_ac_cb),
+            (ResidualList::ChromaAcCr, &self.chroma_ac_cr),
+            (ResidualList::CbLumaLike, &self.cb_luma_like),
+            (ResidualList::CrLumaLike, &self.cr_luma_like),
+        ] {
+            for b in blocks {
+                sink.push(l, *b);
+            }
+        }
+        for (l, dc) in [
+            (ResidualList::LumaDc, &self.luma_dc),
+            (ResidualList::Cb16x16Dc, &self.cb_16x16_dc),
+            (ResidualList::Cr16x16Dc, &self.cr_16x16_dc),
+        ] {
+            if let Some(b) = dc {
+                sink.push(l, *b);
+            }
+        }
+        if !self.chroma_dc_cb.is_empty() {
+            sink.push_chroma_dc(ResidualList::ChromaDcCb, &self.chroma_dc_cb);
+        }
+        if !self.chroma_dc_cr.is_empty() {
+            sink.push_chroma_dc(ResidualList::ChromaDcCr, &self.chroma_dc_cr);
+        }
+        sink.finish()
+    }
+
+    /// A macroblock's lists, copied out of its slice's arena.
+    pub fn of(v: &MbView<'_>) -> Self {
+        Self {
+            luma: v.residual_luma().to_vec(),
+            luma_dc: v.residual_luma_dc().copied(),
+            chroma_dc_cb: v.residual_chroma_dc_cb().to_vec(),
+            chroma_dc_cr: v.residual_chroma_dc_cr().to_vec(),
+            chroma_ac_cb: v.residual_chroma_ac_cb().to_vec(),
+            chroma_ac_cr: v.residual_chroma_ac_cr().to_vec(),
+            cb_luma_like: v.residual_cb_luma_like().to_vec(),
+            cr_luma_like: v.residual_cr_luma_like().to_vec(),
+            cb_16x16_dc: v.residual_cb_16x16_dc().copied(),
+            cr_16x16_dc: v.residual_cr_16x16_dc().copied(),
+        }
+    }
+}
+
+/// A macroblock together with its slice's coefficient arena: the
+/// macroblock's fields, and its residual lists read from the arena.
+#[derive(Debug, Clone, Copy)]
+pub struct MbView<'a> {
+    pub mb: &'a Macroblock,
+    pub coeffs: &'a CoeffArena,
+}
+
+impl std::ops::Deref for MbView<'_> {
+    type Target = Macroblock;
+    #[inline]
+    fn deref(&self) -> &Macroblock {
+        self.mb
+    }
+}
+
+impl<'a> MbView<'a> {
+    pub fn new(mb: &'a Macroblock, coeffs: &'a CoeffArena) -> Self {
+        Self { mb, coeffs }
+    }
+    /// §7.3.5.3 — luma 4x4 blocks (see [`ResidualList::Luma`]).
+    #[inline]
+    pub fn residual_luma(&self) -> &'a [CoeffBlock16] {
+        self.mb.residual.blocks(self.coeffs, ResidualList::Luma)
+    }
+    /// §7.3.5.3 — Intra_16x16 DC block (16 coefficients in zigzag).
+    #[inline]
+    pub fn residual_luma_dc(&self) -> Option<&'a CoeffBlock16> {
+        self.mb.residual.dc_block(self.coeffs, ResidualList::LumaDc)
+    }
+    /// §7.3.5.3 — Cb DC levels (4 for 4:2:0, 8 for 4:2:2; empty if absent).
+    #[inline]
+    pub fn residual_chroma_dc_cb(&self) -> &'a [i32] {
+        self.mb
+            .residual
+            .chroma_dc(self.coeffs, ResidualList::ChromaDcCb)
+    }
+    /// §7.3.5.3 — Cr DC levels.
+    #[inline]
+    pub fn residual_chroma_dc_cr(&self) -> &'a [i32] {
+        self.mb
+            .residual
+            .chroma_dc(self.coeffs, ResidualList::ChromaDcCr)
+    }
+    /// §7.3.5.3 — Cb AC blocks.
+    #[inline]
+    pub fn residual_chroma_ac_cb(&self) -> &'a [CoeffBlock16] {
+        self.mb
+            .residual
+            .blocks(self.coeffs, ResidualList::ChromaAcCb)
+    }
+    /// §7.3.5.3 — Cr AC blocks.
+    #[inline]
+    pub fn residual_chroma_ac_cr(&self) -> &'a [CoeffBlock16] {
+        self.mb
+            .residual
+            .blocks(self.coeffs, ResidualList::ChromaAcCr)
+    }
+    /// §7.3.5.3 — Cb blocks coded like luma (ChromaArrayType 3).
+    #[inline]
+    pub fn residual_cb_luma_like(&self) -> &'a [CoeffBlock16] {
+        self.mb
+            .residual
+            .blocks(self.coeffs, ResidualList::CbLumaLike)
+    }
+    /// §7.3.5.3 — Cr blocks coded like luma (ChromaArrayType 3).
+    #[inline]
+    pub fn residual_cr_luma_like(&self) -> &'a [CoeffBlock16] {
+        self.mb
+            .residual
+            .blocks(self.coeffs, ResidualList::CrLumaLike)
+    }
+    /// §7.3.5.3 — Cb Intra_16x16 DC block (ChromaArrayType 3).
+    #[inline]
+    pub fn residual_cb_16x16_dc(&self) -> Option<&'a CoeffBlock16> {
+        self.mb
+            .residual
+            .dc_block(self.coeffs, ResidualList::Cb16x16Dc)
+    }
+    /// §7.3.5.3 — Cr Intra_16x16 DC block (ChromaArrayType 3).
+    #[inline]
+    pub fn residual_cr_16x16_dc(&self) -> Option<&'a CoeffBlock16> {
+        self.mb
+            .residual
+            .dc_block(self.coeffs, ResidualList::Cr16x16Dc)
+    }
+}
+
 /// §7.3.5.1 / §7.4.5.1 — `mb_pred()` for non-sub_mb path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MbPred {
@@ -711,31 +1146,9 @@ pub struct Macroblock {
     pub transform_size_8x8_flag: bool,
     /// §7.3.5 — mb_qp_delta. 0 when absent.
     pub mb_qp_delta: i32,
-    /// §7.3.5.3 — luma residual: list of 4x4 blocks (16 for Intra_16x16
-    /// AC, 16 for Intra_4x4 / inter 4x4, 4 for 8x8 transform).
-    pub residual_luma: Vec<[i32; 16]>,
-    /// §7.3.5.3 — Intra_16x16 DC block (16 coefficients in zigzag).
-    pub residual_luma_dc: Option<[i32; 16]>,
-    /// §7.3.5.3 — chroma DC (length 4 for 4:2:0, 8 for 4:2:2).
-    pub residual_chroma_dc_cb: Vec<i32>,
-    pub residual_chroma_dc_cr: Vec<i32>,
-    /// §7.3.5.3 — chroma AC per 4x4 block.
-    pub residual_chroma_ac_cb: Vec<[i32; 16]>,
-    pub residual_chroma_ac_cr: Vec<[i32; 16]>,
-    /// §7.3.5.3 — Cb plane residual in the 4:4:4 "coded like luma" path
-    /// (ChromaArrayType == 3 only). Mirrors `residual_luma`: each entry
-    /// is one 4x4 block (or sub-block of an 8x8 transform, padded to
-    /// 16). Empty for ChromaArrayType != 3.
-    pub residual_cb_luma_like: Vec<[i32; 16]>,
-    /// §7.3.5.3 — Cr plane 4:4:4 luma-like residual. See
-    /// `residual_cb_luma_like`.
-    pub residual_cr_luma_like: Vec<[i32; 16]>,
-    /// §7.3.5.3 — Cb Intra16x16 DC block when ChromaArrayType == 3 and
-    /// mb_type is Intra_16x16.
-    pub residual_cb_16x16_dc: Option<[i32; 16]>,
-    /// §7.3.5.3 — Cr Intra16x16 DC block when ChromaArrayType == 3 and
-    /// mb_type is Intra_16x16.
-    pub residual_cr_16x16_dc: Option<[i32; 16]>,
+    /// §7.3.5.3 — the residual lists, as spans of the slice's coefficient
+    /// arena (read them through [`MbView`]).
+    pub residual: MbResidual,
     /// True if this entry represents a P_Skip / B_Skip MB, in which
     /// case none of the residual / pred fields carry meaningful data.
     pub is_skip: bool,
@@ -760,16 +1173,7 @@ impl Macroblock {
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
-            residual_luma: Vec::new(),
-            residual_luma_dc: None,
-            residual_chroma_dc_cb: Vec::new(),
-            residual_chroma_dc_cr: Vec::new(),
-            residual_chroma_ac_cb: Vec::new(),
-            residual_chroma_ac_cr: Vec::new(),
-            residual_cb_luma_like: Vec::new(),
-            residual_cr_luma_like: Vec::new(),
-            residual_cb_16x16_dc: None,
-            residual_cr_16x16_dc: None,
+            residual: MbResidual::default(),
             is_skip: true,
         }
     }
@@ -2491,6 +2895,10 @@ pub struct EntropyState<'ctx, 'data> {
     /// I_PCM macroblock path. Defaults to 0 (BitDepthC = 8) for
     /// non-PCM callers.
     pub bit_depth_chroma_minus8: u32,
+    /// The slice's coefficient arena: each parsed macroblock's residual
+    /// blocks are appended here, and its [`Macroblock::residual`] spans
+    /// point into it.
+    pub coeffs: &'ctx mut CoeffArena,
 }
 
 // ---------------------------------------------------------------------------
@@ -2762,16 +3170,7 @@ pub fn parse_macroblock_dp(
             coded_block_pattern: 0,
             transform_size_8x8_flag: false,
             mb_qp_delta: 0,
-            residual_luma: Vec::new(),
-            residual_luma_dc: None,
-            residual_chroma_dc_cb: Vec::new(),
-            residual_chroma_dc_cr: Vec::new(),
-            residual_chroma_ac_cb: Vec::new(),
-            residual_chroma_ac_cr: Vec::new(),
-            residual_cb_luma_like: Vec::new(),
-            residual_cr_luma_like: Vec::new(),
-            residual_cb_16x16_dc: None,
-            residual_cr_16x16_dc: None,
+            residual: MbResidual::default(),
             is_skip: false,
         });
     }
@@ -2954,16 +3353,7 @@ pub fn parse_macroblock_dp(
         coded_block_pattern: cbp_total,
         transform_size_8x8_flag,
         mb_qp_delta,
-        residual_luma: Vec::new(),
-        residual_luma_dc: None,
-        residual_chroma_dc_cb: Vec::new(),
-        residual_chroma_dc_cr: Vec::new(),
-        residual_chroma_ac_cb: Vec::new(),
-        residual_chroma_ac_cr: Vec::new(),
-        residual_cb_luma_like: Vec::new(),
-        residual_cr_luma_like: Vec::new(),
-        residual_cb_16x16_dc: None,
-        residual_cr_16x16_dc: None,
+        residual: MbResidual::default(),
         is_skip: false,
     };
 
@@ -2980,7 +3370,7 @@ pub fn parse_macroblock_dp(
         // field picture) use the field ctxIdxOffset column for the
         // residual significance map.
         let field_mb = entropy.mb_field_decoding_flag || slice_header.field_pic_flag;
-        parse_residual_cabac_only(
+        out.residual = parse_residual_cabac_only(
             cabac,
             ctxs,
             chroma_at,
@@ -2988,7 +3378,7 @@ pub fn parse_macroblock_dp(
             cbp_luma,
             cbp_chroma,
             transform_size_8x8_flag,
-            &mut out,
+            &mut *entropy.coeffs,
             nb_grid,
             current_mb_addr,
             current_is_intra,
@@ -3014,7 +3404,7 @@ pub fn parse_macroblock_dp(
         // §7.3.5.3 — residual() is category 3 (intra collective
         // types) or 4 (inter): a data-partitioned slice reads it from
         // the matching partition's bitstream.
-        match dp {
+        out.residual = match dp {
             Some(d) => parse_residual_cavlc_only(
                 d.select(mb_type.is_intra())?,
                 entropy,
@@ -3022,7 +3412,6 @@ pub fn parse_macroblock_dp(
                 cbp_luma,
                 cbp_chroma,
                 transform_size_8x8_flag,
-                &mut out,
             )?,
             None => parse_residual_cavlc_only(
                 r,
@@ -3031,9 +3420,8 @@ pub fn parse_macroblock_dp(
                 cbp_luma,
                 cbp_chroma,
                 transform_size_8x8_flag,
-                &mut out,
             )?,
-        }
+        };
     }
 
     // §9.2.1.1 — mark this MB's slot "available" in the CAVLC neighbour
@@ -3804,26 +4192,6 @@ fn pad_to_16(v: impl AsRef<[i32]>) -> [i32; 16] {
     out
 }
 
-/// The coefficient levels of one residual block (at most 64), held
-/// inline instead of in a per-block heap allocation.
-struct CoeffBlock {
-    buf: [i32; 64],
-    len: usize,
-}
-
-impl std::ops::Deref for CoeffBlock {
-    type Target = [i32];
-    fn deref(&self) -> &[i32] {
-        &self.buf[..self.len]
-    }
-}
-
-impl AsRef<[i32]> for CoeffBlock {
-    fn as_ref(&self) -> &[i32] {
-        self
-    }
-}
-
 /// Count non-zero entries in a decoded residual block — this is the
 /// `TotalCoeff(coeff_token)` value the CAVLC engine decoded. We do
 /// not modify `parse_residual_block_cavlc` to return the token directly
@@ -3856,8 +4224,7 @@ fn parse_residual_cavlc_only(
     cbp_luma: u32,
     cbp_chroma: u32,
     transform_size_8x8_flag: bool,
-    out: &mut Macroblock,
-) -> McblResult<()> {
+) -> McblResult<MbResidual> {
     let chroma_array_type = entropy.chroma_array_type;
     let current_mb_addr = entropy.current_mb_addr;
     let current_is_intra = mb_type.is_intra();
@@ -4031,6 +4398,7 @@ fn parse_residual_cavlc_only(
 
     // Short immutable borrow for the nC lookups.
     let grid_ref: Option<&CavlcNcGrid> = entropy.cavlc_nc.as_deref();
+    let mut sink = ResidualSink::new(&mut *entropy.coeffs);
     let dbg = dbg_general_enabled();
 
     // --- Luma DC (Intra_16x16) ---
@@ -4041,7 +4409,7 @@ fn parse_residual_cavlc_only(
         // neighbours, i.e. the standard luma derivation.
         let nc = derive_luma(0, LumaNcKind::Intra16x16Dc, &own_luma_totals, grid_ref);
         let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 15, 16)?;
-        out.residual_luma_dc = Some(pad_to_16(blk));
+        sink.push(ResidualList::LumaDc, pad_to_16(blk));
         // NOTE 1 of §9.2.1.1: DC counts do NOT contribute to nN — do
         // not update own_luma_totals here.
     }
@@ -4054,7 +4422,7 @@ fn parse_residual_cavlc_only(
                 let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 14, 15)?;
                 let tc = count_nonzero(&blk);
                 own_luma_totals[blk_idx as usize] = tc;
-                out.residual_luma.push(pad_to_16(blk));
+                sink.push(ResidualList::Luma, pad_to_16(blk));
             }
         }
     } else if transform_size_8x8_flag {
@@ -4094,7 +4462,7 @@ fn parse_residual_cavlc_only(
                 for chunk in scan8.as_chunks::<16>().0 {
                     let mut store = [0i32; 16];
                     store.copy_from_slice(chunk);
-                    out.residual_luma.push(store);
+                    sink.push(ResidualList::Luma, store);
                 }
             }
         }
@@ -4117,7 +4485,7 @@ fn parse_residual_cavlc_only(
                         parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 15, 16)?;
                     let tc = count_nonzero(&blk);
                     own_luma_totals[blk_idx as usize] = tc;
-                    out.residual_luma.push(pad_to_16(blk));
+                    sink.push(ResidualList::Luma, pad_to_16(blk));
                 }
             }
         }
@@ -4144,7 +4512,7 @@ fn parse_residual_cavlc_only(
                 );
             }
             let cb_dc = parse_residual_block_cavlc(r, dc_ctx, 0, max_dc - 1, max_dc)?;
-            out.residual_chroma_dc_cb = cb_dc;
+            sink.push_chroma_dc(ResidualList::ChromaDcCb, &cb_dc);
             if dbg {
                 let (b, bi) = r.position();
                 eprintln!(
@@ -4153,7 +4521,7 @@ fn parse_residual_cavlc_only(
                 );
             }
             let cr_dc = parse_residual_block_cavlc(r, dc_ctx, 0, max_dc - 1, max_dc)?;
-            out.residual_chroma_dc_cr = cr_dc;
+            sink.push_chroma_dc(ResidualList::ChromaDcCr, &cr_dc);
             if dbg {
                 let (b, bi) = r.position();
                 eprintln!(
@@ -4184,7 +4552,7 @@ fn parse_residual_cavlc_only(
                 let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 14, 15)?;
                 let tc = count_nonzero(&blk);
                 own_cb_totals[blk_idx as usize] = tc;
-                out.residual_chroma_ac_cb.push(pad_to_16(blk));
+                sink.push(ResidualList::ChromaAcCb, pad_to_16(blk));
             }
             // Cr plane.
             for blk_idx in 0..num_c_blk as u8 {
@@ -4198,7 +4566,7 @@ fn parse_residual_cavlc_only(
                 let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 14, 15)?;
                 let tc = count_nonzero(&blk);
                 own_cr_totals[blk_idx as usize] = tc;
-                out.residual_chroma_ac_cr.push(pad_to_16(blk));
+                sink.push(ResidualList::ChromaAcCr, pad_to_16(blk));
             }
         }
     } else if chroma_array_type == 0 {
@@ -4225,9 +4593,9 @@ fn parse_residual_cavlc_only(
                 );
                 let blk = parse_residual_block_cavlc(r, CoeffTokenContext::Numeric(nc), 0, 15, 16)?;
                 if plane_is_cr {
-                    out.residual_cr_16x16_dc = Some(pad_to_16(blk));
+                    sink.push(ResidualList::Cr16x16Dc, pad_to_16(blk));
                 } else {
-                    out.residual_cb_16x16_dc = Some(pad_to_16(blk));
+                    sink.push(ResidualList::Cb16x16Dc, pad_to_16(blk));
                 }
                 // §9.2.1.1 NOTE 1: DC counts do NOT contribute to nN.
             }
@@ -4253,10 +4621,10 @@ fn parse_residual_cavlc_only(
                         let tc = count_nonzero(&blk);
                         if plane_is_cr {
                             own_cr_luma_totals[blk_idx as usize] = tc;
-                            out.residual_cr_luma_like.push(pad_to_16(blk));
+                            sink.push(ResidualList::CrLumaLike, pad_to_16(blk));
                         } else {
                             own_cb_luma_totals[blk_idx as usize] = tc;
-                            out.residual_cb_luma_like.push(pad_to_16(blk));
+                            sink.push(ResidualList::CbLumaLike, pad_to_16(blk));
                         }
                     }
                 }
@@ -4308,9 +4676,9 @@ fn parse_residual_cavlc_only(
                             let mut store = [0i32; 16];
                             store.copy_from_slice(chunk);
                             if plane_is_cr {
-                                out.residual_cr_luma_like.push(store);
+                                sink.push(ResidualList::CrLumaLike, store);
                             } else {
-                                out.residual_cb_luma_like.push(store);
+                                sink.push(ResidualList::CbLumaLike, store);
                             }
                         }
                     }
@@ -4337,10 +4705,10 @@ fn parse_residual_cavlc_only(
                             let tc = count_nonzero(&blk);
                             if plane_is_cr {
                                 own_cr_luma_totals[blk_idx as usize] = tc;
-                                out.residual_cr_luma_like.push(pad_to_16(blk));
+                                sink.push(ResidualList::CrLumaLike, pad_to_16(blk));
                             } else {
                                 own_cb_luma_totals[blk_idx as usize] = tc;
-                                out.residual_cb_luma_like.push(pad_to_16(blk));
+                                sink.push(ResidualList::CbLumaLike, pad_to_16(blk));
                             }
                         }
                     }
@@ -4353,6 +4721,7 @@ fn parse_residual_cavlc_only(
         ));
     }
 
+    let residual = sink.finish();
     // Write the accumulated own-MB totals back to the grid.
     if let Some(grid) = entropy.cavlc_nc.as_deref_mut()
         && let Some(slot) = grid.mbs.get_mut(current_mb_addr as usize)
@@ -4364,7 +4733,7 @@ fn parse_residual_cavlc_only(
         slot.cr_luma_total_coeff = own_cr_luma_totals;
     }
 
-    Ok(())
+    Ok(residual)
 }
 
 // ---------------------------------------------------------------------------
@@ -4402,13 +4771,13 @@ fn parse_residual_block_cabac(
     neighbour_cbf_left: Option<bool>,
     neighbour_cbf_above: Option<bool>,
     field: bool,
-) -> McblResult<(CoeffBlock, bool)> {
+    // The block's coefficient levels, zeroed by the caller; the first
+    // `endIdx - startIdx + 1` entries (at most 64) are written.
+    out: &mut [i32],
+) -> McblResult<bool> {
     // Residual blocks hold at most 64 coefficients (§7.3.5.3.3).
     let len = ((end_idx - start_idx + 1) as usize).min(64);
-    let mut out = CoeffBlock {
-        buf: [0i32; 64],
-        len,
-    };
+    let out = &mut out[..len];
 
     // §7.3.5.3.3 — coded_block_flag is suppressed for 8x8 blocks unless
     // we're in 4:4:4 (where 8x8 CBP semantics differ).
@@ -4425,7 +4794,7 @@ fn parse_residual_block_cabac(
     };
 
     if !coded {
-        return Ok((out, false));
+        return Ok(false);
     }
 
     // §7.3.5.3.3 — significance map, in forward scan order.
@@ -4475,14 +4844,14 @@ fn parse_residual_block_cabac(
         let abs_m1 = decode_coeff_abs_level_minus1(cabac, ctxs, block_type, num_eq1, num_gt1)?;
         let sign = decode_coeff_sign_flag(cabac)?;
         let val = ((abs_m1 + 1) as i32) * if sign { -1 } else { 1 };
-        out.buf[pos as usize] = val;
+        out[pos as usize] = val;
         if abs_m1 == 0 {
             num_eq1 += 1;
         } else {
             num_gt1 += 1;
         }
     }
-    Ok((out, true))
+    Ok(true)
 }
 
 /// CABAC residual walker (§7.3.5.3 with entropy_coding_mode_flag == 1).
@@ -4497,14 +4866,15 @@ fn parse_residual_cabac_only(
     cbp_luma: u32,
     cbp_chroma: u32,
     transform_size_8x8_flag: bool,
-    out: &mut Macroblock,
+    arena: &mut CoeffArena,
     nb_grid: Option<&mut CabacNeighbourGrid>,
     current_mb_addr: u32,
     current_is_intra: bool,
     // §9.3.3.1.3 — FIELD-coded MB (MBAFF field MB / field picture):
     // selects the field ctxIdxOffset column for the significance map.
     field: bool,
-) -> McblResult<()> {
+) -> McblResult<MbResidual> {
+    let mut sink = ResidualSink::new(arena);
     // Scratch for this MB's accumulating CBF state; committed back to
     // the grid at the end of the function.
     let mut curr_cbf = CabacMbNeighbourInfo {
@@ -4542,7 +4912,7 @@ fn parse_residual_cabac_only(
         } else {
             (None, None)
         };
-        let (blk, coded) = parse_residual_block_cabac(
+        let coded = parse_residual_block_cabac(
             cabac,
             ctxs,
             BlockType::Luma16x16Dc,
@@ -4553,9 +4923,9 @@ fn parse_residual_cabac_only(
             ca,
             cb,
             field,
+            &mut sink.append(ResidualList::LumaDc, 1)[0],
         )?;
         curr_cbf.cbf_luma_16x16_dc = coded;
-        out.residual_luma_dc = Some(pad_to_16(blk));
     }
 
     // --- Luma AC / 4x4 blocks / 8x8 blocks ---
@@ -4577,7 +4947,7 @@ fn parse_residual_cabac_only(
                 } else {
                     (None, None)
                 };
-                let (blk, coded) = parse_residual_block_cabac(
+                let coded = parse_residual_block_cabac(
                     cabac,
                     ctxs,
                     BlockType::Luma16x16Ac,
@@ -4588,9 +4958,9 @@ fn parse_residual_cabac_only(
                     ca,
                     cb,
                     field,
+                    &mut sink.append(ResidualList::Luma, 1)[0],
                 )?;
                 curr_cbf.cbf_luma_16x16_ac[blk_idx as usize] = coded;
-                out.residual_luma.push(pad_to_16(blk));
             }
         }
     } else if transform_size_8x8_flag {
@@ -4615,7 +4985,9 @@ fn parse_residual_cabac_only(
                 } else {
                     (None, None)
                 };
-                let (blk, coded) = parse_residual_block_cabac(
+                // The 64 coefficients fill four consecutive 16-level
+                // blocks.
+                let coded = parse_residual_block_cabac(
                     cabac,
                     ctxs,
                     BlockType::Luma8x8,
@@ -4626,20 +4998,13 @@ fn parse_residual_cabac_only(
                     ca,
                     cb,
                     field,
+                    sink.append(ResidualList::Luma, 4).as_flattened_mut(),
                 )?;
                 // Propagate the inferred coded flag to the four 4x4
                 // sub-blocks for CBF neighbour tracking.
                 for sub in 0..4u8 {
                     let idx = (blk8 * 4 + sub) as usize;
                     curr_cbf.cbf_luma_4x4[idx] = coded;
-                }
-                // Pad the 64 coefficients into four 16-slot arrays.
-                for sub in 0..4 {
-                    let mut chunk = [0i32; 16];
-                    for k in 0..16 {
-                        chunk[k] = blk[sub * 16 + k];
-                    }
-                    out.residual_luma.push(chunk);
                 }
             }
         }
@@ -4663,7 +5028,7 @@ fn parse_residual_cabac_only(
                     } else {
                         (None, None)
                     };
-                    let (blk, coded) = parse_residual_block_cabac(
+                    let coded = parse_residual_block_cabac(
                         cabac,
                         ctxs,
                         BlockType::Luma4x4,
@@ -4674,9 +5039,9 @@ fn parse_residual_cabac_only(
                         ca,
                         cb,
                         field,
+                        &mut sink.append(ResidualList::Luma, 1)[0],
                     )?;
                     curr_cbf.cbf_luma_4x4[blk_idx as usize] = coded;
-                    out.residual_luma.push(pad_to_16(blk));
                 }
             }
         }
@@ -4706,7 +5071,7 @@ fn parse_residual_cabac_only(
             } else {
                 (None, None)
             };
-            let (cb_dc, cb_coded) = parse_residual_block_cabac(
+            let cb_coded = parse_residual_block_cabac(
                 cabac,
                 ctxs,
                 BlockType::ChromaDc,
@@ -4717,9 +5082,10 @@ fn parse_residual_cabac_only(
                 ca_cb,
                 cb_cb,
                 field,
+                &mut sink.append(ResidualList::ChromaDcCb, 1)[0],
             )?;
             curr_cbf.cbf_cb_dc = cb_coded;
-            out.residual_chroma_dc_cb = cb_dc.to_vec();
+            sink.set_chroma_dc_len(max_dc as usize);
 
             let (ca_cr, cb_cr) = if let Some(g) = grid_ref {
                 let (a, b) = cabac_cbf_cond_terms(
@@ -4736,7 +5102,7 @@ fn parse_residual_cabac_only(
             } else {
                 (None, None)
             };
-            let (cr_dc, cr_coded) = parse_residual_block_cabac(
+            let cr_coded = parse_residual_block_cabac(
                 cabac,
                 ctxs,
                 BlockType::ChromaDc,
@@ -4747,9 +5113,10 @@ fn parse_residual_cabac_only(
                 ca_cr,
                 cb_cr,
                 field,
+                &mut sink.append(ResidualList::ChromaDcCr, 1)[0],
             )?;
             curr_cbf.cbf_cr_dc = cr_coded;
-            out.residual_chroma_dc_cr = cr_dc.to_vec();
+            sink.set_chroma_dc_len(max_dc as usize);
         }
 
         if cbp_chroma == 2 {
@@ -4770,7 +5137,7 @@ fn parse_residual_cabac_only(
                 } else {
                     (None, None)
                 };
-                let (blk, coded) = parse_residual_block_cabac(
+                let coded = parse_residual_block_cabac(
                     cabac,
                     ctxs,
                     BlockType::ChromaAc,
@@ -4781,9 +5148,9 @@ fn parse_residual_cabac_only(
                     ca,
                     cb,
                     field,
+                    &mut sink.append(ResidualList::ChromaAcCb, 1)[0],
                 )?;
                 curr_cbf.cbf_cb_ac[blk_idx as usize] = coded;
-                out.residual_chroma_ac_cb.push(pad_to_16(blk));
             }
             for blk_idx in 0..num_ac as u8 {
                 let (ca, cb) = if let Some(g) = grid_ref {
@@ -4801,7 +5168,7 @@ fn parse_residual_cabac_only(
                 } else {
                     (None, None)
                 };
-                let (blk, coded) = parse_residual_block_cabac(
+                let coded = parse_residual_block_cabac(
                     cabac,
                     ctxs,
                     BlockType::ChromaAc,
@@ -4812,9 +5179,9 @@ fn parse_residual_cabac_only(
                     ca,
                     cb,
                     field,
+                    &mut sink.append(ResidualList::ChromaAcCr, 1)[0],
                 )?;
                 curr_cbf.cbf_cr_ac[blk_idx as usize] = coded;
-                out.residual_chroma_ac_cr.push(pad_to_16(blk));
             }
         }
     } else if chroma_array_type == 0 {
@@ -4826,6 +5193,11 @@ fn parse_residual_cabac_only(
         // Cb DC=6, Cb AC=7, Cb 4x4=8, Cb 8x8=9,
         // Cr DC=10, Cr AC=11, Cr 4x4=12, Cr 8x8=13).
         for plane_is_cr in [false, true] {
+            let (l_dc, l_like) = if plane_is_cr {
+                (ResidualList::Cr16x16Dc, ResidualList::CrLumaLike)
+            } else {
+                (ResidualList::Cb16x16Dc, ResidualList::CbLumaLike)
+            };
             let (bt_dc, bt_ac, bt_4x4, bt_8x8) = if plane_is_cr {
                 (
                     BlockType::CrIntra16x16Dc,
@@ -4859,7 +5231,7 @@ fn parse_residual_cabac_only(
                 } else {
                     (None, None)
                 };
-                let (blk, coded) = parse_residual_block_cabac(
+                let coded = parse_residual_block_cabac(
                     cabac,
                     ctxs,
                     bt_dc,
@@ -4870,13 +5242,12 @@ fn parse_residual_cabac_only(
                     ca,
                     cb,
                     field,
+                    &mut sink.append(l_dc, 1)[0],
                 )?;
                 if plane_is_cr {
                     curr_cbf.cbf_cr_16x16_dc = coded;
-                    out.residual_cr_16x16_dc = Some(pad_to_16(blk));
                 } else {
                     curr_cbf.cbf_cb_16x16_dc = coded;
-                    out.residual_cb_16x16_dc = Some(pad_to_16(blk));
                 }
             }
 
@@ -4899,7 +5270,7 @@ fn parse_residual_cabac_only(
                         } else {
                             (None, None)
                         };
-                        let (blk, coded) = parse_residual_block_cabac(
+                        let coded = parse_residual_block_cabac(
                             cabac,
                             ctxs,
                             bt_ac,
@@ -4910,13 +5281,12 @@ fn parse_residual_cabac_only(
                             ca,
                             cb,
                             field,
+                            &mut sink.append(l_like, 1)[0],
                         )?;
                         if plane_is_cr {
                             curr_cbf.cbf_cr_16x16_ac[blk_idx as usize] = coded;
-                            out.residual_cr_luma_like.push(pad_to_16(blk));
                         } else {
                             curr_cbf.cbf_cb_16x16_ac[blk_idx as usize] = coded;
-                            out.residual_cb_luma_like.push(pad_to_16(blk));
                         }
                     }
                 }
@@ -4942,7 +5312,7 @@ fn parse_residual_cabac_only(
                         } else {
                             (None, None)
                         };
-                        let (blk, coded) = parse_residual_block_cabac(
+                        let coded = parse_residual_block_cabac(
                             cabac,
                             ctxs,
                             bt_8x8,
@@ -4953,6 +5323,7 @@ fn parse_residual_cabac_only(
                             ca,
                             cb,
                             field,
+                            sink.append(l_like, 4).as_flattened_mut(),
                         )?;
                         // Propagate coded flag to the four 4x4 sub-
                         // blocks so subsequent intra-MB neighbour
@@ -4963,17 +5334,6 @@ fn parse_residual_cabac_only(
                                 curr_cbf.cbf_cr_luma_4x4[idx] = coded;
                             } else {
                                 curr_cbf.cbf_cb_luma_4x4[idx] = coded;
-                            }
-                        }
-                        for sub in 0..4 {
-                            let mut chunk = [0i32; 16];
-                            for k in 0..16 {
-                                chunk[k] = blk[sub * 16 + k];
-                            }
-                            if plane_is_cr {
-                                out.residual_cr_luma_like.push(chunk);
-                            } else {
-                                out.residual_cb_luma_like.push(chunk);
                             }
                         }
                     }
@@ -4998,7 +5358,7 @@ fn parse_residual_cabac_only(
                             } else {
                                 (None, None)
                             };
-                            let (blk, coded) = parse_residual_block_cabac(
+                            let coded = parse_residual_block_cabac(
                                 cabac,
                                 ctxs,
                                 bt_4x4,
@@ -5009,13 +5369,12 @@ fn parse_residual_cabac_only(
                                 ca,
                                 cb,
                                 field,
+                                &mut sink.append(l_like, 1)[0],
                             )?;
                             if plane_is_cr {
                                 curr_cbf.cbf_cr_luma_4x4[blk_idx as usize] = coded;
-                                out.residual_cr_luma_like.push(pad_to_16(blk));
                             } else {
                                 curr_cbf.cbf_cb_luma_4x4[blk_idx as usize] = coded;
-                                out.residual_cb_luma_like.push(pad_to_16(blk));
                             }
                         }
                     }
@@ -5068,7 +5427,7 @@ fn parse_residual_cabac_only(
         }
     }
 
-    Ok(())
+    Ok(sink.finish())
 }
 
 // ---------------------------------------------------------------------------
@@ -5378,6 +5737,7 @@ mod tests {
             pic_width_in_mbs: 0,
             bit_depth_luma_minus8: 0,
             bit_depth_chroma_minus8: 0,
+            coeffs: Box::leak(Box::new(CoeffArena::default())),
         }
     }
 
@@ -5427,11 +5787,12 @@ mod tests {
         entropy.transform_8x8_mode_flag = true;
 
         let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        let mb = MbView::new(&mb, entropy.coeffs);
         assert_eq!(mb.mb_type, MbType::INxN);
         assert!(mb.transform_size_8x8_flag);
         assert_eq!(mb.coded_block_pattern, 0);
         // mb_pred should have filled the 8x8 flags, not the 4x4 ones.
-        let pred = mb.mb_pred.expect("mb_pred present");
+        let pred = mb.mb_pred.as_ref().expect("mb_pred present");
         for i in 0..4 {
             assert!(
                 pred.prev_intra8x8_pred_mode_flag[i],
@@ -5508,21 +5869,22 @@ mod tests {
         entropy.transform_8x8_mode_flag = true;
 
         let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        let mb = MbView::new(&mb, entropy.coeffs);
         assert_eq!(mb.mb_type, MbType::INxN);
         assert!(mb.transform_size_8x8_flag);
         assert_eq!(mb.coded_block_pattern & 0xF, 1);
 
         // Luma: interleaved → sub0's pos-0 coefficient lands at
         // scan8[4*0 + 0] = chunk 0 slot 0.
-        assert_eq!(mb.residual_luma.len(), 4);
-        assert_eq!(mb.residual_luma[0][0], 1);
-        assert!(mb.residual_luma[0][1..].iter().all(|&c| c == 0));
-        assert!(mb.residual_luma[1..].iter().flatten().all(|&c| c == 0));
+        assert_eq!(mb.residual_luma().len(), 4);
+        assert_eq!(mb.residual_luma()[0][0], 1);
+        assert!(mb.residual_luma()[0][1..].iter().all(|&c| c == 0));
+        assert!(mb.residual_luma()[1..].iter().flatten().all(|&c| c == 0));
 
         // Cb: scan8[0] = sub0@0 = +1, scan8[1] = sub1@0 = -1,
         // scan8[4*1 + 2] = scan8[6] = sub2@1 = +1; everything else 0.
-        assert_eq!(mb.residual_cb_luma_like.len(), 4);
-        let cb0 = &mb.residual_cb_luma_like[0];
+        assert_eq!(mb.residual_cb_luma_like().len(), 4);
+        let cb0 = &mb.residual_cb_luma_like()[0];
         assert_eq!(cb0[0], 1, "scan8[0]");
         assert_eq!(cb0[1], -1, "scan8[1]");
         assert_eq!(cb0[6], 1, "scan8[6]");
@@ -5532,15 +5894,15 @@ mod tests {
             }
         }
         assert!(
-            mb.residual_cb_luma_like[1..]
+            mb.residual_cb_luma_like()[1..]
                 .iter()
                 .flatten()
                 .all(|&c| c == 0)
         );
 
         // Cr: coded quadrant with all-zero levels → four zero chunks.
-        assert_eq!(mb.residual_cr_luma_like.len(), 4);
-        assert!(mb.residual_cr_luma_like.iter().flatten().all(|&c| c == 0));
+        assert_eq!(mb.residual_cr_luma_like().len(), 4);
+        assert!(mb.residual_cr_luma_like().iter().flatten().all(|&c| c == 0));
     }
 
     #[test]
@@ -5572,13 +5934,14 @@ mod tests {
         let mut entropy = cavlc_entropy();
 
         let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        let mb = MbView::new(&mb, entropy.coeffs);
         assert_eq!(mb.mb_type, MbType::INxN);
         assert_eq!(mb.coded_block_pattern, 0);
         assert!(mb.pcm_samples.is_none());
         assert!(mb.mb_pred.is_some());
-        assert!(mb.residual_luma.is_empty());
+        assert!(mb.residual_luma().is_empty());
         assert_eq!(mb.mb_qp_delta, 0);
-        assert!(mb.residual_luma_dc.is_none());
+        assert!(mb.residual_luma_dc().is_none());
     }
 
     #[test]
@@ -5607,6 +5970,7 @@ mod tests {
         let mut entropy = cavlc_entropy();
 
         let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        let mb = MbView::new(&mb, entropy.coeffs);
         assert!(matches!(
             mb.mb_type,
             MbType::Intra16x16(Intra16x16 {
@@ -5616,8 +5980,8 @@ mod tests {
             })
         ));
         assert_eq!(mb.coded_block_pattern, 0);
-        assert!(mb.residual_luma_dc.is_some());
-        assert!(mb.residual_luma.is_empty());
+        assert!(mb.residual_luma_dc().is_some());
+        assert!(mb.residual_luma().is_empty());
         assert_eq!(mb.mb_qp_delta, 0);
     }
 
@@ -5655,6 +6019,7 @@ mod tests {
         let mut entropy = cavlc_entropy();
 
         let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        let mb = MbView::new(&mb, entropy.coeffs);
         assert!(mb.mb_type.is_i_pcm());
         let pcm = mb.pcm_samples.as_ref().unwrap();
         assert_eq!(pcm.luma.len(), 256);
@@ -6571,9 +6936,10 @@ mod tests {
         entropy.slice_kind = SliceKind::P;
         entropy.num_ref_idx_l0_active_minus1 = 0;
         let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        let mb = MbView::new(&mb, entropy.coeffs);
         assert_eq!(mb.mb_type, MbType::PL016x16);
         assert_eq!(mb.coded_block_pattern, 0);
-        let pred = mb.mb_pred.expect("mb_pred");
+        let pred = mb.mb_pred.as_ref().expect("mb_pred");
         // ref_idx_l0 should have been filled with the default (0) — no
         // bits consumed.
         assert_eq!(pred.ref_idx_l0.len(), 1);
@@ -6612,8 +6978,9 @@ mod tests {
         entropy.slice_kind = SliceKind::P;
         entropy.num_ref_idx_l0_active_minus1 = 1;
         let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        let mb = MbView::new(&mb, entropy.coeffs);
         assert_eq!(mb.mb_type, MbType::PL016x16);
-        let pred = mb.mb_pred.expect("mb_pred");
+        let pred = mb.mb_pred.as_ref().expect("mb_pred");
         assert_eq!(pred.ref_idx_l0[0], 1);
     }
 
@@ -6856,6 +7223,7 @@ mod tests {
             pic_width_in_mbs: 0,
             bit_depth_luma_minus8: 0,
             bit_depth_chroma_minus8: 0,
+            coeffs: Box::leak(Box::new(CoeffArena::default())),
         };
         let pred = parse_mb_pred(&mut r, &mut entropy, mb_type, false).unwrap();
         let bins_used = dec.bin_count() - bins_before;
@@ -7174,6 +7542,7 @@ mod tests {
             pic_width_in_mbs: 0,
             bit_depth_luma_minus8: 0,
             bit_depth_chroma_minus8: 0,
+            coeffs: Box::leak(Box::new(CoeffArena::default())),
         };
         let pred = parse_sub_mb_pred(&mut r, &mut entropy, mb_type).unwrap();
         let bins_used = dec.bin_count() - bins_before;
@@ -7308,6 +7677,7 @@ mod tests {
             pic_width_in_mbs: 0,
             bit_depth_luma_minus8: 0,
             bit_depth_chroma_minus8: 0,
+            coeffs: Box::leak(Box::new(CoeffArena::default())),
         }
     }
 
@@ -7336,6 +7706,7 @@ mod tests {
         let mut entropy = cavlc_entropy_444();
 
         let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        let mb = MbView::new(&mb, entropy.coeffs);
         assert!(matches!(
             mb.mb_type,
             MbType::Intra16x16(Intra16x16 {
@@ -7347,20 +7718,20 @@ mod tests {
         assert_eq!(mb.coded_block_pattern, 0);
         // Y DC present, Cb DC + Cr DC present (4:4:4 Intra_16x16 always
         // parses per-plane DC blocks even when cbp_luma/chroma == 0).
-        assert!(mb.residual_luma_dc.is_some());
-        assert!(mb.residual_cb_16x16_dc.is_some());
-        assert!(mb.residual_cr_16x16_dc.is_some());
+        assert!(mb.residual_luma_dc().is_some());
+        assert!(mb.residual_cb_16x16_dc().is_some());
+        assert!(mb.residual_cr_16x16_dc().is_some());
         // All 16 coefficients of each DC block are zero (TotalCoeff=0).
-        assert_eq!(mb.residual_luma_dc.unwrap(), [0; 16]);
-        assert_eq!(mb.residual_cb_16x16_dc.unwrap(), [0; 16]);
-        assert_eq!(mb.residual_cr_16x16_dc.unwrap(), [0; 16]);
+        assert_eq!(*mb.residual_luma_dc().unwrap(), [0; 16]);
+        assert_eq!(*mb.residual_cb_16x16_dc().unwrap(), [0; 16]);
+        assert_eq!(*mb.residual_cr_16x16_dc().unwrap(), [0; 16]);
         // No AC blocks (cbp_luma == 0 gates all planes).
-        assert!(mb.residual_luma.is_empty());
-        assert!(mb.residual_cb_luma_like.is_empty());
-        assert!(mb.residual_cr_luma_like.is_empty());
+        assert!(mb.residual_luma().is_empty());
+        assert!(mb.residual_cb_luma_like().is_empty());
+        assert!(mb.residual_cr_luma_like().is_empty());
         // No 4:2:0 / 4:2:2 chroma path state.
-        assert!(mb.residual_chroma_dc_cb.is_empty());
-        assert!(mb.residual_chroma_ac_cb.is_empty());
+        assert!(mb.residual_chroma_dc_cb().is_empty());
+        assert!(mb.residual_chroma_ac_cb().is_empty());
     }
 
     /// §7.3.5.3 / §9.2.1 — CAVLC Intra_16x16 in 4:4:4 with cbp_luma=15,
@@ -7387,6 +7758,7 @@ mod tests {
         let mut entropy = cavlc_entropy_444();
 
         let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        let mb = MbView::new(&mb, entropy.coeffs);
         assert!(matches!(
             mb.mb_type,
             MbType::Intra16x16(Intra16x16 {
@@ -7396,22 +7768,22 @@ mod tests {
             })
         ));
         // Y: DC + 16 AC.
-        assert!(mb.residual_luma_dc.is_some());
-        assert_eq!(mb.residual_luma.len(), 16);
+        assert!(mb.residual_luma_dc().is_some());
+        assert_eq!(mb.residual_luma().len(), 16);
         // Cb: DC + 16 AC (stored in luma-like fields).
-        assert!(mb.residual_cb_16x16_dc.is_some());
-        assert_eq!(mb.residual_cb_luma_like.len(), 16);
+        assert!(mb.residual_cb_16x16_dc().is_some());
+        assert_eq!(mb.residual_cb_luma_like().len(), 16);
         // Cr: DC + 16 AC.
-        assert!(mb.residual_cr_16x16_dc.is_some());
-        assert_eq!(mb.residual_cr_luma_like.len(), 16);
+        assert!(mb.residual_cr_16x16_dc().is_some());
+        assert_eq!(mb.residual_cr_luma_like().len(), 16);
         // Every block is zero (TotalCoeff=0 → empty coefficient vector).
-        for blk in &mb.residual_luma {
+        for blk in mb.residual_luma() {
             assert_eq!(*blk, [0; 16]);
         }
-        for blk in &mb.residual_cb_luma_like {
+        for blk in mb.residual_cb_luma_like() {
             assert_eq!(*blk, [0; 16]);
         }
-        for blk in &mb.residual_cr_luma_like {
+        for blk in mb.residual_cr_luma_like() {
             assert_eq!(*blk, [0; 16]);
         }
     }
@@ -7443,13 +7815,14 @@ mod tests {
         let mut entropy = cavlc_entropy_444();
 
         let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        let mb = MbView::new(&mb, entropy.coeffs);
         assert_eq!(mb.mb_type, MbType::INxN);
         assert_eq!(mb.coded_block_pattern, 0);
-        assert!(mb.residual_luma.is_empty());
-        assert!(mb.residual_cb_luma_like.is_empty());
-        assert!(mb.residual_cr_luma_like.is_empty());
-        assert!(mb.residual_cb_16x16_dc.is_none());
-        assert!(mb.residual_cr_16x16_dc.is_none());
+        assert!(mb.residual_luma().is_empty());
+        assert!(mb.residual_cb_luma_like().is_empty());
+        assert!(mb.residual_cr_luma_like().is_empty());
+        assert!(mb.residual_cb_16x16_dc().is_none());
+        assert!(mb.residual_cr_16x16_dc().is_none());
     }
 
     /// §7.3.5.3 — CAVLC Inter P_L0_16x16 in 4:4:4 with cbp_total = 0.
@@ -7480,14 +7853,15 @@ mod tests {
         entropy.slice_kind = SliceKind::P;
 
         let mb = parse_macroblock(&mut r, &mut entropy, &hdr, &sps, &pps, 0).unwrap();
+        let mb = MbView::new(&mb, entropy.coeffs);
         assert_eq!(mb.mb_type, MbType::PL016x16);
         assert_eq!(mb.coded_block_pattern, 0);
-        assert!(mb.residual_luma.is_empty());
-        assert!(mb.residual_cb_luma_like.is_empty());
-        assert!(mb.residual_cr_luma_like.is_empty());
-        assert!(mb.residual_luma_dc.is_none());
-        assert!(mb.residual_cb_16x16_dc.is_none());
-        assert!(mb.residual_cr_16x16_dc.is_none());
+        assert!(mb.residual_luma().is_empty());
+        assert!(mb.residual_cb_luma_like().is_empty());
+        assert!(mb.residual_cr_luma_like().is_empty());
+        assert!(mb.residual_luma_dc().is_none());
+        assert!(mb.residual_cb_16x16_dc().is_none());
+        assert!(mb.residual_cr_16x16_dc().is_none());
     }
 
     /// §9.2.1.1 — CAVLC 4:4:4 nC neighbour derivation uses per-plane
@@ -7561,9 +7935,7 @@ mod tests {
         ];
         let mut dec = CabacDecoder::new(BitReader::new(&data)).unwrap();
         let mut ctxs = CabacContexts::init(SliceKind::I, None, 26).unwrap();
-        let mut out = Macroblock::new_skip(SliceType::I);
-        // Set it up to look like a non-skip Intra_16x16 MB.
-        out.is_skip = false;
+        let mut arena = CoeffArena::default();
         let mb_type = MbType::Intra16x16(Intra16x16 {
             pred_mode: 0,
             cbp_luma: 0,
@@ -7571,7 +7943,7 @@ mod tests {
         });
         let res = parse_residual_cabac_only(
             &mut dec, &mut ctxs, /*chroma_array_type=*/ 3, &mb_type, /*cbp_luma=*/ 0,
-            /*cbp_chroma=*/ 0, /*transform_size_8x8_flag=*/ false, &mut out,
+            /*cbp_chroma=*/ 0, /*transform_size_8x8_flag=*/ false, &mut arena,
             /*nb_grid=*/ None, /*current_mb_addr=*/ 0, /*current_is_intra=*/ true,
             /*field=*/ false,
         );
@@ -7587,14 +7959,18 @@ mod tests {
         // Whether res is Ok or some other CABAC error depends on the
         // specific bit pattern — we only assert that the 4:4:4 path
         // no longer rejects with UnsupportedChromaArrayType(3).
-        if res.is_ok() {
+        if let Ok(residual) = res {
             // When coded_block_flag decodes to 0 for all three planes'
             // DC blocks, the corresponding residuals are present as
-            // all-zero vectors (parse_residual_block_cabac pads
-            // `out` to `len` = 16 and returns `coded = false`).
-            assert!(out.residual_luma_dc.is_some());
-            assert!(out.residual_cb_16x16_dc.is_some());
-            assert!(out.residual_cr_16x16_dc.is_some());
+            // all-zero blocks (parse_residual_block_cabac fills a zeroed
+            // arena block and returns `coded = false`).
+            let mut out = Macroblock::new_skip(SliceType::I);
+            out.is_skip = false;
+            out.residual = residual;
+            let out = MbView::new(&out, &arena);
+            assert!(out.residual_luma_dc().is_some());
+            assert!(out.residual_cb_16x16_dc().is_some());
+            assert!(out.residual_cr_16x16_dc().is_some());
         }
     }
 
@@ -7632,5 +8008,143 @@ mod tests {
         assert!(cbf_mb_level_for(&info, BlockType::Luma16x16Dc, false));
         assert!(!cbf_mb_level_for(&info, BlockType::CbIntra16x16Dc, false));
         assert!(cbf_mb_level_for(&info, BlockType::CrIntra16x16Dc, true));
+    }
+}
+
+#[cfg(test)]
+mod arena_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    // A chunk stays under glibc's default 128 KiB mmap threshold, and a
+    // macroblock's span offsets fit their byte fields.
+    const _: () = assert!(ARENA_CHUNK_BLOCKS * std::mem::size_of::<CoeffBlock16>() <= 64 * 1024);
+    const _: () = assert!(MAX_MB_BLOCKS <= u8::MAX as usize);
+    const _: () = assert!(MAX_MB_BLOCKS <= ARENA_CHUNK_BLOCKS);
+
+    /// A block whose every level identifies (macroblock, list, block).
+    fn tag(mb: usize, list: usize, blk: usize) -> CoeffBlock16 {
+        let mut b = [0i32; 16];
+        for (k, v) in b.iter_mut().enumerate() {
+            *v = (mb * 10_000 + list * 1_000 + blk * 16 + k) as i32;
+        }
+        b
+    }
+
+    /// A residual of the largest shape (4:4:4 Intra_16x16, all lists
+    /// full) or a 4:2:2 one, with every block tagged.
+    fn owned(mb: usize, full_444: bool) -> OwnedResidual {
+        let blocks = |list: usize, n: usize| (0..n).map(|b| tag(mb, list, b)).collect::<Vec<_>>();
+        if full_444 {
+            OwnedResidual {
+                luma: blocks(0, 16),
+                luma_dc: Some(tag(mb, 1, 0)),
+                cb_luma_like: blocks(6, 16),
+                cr_luma_like: blocks(7, 16),
+                cb_16x16_dc: Some(tag(mb, 8, 0)),
+                cr_16x16_dc: Some(tag(mb, 9, 0)),
+                ..OwnedResidual::default()
+            }
+        } else {
+            OwnedResidual {
+                luma: blocks(0, mb % 17),
+                chroma_dc_cb: tag(mb, 2, 0)[..8].to_vec(),
+                chroma_dc_cr: tag(mb, 3, 0)[..8].to_vec(),
+                chroma_ac_cb: blocks(4, 8),
+                chroma_ac_cr: blocks(5, 8),
+                ..OwnedResidual::default()
+            }
+        }
+    }
+
+    /// Many macroblocks, enough to fill several chunks, each read back
+    /// exactly through its spans: no macroblock straddles a chunk and no
+    /// list bleeds into another.
+    #[test]
+    fn residuals_round_trip_across_chunks() {
+        let mut arena = CoeffArena::default();
+        let mut spans = Vec::new();
+        let n = 3 * ARENA_CHUNK_BLOCKS / 20;
+        for mb in 0..n {
+            spans.push(owned(mb, mb % 3 == 0).append_to(&mut arena));
+        }
+        assert!(arena.chunks.len() > 3, "the test must span several chunks");
+        assert!(arena.chunks.iter().all(|c| c.len() <= ARENA_CHUNK_BLOCKS));
+        for (mb, res) in spans.into_iter().enumerate() {
+            let m = Macroblock {
+                residual: res,
+                ..Macroblock::new_skip(SliceType::P)
+            };
+            assert_eq!(
+                OwnedResidual::of(&MbView::new(&m, &arena)),
+                owned(mb, mb % 3 == 0)
+            );
+        }
+    }
+
+    /// The parser fills lists in place in its own order; a list must read
+    /// back as exactly the blocks appended to it.
+    #[test]
+    fn lists_read_back_in_append_order() {
+        let mut arena = CoeffArena::default();
+        let mut sink = ResidualSink::new(&mut arena);
+        sink.push(ResidualList::LumaDc, tag(0, 1, 0));
+        for b in 0..4 {
+            sink.append(ResidualList::Luma, 1)[0] = tag(0, 0, b);
+        }
+        sink.append(ResidualList::ChromaDcCb, 1)[0][..4].copy_from_slice(&[1, 2, 3, 4]);
+        sink.append(ResidualList::ChromaDcCr, 1)[0][..4].copy_from_slice(&[5, 6, 7, 8]);
+        sink.set_chroma_dc_len(4);
+        let quarters = sink.append(ResidualList::ChromaAcCb, 2);
+        quarters[1] = tag(0, 4, 1);
+        let res = sink.finish();
+        let m = Macroblock {
+            residual: res,
+            ..Macroblock::new_skip(SliceType::I)
+        };
+        let v = MbView::new(&m, &arena);
+        assert_eq!(v.residual_luma_dc(), Some(&tag(0, 1, 0)));
+        assert_eq!(
+            v.residual_luma(),
+            &(0..4).map(|b| tag(0, 0, b)).collect::<Vec<_>>()[..]
+        );
+        assert_eq!(v.residual_chroma_dc_cb(), &[1, 2, 3, 4]);
+        assert_eq!(v.residual_chroma_dc_cr(), &[5, 6, 7, 8]);
+        assert_eq!(v.residual_chroma_ac_cb(), &[[0; 16], tag(0, 4, 1)]);
+        assert!(v.residual_chroma_ac_cr().is_empty());
+        assert!(v.residual_cb_luma_like().is_empty());
+        assert_eq!(v.residual_cb_16x16_dc(), None);
+    }
+
+    /// A pooled arena hands its chunks back when dropped, and the next
+    /// arena reuses them; the pool keeps at most its cap.
+    #[test]
+    fn pooled_chunks_are_reused_and_capped() {
+        let pool = Arc::new(ChunkPool::default());
+        let mut a = CoeffArena::with_pool(pool.clone());
+        for mb in 0..40 {
+            owned(mb, true).append_to(&mut a);
+        }
+        let used = a.chunks.len();
+        let ptrs: Vec<*const CoeffBlock16> = a.chunks.iter().map(|c| c.as_ptr()).collect();
+        drop(a);
+        assert_eq!(pool.spare_chunks(), used);
+        let mut b = CoeffArena::with_pool(pool.clone());
+        owned(0, true).append_to(&mut b);
+        assert!(
+            ptrs.contains(&b.chunks[0].as_ptr()),
+            "a spare chunk is reused"
+        );
+        assert_eq!(pool.spare_chunks(), used - 1);
+        // 16 luma + DC, and the same for each 4:4:4 chroma plane.
+        assert_eq!(b.chunks[0].len(), 3 * 17, "a reused chunk starts empty");
+        drop(b);
+        // More chunks than the cap: the excess is freed.
+        let mut c = CoeffArena::with_pool(pool.clone());
+        for _ in 0..ChunkPool::MAX_SPARE + 4 {
+            c.chunks.push(Vec::with_capacity(ARENA_CHUNK_BLOCKS));
+        }
+        drop(c);
+        assert_eq!(pool.spare_chunks(), ChunkPool::MAX_SPARE);
     }
 }

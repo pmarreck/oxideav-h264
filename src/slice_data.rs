@@ -47,8 +47,9 @@ use crate::cabac_ctx::{
     CabacContexts, NeighbourCtx, SliceKind, decode_end_of_slice_flag, decode_mb_skip_flag,
 };
 use crate::macroblock_layer::{
-    CabacNeighbourGrid, CavlcNcGrid, DpResidualReaders, EntropyState, Macroblock,
-    MacroblockLayerError, MbType, PcmSamples, parse_macroblock, parse_macroblock_dp,
+    CabacNeighbourGrid, CavlcNcGrid, ChunkPool, CoeffArena, DpResidualReaders, EntropyState,
+    Macroblock, MacroblockLayerError, MbType, MbView, PcmSamples, parse_macroblock,
+    parse_macroblock_dp,
 };
 use crate::mb_address::mbaff_pair_neighbour_addrs;
 use crate::pps::Pps;
@@ -121,6 +122,24 @@ pub struct SliceData {
     /// Final CurrMbAddr after the loop — i.e. `first_mb + len(macroblocks)`
     /// for single-slice-group streams.
     pub last_mb_addr: u32,
+    /// The residual blocks of every macroblock, back to back; each
+    /// macroblock's [`Macroblock::residual`] spans index into it.
+    pub coeffs: CoeffArena,
+}
+
+impl SliceData {
+    /// Macroblock `idx` with its residual lists.
+    #[inline]
+    pub fn mb(&self, idx: usize) -> MbView<'_> {
+        MbView::new(&self.macroblocks[idx], &self.coeffs)
+    }
+
+    /// Every macroblock with its residual lists, in slice order.
+    pub fn mbs(&self) -> impl Iterator<Item = MbView<'_>> {
+        self.macroblocks
+            .iter()
+            .map(|mb| MbView::new(mb, &self.coeffs))
+    }
 }
 
 /// Map [`SliceType`] to the CABAC [`SliceKind`].
@@ -159,6 +178,32 @@ pub fn parse_slice_data(
         slice_header,
         sps,
         pps,
+        None,
+    )
+}
+
+/// [`parse_slice_data`] with the slice's coefficient arena drawing its
+/// chunks from (and returning them to) `pool`, which the slices of one
+/// stream share.
+pub fn parse_slice_data_pooled(
+    rbsp: &[u8],
+    bit_cursor_bytes: usize,
+    bit_cursor_bits: u8,
+    slice_header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    pool: &std::sync::Arc<ChunkPool>,
+) -> SliceDataResult<SliceData> {
+    parse_slice_data_impl(
+        rbsp,
+        bit_cursor_bytes,
+        bit_cursor_bits,
+        None,
+        None,
+        slice_header,
+        sps,
+        pps,
+        Some(pool.clone()),
     )
 }
 
@@ -196,6 +241,7 @@ pub fn parse_slice_data_partitioned(
         slice_header,
         sps,
         pps,
+        None,
     )
 }
 
@@ -233,6 +279,7 @@ fn parse_slice_data_impl(
     slice_header: &SliceHeader,
     sps: &Sps,
     pps: &Pps,
+    pool: Option<std::sync::Arc<ChunkPool>>,
 ) -> SliceDataResult<SliceData> {
     // §7.3.4 — MbaffFrameFlag = mb_adaptive_frame_field_flag &&
     // !field_pic_flag. Phase 1: the walker steps in MB pairs and
@@ -259,6 +306,10 @@ fn parse_slice_data_impl(
     }
 
     let mut macroblocks: Vec<Macroblock> = Vec::new();
+    let mut coeffs = match pool {
+        Some(p) => CoeffArena::with_pool(p),
+        None => CoeffArena::default(),
+    };
     let mut mb_field_decoding_flags: Vec<bool> = Vec::new();
     let mut curr_mb_addr: u32 = slice_header.first_mb_in_slice * (1 + u32::from(mbaff_frame_flag));
     // §8.2.2 / §7.3.4 — FMO slice group map (round-453): NextMbAddress
@@ -636,6 +687,7 @@ fn parse_slice_data_impl(
                     pic_width_in_mbs: pic_w_mbs,
                     bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
                     bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8,
+                    coeffs: &mut coeffs,
                 };
                 let (byte, bit) = r.position();
                 let mb_result =
@@ -787,16 +839,7 @@ fn parse_slice_data_impl(
                             coded_block_pattern: 0,
                             transform_size_8x8_flag: false,
                             mb_qp_delta: 0,
-                            residual_luma: Vec::new(),
-                            residual_luma_dc: None,
-                            residual_chroma_dc_cb: Vec::new(),
-                            residual_chroma_dc_cr: Vec::new(),
-                            residual_chroma_ac_cb: Vec::new(),
-                            residual_chroma_ac_cr: Vec::new(),
-                            residual_cb_luma_like: Vec::new(),
-                            residual_cr_luma_like: Vec::new(),
-                            residual_cb_16x16_dc: None,
-                            residual_cr_16x16_dc: None,
+                            residual: crate::macroblock_layer::MbResidual::default(),
                             is_skip: false,
                         }
                     }
@@ -997,6 +1040,7 @@ fn parse_slice_data_impl(
                 pic_width_in_mbs: pic_w_mbs,
                 bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
                 bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8,
+                coeffs: &mut coeffs,
             };
             let (byte, bit) = r.position();
             let mb = parse_macroblock_dp(
@@ -1059,6 +1103,7 @@ fn parse_slice_data_impl(
         macroblocks,
         mb_field_decoding_flags,
         last_mb_addr: curr_mb_addr,
+        coeffs,
     })
 }
 
