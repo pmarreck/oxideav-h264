@@ -2059,7 +2059,10 @@ fn init_table() -> &'static [InitCell; NUM_CTX_IDX] {
 /// a slice, initialised once at slice start per §9.3.1.1.
 #[derive(Debug, Clone)]
 pub struct CabacContexts {
-    pub contexts: Vec<CtxState>,
+    /// Indexed by ctxIdx. A fixed-size array, so decoders that index it
+    /// many times per block can mask an index into range instead of
+    /// checking it.
+    pub contexts: Box<[CtxState; NUM_CTX_IDX]>,
     pub slice_kind: SliceKind,
 }
 
@@ -2076,13 +2079,12 @@ impl CabacContexts {
         slice_qp_y: i32,
     ) -> CabacResult<Self> {
         let table = init_table();
-        let mut ctx = vec![
-            CtxState {
+        let mut ctx = Box::new(
+            [CtxState {
                 state_idx: 0,
-                val_mps: 0
-            };
-            NUM_CTX_IDX
-        ];
+                val_mps: 0,
+            }; NUM_CTX_IDX],
+        );
         for (idx, cell) in table.iter().enumerate() {
             if let Some((m, n)) = cell.pick(slice_kind, cabac_init_idc) {
                 ctx[idx] = CtxState::init(m, n, slice_qp_y)?;
@@ -3513,6 +3515,263 @@ pub fn decode_coeff_abs_level_minus1(
 /// coeff_sign_flag — bypass bin (§9.3.3.2.3).
 pub fn decode_coeff_sign_flag(dec: &mut CabacDecoder<'_>) -> CabacResult<bool> {
     Ok(dec.decode_bypass()? == 1)
+}
+
+// ---------------------------------------------------------------------------
+// §7.3.5.3.3 — a whole residual block on a local copy of the engine.
+// ---------------------------------------------------------------------------
+
+/// ctxIdxInc by levelListIdx for blocks where it is levelListIdx itself
+/// (eq. 9-21).
+static INC_BY_INDEX: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        t[i] = i as u8;
+        i += 1;
+    }
+    t
+};
+
+/// eq. (9-22), chroma DC: Min(levelListIdx / NumC8x8, 2), for NumC8x8 = 1
+/// (4:2:0) and 2 (4:2:2).
+static INC_CHROMA_DC: [[u8; 64]; 2] = {
+    let mut t = [[0u8; 64]; 2];
+    let mut i = 0;
+    while i < 64 {
+        t[0][i] = if i < 2 { i as u8 } else { 2 };
+        t[1][i] = if i / 2 < 2 { (i / 2) as u8 } else { 2 };
+        i += 1;
+    }
+    t
+};
+
+/// Table 9-43 by column (significant_coeff_flag in frame macroblocks, in
+/// field macroblocks, then last_significant_coeff_flag), for ctxBlockCat 5,
+/// 9 and 13; the 64th position, which never codes either flag, is 0.
+static INC_8X8: [[u8; 64]; 3] = {
+    let mut t = [[0u8; 64]; 3];
+    let mut i = 0;
+    while i < 63 {
+        t[0][i] = TBL_9_43[i].0;
+        t[1][i] = TBL_9_43[i].1;
+        t[2][i] = TBL_9_43[i].2;
+        i += 1;
+    }
+    t
+};
+
+/// One residual block's context indices (Tables 9-34 and 9-40, §9.3.3.1.3),
+/// resolved once per block rather than once per bin.
+struct BlockCtx {
+    /// coded_block_flag's ctxIdxOffset plus ctxIdxBlockCatOffset.
+    cbf: usize,
+    /// The same for significant_coeff_flag, last_significant_coeff_flag and
+    /// coeff_abs_level_minus1.
+    sig: usize,
+    last: usize,
+    abs: usize,
+    /// ctxIdxInc of significant_coeff_flag and last_significant_coeff_flag
+    /// by levelListIdx.
+    sig_inc: &'static [u8; 64],
+    last_inc: &'static [u8; 64],
+    /// eq. (9-24): the most numDecodAbsLevelGt1 adds to ctxIdxInc 5,
+    /// 4 - (ctxBlockCat == 3 ? 1 : 0).
+    gt1_cap: u32,
+}
+
+impl BlockCtx {
+    fn new(block_type: BlockType, field: bool, chroma_422: bool) -> Self {
+        let sig_cat = block_type.sig_block_cat_offset() as usize;
+        let (sig_inc, last_inc, gt1_cap) = match block_type.ctx_block_cat() {
+            3 => {
+                let t = &INC_CHROMA_DC[usize::from(chroma_422)];
+                (t, t, 3)
+            }
+            5 | 9 | 13 => (&INC_8X8[usize::from(field)], &INC_8X8[2], 4),
+            _ => (&INC_BY_INDEX, &INC_BY_INDEX, 4),
+        };
+        Self {
+            cbf: (block_type.cbf_ctx_offset() + block_type.cbf_block_cat_offset()) as usize,
+            sig: block_type.sig_coef_ctx_offset(field) as usize + sig_cat,
+            last: block_type.last_coef_ctx_offset(field) as usize + sig_cat,
+            abs: (block_type.abs_level_ctx_offset() + block_type.lvl_block_cat_offset()) as usize,
+            sig_inc,
+            last_inc,
+            gt1_cap,
+        }
+    }
+}
+
+/// Whether a CABAC trace (`OXIDEAV_H264_BIN_TRACE` or
+/// `OXIDEAV_H264_CABAC_DEBUG`) is on, so residual blocks must be decoded
+/// element by element to emit its lines rather than by
+/// [`decode_residual_block`].
+pub(crate) fn residual_trace_on() -> bool {
+    dbg_enabled() || CabacDecoder::bin_trace_on()
+}
+
+/// The context at `idx`. Every index a residual block derives is within
+/// the table (the largest is coded_block_flag's 1012 + 8 + 3); the mask
+/// keeps that without a bounds check per bin.
+#[inline(always)]
+fn ctx_at(ctxs: &mut [CtxState; NUM_CTX_IDX], idx: usize) -> &mut CtxState {
+    &mut ctxs[idx & (NUM_CTX_IDX - 1)]
+}
+
+/// §7.3.5.3.3 residual_block_cabac for a block of `num_coeff` levels
+/// (endIdx - startIdx + 1 with startIdx 0, at most 64): the bins, context
+/// updates and levels of decoding it element by element with
+/// [`decode_coded_block_flag`], [`decode_significant_coeff_flag`],
+/// [`decode_last_significant_coeff_flag`], [`decode_coeff_abs_level_minus1`]
+/// and [`decode_coeff_sign_flag`], without their trace lines; callers use
+/// those when a trace is on.
+///
+/// The block runs on a local copy of the engine written back at the end,
+/// so codIRange and codIOffset stay in registers from bin to bin, and the
+/// context indices come from per-category tables resolved once.
+///
+/// `cbf_inc` is coded_block_flag's ctxIdxInc (§9.3.3.1.1.9), or `None` when
+/// the flag is not coded and inferred to be 1. `chroma_422` selects NumC8x8
+/// = 2 for chroma DC (eq. 9-22). Levels are written to `out[..num_coeff]`,
+/// which the caller has zeroed. Returns coded_block_flag.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_residual_block(
+    dec: &mut CabacDecoder<'_>,
+    ctxs: &mut CabacContexts,
+    block_type: BlockType,
+    field: bool,
+    chroma_422: bool,
+    cbf_inc: Option<u32>,
+    num_coeff: usize,
+    out: &mut [i32],
+) -> CabacResult<bool> {
+    let bc = BlockCtx::new(block_type, field, chroma_422);
+    let mut engine = dec.clone();
+    let coded = residual_block_bins(
+        &mut engine,
+        &mut ctxs.contexts,
+        &bc,
+        cbf_inc,
+        num_coeff.clamp(1, 64),
+        out,
+    );
+    *dec = engine;
+    coded
+}
+
+/// The bins of [`decode_residual_block`], on the engine copy `e`.
+#[inline(always)]
+fn residual_block_bins(
+    e: &mut CabacDecoder<'_>,
+    ctxs: &mut [CtxState; NUM_CTX_IDX],
+    bc: &BlockCtx,
+    cbf_inc: Option<u32>,
+    num_coeff: usize,
+    out: &mut [i32],
+) -> CabacResult<bool> {
+    if let Some(inc) = cbf_inc
+        && e.decide(ctx_at(ctxs, bc.cbf + inc as usize))? == 0
+    {
+        return Ok(false);
+    }
+    let out = &mut out[..num_coeff];
+
+    // Significance map, forward: the scan positions of the significant
+    // levels, in order. The last position is significant without a flag
+    // when no last_significant_coeff_flag came before it.
+    let mut sig_pos = [0u8; 64];
+    let mut n = 0usize;
+    let last_idx = num_coeff - 1;
+    let mut i = 0usize;
+    loop {
+        if i >= last_idx {
+            sig_pos[n & 63] = last_idx as u8;
+            n += 1;
+            break;
+        }
+        let sig_ctx = bc.sig + usize::from(bc.sig_inc[i & 63]);
+        if e.decide(ctx_at(ctxs, sig_ctx))? != 0 {
+            sig_pos[n & 63] = i as u8;
+            n += 1;
+            let last_ctx = bc.last + usize::from(bc.last_inc[i & 63]);
+            if e.decide(ctx_at(ctxs, last_ctx))? != 0 {
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    // Levels, in reverse scan order (§9.3.3.1.3 eq. 9-23 and 9-24 count the
+    // levels decoded so far equal to 1 and greater than 1).
+    let mut num_eq1: u32 = 0;
+    let mut num_gt1: u32 = 0;
+    for &pos in sig_pos[..n.min(64)].iter().rev() {
+        let inc0 = if num_gt1 != 0 {
+            0
+        } else {
+            core::cmp::min(4, 1 + num_eq1)
+        };
+        let mut abs_m1: u32 = 0;
+        if e.decide(ctx_at(ctxs, bc.abs + inc0 as usize))? != 0 {
+            abs_m1 = level_prefix_rest(e, ctxs, bc.abs + 5 + num_gt1.min(bc.gt1_cap) as usize)?;
+            if abs_m1 == 14 {
+                abs_m1 += level_suffix(e)?;
+            }
+            num_gt1 += 1;
+        } else {
+            num_eq1 += 1;
+        }
+        let negative = e.bypass_bin()? != 0;
+        let level = (abs_m1 + 1) as i32;
+        out[usize::from(pos)] = if negative { -level } else { level };
+    }
+    Ok(true)
+}
+
+/// coeff_abs_level_minus1's TU prefix (cMax 14, §9.3.2.3) after a first bin
+/// of 1: the prefix value, 1..=14. Every one of these bins uses the context
+/// at `ctx_idx`, held in a register across them.
+#[inline(always)]
+fn level_prefix_rest(
+    e: &mut CabacDecoder<'_>,
+    ctxs: &mut [CtxState; NUM_CTX_IDX],
+    ctx_idx: usize,
+) -> CabacResult<u32> {
+    let slot = ctx_at(ctxs, ctx_idx);
+    let mut ctx = *slot;
+    let mut prefix: u32 = 1;
+    let result = loop {
+        if prefix == 14 {
+            break Ok(prefix);
+        }
+        match e.decide(&mut ctx) {
+            Ok(0) => break Ok(prefix),
+            Ok(_) => prefix += 1,
+            Err(err) => break Err(err),
+        }
+    };
+    *slot = ctx;
+    result
+}
+
+/// coeff_abs_level_minus1's suffix (§9.3.2.3, UEG0 with uCoff 14): a 0th
+/// order Exp-Golomb code in bypass bins, with the escape bounded as in
+/// [`decode_coeff_abs_level_minus1`].
+#[inline(always)]
+fn level_suffix(e: &mut CabacDecoder<'_>) -> CabacResult<u32> {
+    let mut k: u32 = 0;
+    while e.bypass_bin()? != 0 {
+        if k >= 21 {
+            return Err(CabacError::EgEscapeSuffixOverflow);
+        }
+        k += 1;
+    }
+    let mut tail: u32 = 0;
+    for _ in 0..k {
+        tail = (tail << 1) | u32::from(e.bypass_bin()?);
+    }
+    Ok((1u32 << k) - 1 + tail)
 }
 
 /// end_of_slice_flag — terminate bin (§9.3.3.2.4).

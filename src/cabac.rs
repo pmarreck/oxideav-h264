@@ -278,6 +278,12 @@ pub fn validate_init_idc(init_idc: Option<u32>) -> CabacResult<Option<u32>> {
 /// the 10-bit register precision required by the spec (§9.3.1.2 NOTE —
 /// 9 bits suffice for DecodeDecision/DecodeTerminate, 10 bits for
 /// DecodeBypass because of the doubling step).
+///
+/// It is `Clone` so a decoder of many bins in a row (a residual block) can
+/// run them on a local copy and write it back once: the engine's registers
+/// then stay in machine registers across bins instead of being stored and
+/// reloaded through the reference for every bin.
+#[derive(Clone)]
 pub struct CabacDecoder<'a> {
     /// §9.3.1.2 — `codIRange`, initialised to 510.
     cod_i_range: u32,
@@ -307,6 +313,28 @@ pub struct CabacDecoder<'a> {
 /// Stream bits loaded ahead of `codIOffset` at most: `codIOffset` needs 10
 /// bits (§9.3.1.2 NOTE, the bypass doubling), so `window` stays within 64.
 const MAX_AHEAD: u32 = 48;
+
+/// `window` and `ahead` with whole bytes of `data` from `next_byte` loaded
+/// below `codIOffset` while they fit, and the next byte to load. By value, so
+/// a decoder working on a local copy of the engine keeps the copy in
+/// registers when this is not inlined.
+#[inline]
+fn refilled(
+    data: &[u8],
+    mut window: u64,
+    mut ahead: u32,
+    mut next_byte: usize,
+) -> (u64, u32, usize) {
+    while ahead <= MAX_AHEAD - 8 {
+        let Some(&byte) = data.get(next_byte) else {
+            break;
+        };
+        window = (window << 8) | u64::from(byte);
+        next_byte += 1;
+        ahead += 8;
+    }
+    (window, ahead, next_byte)
+}
 
 impl<'a> core::fmt::Debug for CabacDecoder<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -356,22 +384,16 @@ impl<'a> CabacDecoder<'a> {
     }
 
     /// Loads whole bytes below `codIOffset` while they fit.
-    #[inline]
+    #[inline(always)]
     fn refill(&mut self) {
-        while self.ahead <= MAX_AHEAD - 8 {
-            let Some(&byte) = self.data.get(self.next_byte) else {
-                break;
-            };
-            self.window = (self.window << 8) | u64::from(byte);
-            self.next_byte += 1;
-            self.ahead += 8;
-        }
+        (self.window, self.ahead, self.next_byte) =
+            refilled(self.data, self.window, self.ahead, self.next_byte);
     }
 
     /// `codIOffset = (codIOffset << bits) | read_bits(bits)`, the reads of
     /// §9.3.3.2.2 and §9.3.3.2.3. Fails with `Eof`, changing nothing, when
     /// fewer than `bits` bits are left, as `BitReader::u` does.
-    #[inline]
+    #[inline(always)]
     fn read_into_offset(&mut self, bits: u32) -> CabacResult<()> {
         if self.ahead < bits {
             self.refill();
@@ -455,6 +477,31 @@ impl<'a> CabacDecoder<'a> {
             return self.decode_decision_traced(ctx);
         }
         self.decision(ctx)
+    }
+
+    /// Whether `OXIDEAV_H264_BIN_TRACE` is set. Callers of [`Self::decide`]
+    /// and [`Self::bypass_bin`] check it once and take a path through the
+    /// traced entry points instead when it is.
+    #[inline]
+    pub(crate) fn bin_trace_on() -> bool {
+        bin_trace_enabled()
+    }
+
+    /// DecodeDecision (§9.3.3.2.1) without the trace check, always inlined:
+    /// for loops that decode many bins on a local copy of the engine (see
+    /// the type's documentation), where an out-of-line call would put the
+    /// copy back in memory. Equal to [`Self::decode_decision`] with the trace
+    /// off.
+    #[inline(always)]
+    pub(crate) fn decide(&mut self, ctx: &mut CtxState) -> CabacResult<u8> {
+        self.decision(ctx)
+    }
+
+    /// DecodeBypass (§9.3.3.2.3) without the trace check, always inlined, as
+    /// [`Self::decide`] is for DecodeDecision.
+    #[inline(always)]
+    pub(crate) fn bypass_bin(&mut self) -> CabacResult<u8> {
+        self.bypass()
     }
 
     /// [`Self::decode_decision`] with its per-bin trace line, kept out of

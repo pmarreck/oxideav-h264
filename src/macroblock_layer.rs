@@ -46,7 +46,8 @@ use crate::cabac_ctx::{
     decode_intra_chroma_pred_mode, decode_last_significant_coeff_flag, decode_mb_qp_delta,
     decode_mb_type_b, decode_mb_type_i, decode_mb_type_p, decode_mvd_lx,
     decode_prev_intra_pred_mode_flag, decode_ref_idx_lx, decode_rem_intra_pred_mode,
-    decode_significant_coeff_flag, decode_transform_size_8x8_flag,
+    decode_residual_block, decode_significant_coeff_flag, decode_transform_size_8x8_flag,
+    residual_trace_on,
 };
 use crate::cavlc::{CavlcError, CoeffTokenContext, parse_residual_block_cavlc};
 use crate::mv_deriv::{NeighbourSource, neighbour_4x4_map};
@@ -4953,6 +4954,89 @@ fn parse_residual_block_cabac(
     // `endIdx - startIdx + 1` entries (at most 64) are written.
     out: &mut [i32],
 ) -> McblResult<bool> {
+    // With a trace on, element by element, to emit its lines; otherwise the
+    // whole block in one pass on a local copy of the engine, decoding the
+    // same bins.
+    if residual_trace_on() {
+        return parse_residual_block_cabac_by_element(
+            cabac,
+            ctxs,
+            block_type,
+            start_idx,
+            end_idx,
+            max_num_coeff,
+            chroma_array_type,
+            neighbour_cbf_left,
+            neighbour_cbf_above,
+            field,
+            out,
+        );
+    }
+    parse_residual_block_cabac_one_pass(
+        cabac,
+        ctxs,
+        block_type,
+        start_idx,
+        end_idx,
+        max_num_coeff,
+        chroma_array_type,
+        neighbour_cbf_left,
+        neighbour_cbf_above,
+        field,
+        out,
+    )
+}
+
+/// [`parse_residual_block_cabac`] in one pass on a local copy of the engine
+/// ([`decode_residual_block`]), without trace lines.
+#[allow(clippy::too_many_arguments)]
+fn parse_residual_block_cabac_one_pass(
+    cabac: &mut CabacDecoder<'_>,
+    ctxs: &mut CabacContexts,
+    block_type: BlockType,
+    start_idx: u32,
+    end_idx: u32,
+    max_num_coeff: u32,
+    chroma_array_type: u32,
+    neighbour_cbf_left: Option<bool>,
+    neighbour_cbf_above: Option<bool>,
+    field: bool,
+    out: &mut [i32],
+) -> McblResult<bool> {
+    // §7.3.5.3.3 — coded_block_flag is inferred for 8x8 blocks outside 4:4:4.
+    let code_cbf = max_num_coeff != 64 || chroma_array_type == 3;
+    let cbf_inc = code_cbf.then(|| {
+        u32::from(neighbour_cbf_left.unwrap_or(false))
+            + 2 * u32::from(neighbour_cbf_above.unwrap_or(false))
+    });
+    Ok(decode_residual_block(
+        cabac,
+        ctxs,
+        block_type,
+        field,
+        chroma_array_type == 2,
+        cbf_inc,
+        (end_idx - start_idx + 1) as usize,
+        out,
+    )?)
+}
+
+/// [`parse_residual_block_cabac`] one syntax element at a time through the
+/// per-element decoders, which emit the CABAC trace lines.
+#[allow(clippy::too_many_arguments)]
+fn parse_residual_block_cabac_by_element(
+    cabac: &mut CabacDecoder<'_>,
+    ctxs: &mut CabacContexts,
+    block_type: BlockType,
+    start_idx: u32,
+    end_idx: u32,
+    max_num_coeff: u32,
+    chroma_array_type: u32,
+    neighbour_cbf_left: Option<bool>,
+    neighbour_cbf_above: Option<bool>,
+    field: bool,
+    out: &mut [i32],
+) -> McblResult<bool> {
     // Residual blocks hold at most 64 coefficients (§7.3.5.3.3).
     let len = ((end_idx - start_idx + 1) as usize).min(64);
     let out = &mut out[..len];
@@ -8393,5 +8477,352 @@ mod arena_tests {
         }
         drop(c);
         assert_eq!(pool.spare_chunks(), SlicePool::MAX_SPARE_CHUNKS);
+    }
+}
+
+#[cfg(test)]
+mod cabac_residual_block_tests {
+    //! [`parse_residual_block_cabac_one_pass`] against
+    //! [`parse_residual_block_cabac_by_element`], the walk through the
+    //! per-element decoders: the same coded flag, levels, error, context
+    //! states and engine state, for every block category and shape, on random
+    //! streams with random context states and on encoded blocks.
+    use super::*;
+    use crate::cabac::CtxState;
+    use crate::cabac_ctx::SliceKind;
+    use crate::encoder::cabac_engine::CabacEncoder;
+    use crate::encoder::cabac_syntax::encode_residual_block_cabac_field;
+
+    const BLOCK_TYPES: [BlockType; 14] = [
+        BlockType::Luma16x16Dc,
+        BlockType::Luma16x16Ac,
+        BlockType::Luma4x4,
+        BlockType::ChromaDc,
+        BlockType::ChromaAc,
+        BlockType::Luma8x8,
+        BlockType::CbIntra16x16Dc,
+        BlockType::CbIntra16x16Ac,
+        BlockType::CbLuma4x4,
+        BlockType::Cb8x8,
+        BlockType::CrIntra16x16Dc,
+        BlockType::CrIntra16x16Ac,
+        BlockType::CrLuma4x4,
+        BlockType::Cr8x8,
+    ];
+
+    /// The block lengths callers pass: chroma DC at 4:2:0 and 4:2:2, AC,
+    /// 4x4 and 8x8 blocks.
+    const LENGTHS: [u32; 5] = [4, 8, 15, 16, 64];
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            // xorshift64*
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    struct Outcome {
+        result: McblResult<bool>,
+        levels: [i32; 64],
+        contexts: Vec<CtxState>,
+        engine: ((usize, u8), u32, u32, u64),
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        one_pass: bool,
+        data: &[u8],
+        ctxs: &CabacContexts,
+        block_type: BlockType,
+        num_coeff: u32,
+        chroma_array_type: u32,
+        cbf_neighbors: (Option<bool>, Option<bool>),
+        field: bool,
+    ) -> Option<Outcome> {
+        let mut dec = CabacDecoder::new(BitReader::new(data)).ok()?;
+        let mut ctxs = ctxs.clone();
+        let mut levels = [0i32; 64];
+        let parse = if one_pass {
+            parse_residual_block_cabac_one_pass
+        } else {
+            parse_residual_block_cabac_by_element
+        };
+        let result = parse(
+            &mut dec,
+            &mut ctxs,
+            block_type,
+            0,
+            num_coeff - 1,
+            num_coeff,
+            chroma_array_type,
+            cbf_neighbors.0,
+            cbf_neighbors.1,
+            field,
+            &mut levels,
+        );
+        Some(Outcome {
+            result,
+            levels,
+            contexts: ctxs.contexts.to_vec(),
+            engine: (
+                dec.position(),
+                dec.debug_range(),
+                dec.debug_offset(),
+                dec.bin_count(),
+            ),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_same(
+        data: &[u8],
+        ctxs: &CabacContexts,
+        block_type: BlockType,
+        num_coeff: u32,
+        chroma_array_type: u32,
+        cbf_neighbors: (Option<bool>, Option<bool>),
+        field: bool,
+    ) -> Option<McblResult<bool>> {
+        let args = (
+            block_type,
+            num_coeff,
+            chroma_array_type,
+            cbf_neighbors,
+            field,
+        );
+        let a = run(
+            true,
+            data,
+            ctxs,
+            block_type,
+            num_coeff,
+            chroma_array_type,
+            cbf_neighbors,
+            field,
+        )?;
+        let b = run(
+            false,
+            data,
+            ctxs,
+            block_type,
+            num_coeff,
+            chroma_array_type,
+            cbf_neighbors,
+            field,
+        )?;
+        assert_eq!(a.result, b.result, "result for {args:?} on {data:02x?}");
+        assert_eq!(a.levels, b.levels, "levels for {args:?} on {data:02x?}");
+        assert_eq!(
+            a.engine, b.engine,
+            "engine state for {args:?} on {data:02x?}"
+        );
+        assert!(
+            a.contexts == b.contexts,
+            "context states for {args:?} on {data:02x?}"
+        );
+        Some(a.result)
+    }
+
+    fn random_contexts(rng: &mut Rng) -> CabacContexts {
+        let mut ctxs = CabacContexts::init(SliceKind::I, None, 26).unwrap();
+        for c in ctxs.contexts.iter_mut() {
+            *c = CtxState {
+                state_idx: rng.below(63) as u8,
+                val_mps: rng.below(2) as u8,
+            };
+        }
+        ctxs
+    }
+
+    #[test]
+    fn one_pass_matches_element_walk_on_random_streams() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let (mut ok, mut errors, mut coded) = (0u32, 0u32, 0u32);
+        for &block_type in &BLOCK_TYPES {
+            for &num_coeff in &LENGTHS {
+                for chroma_array_type in 1..=3u32 {
+                    for field in [false, true] {
+                        for trial in 0..12 {
+                            let ctxs = random_contexts(&mut rng);
+                            // Short streams run out mid-block (Eof); long
+                            // ones finish it.
+                            let len = if trial % 3 == 0 {
+                                2 + rng.below(4) as usize
+                            } else {
+                                8 + rng.below(120) as usize
+                            };
+                            let data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+                            let neighbors = match rng.below(3) {
+                                0 => (None, None),
+                                _ => (Some(rng.below(2) == 1), Some(rng.below(2) == 1)),
+                            };
+                            match assert_same(
+                                &data,
+                                &ctxs,
+                                block_type,
+                                num_coeff,
+                                chroma_array_type,
+                                neighbors,
+                                field,
+                            ) {
+                                Some(Ok(c)) => {
+                                    ok += 1;
+                                    coded += u32::from(c);
+                                }
+                                Some(Err(_)) => errors += 1,
+                                None => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The streams reach both outcomes, and coded blocks among the
+        // successes.
+        assert!(
+            ok > 1000 && errors > 100 && coded > 500,
+            "{ok} {errors} {coded}"
+        );
+    }
+
+    /// A level of each size class, up to the escape suffix's longest codes.
+    fn random_level(rng: &mut Rng) -> i32 {
+        // A level L has an escape suffix of k leading ones for
+        // 2^k - 1 <= L - 15 < 2^(k+1) - 1 (UEG0 with uCoff 14).
+        let magnitude = match rng.below(11) {
+            0..=3 => 1,
+            4 => 2 + rng.below(13) as i32,
+            5 => 15 + rng.below(20) as i32,
+            6 => 35 + rng.below(4000) as i32,
+            7 => 1 << (12 + rng.below(9)),
+            // k = 20 with every tail bit set.
+            8 => (1 << 21) + 13,
+            // k = 21, the longest escape accepted, with no tail bit and
+            // with every tail bit set.
+            9 => (1 << 21) + 14,
+            _ => (1 << 22) + 13,
+        };
+        if rng.below(2) == 1 {
+            -magnitude
+        } else {
+            magnitude
+        }
+    }
+
+    #[test]
+    fn one_pass_decodes_encoded_blocks() {
+        let mut rng = Rng(0x0123_4567_89AB_CDEF);
+        for &block_type in &BLOCK_TYPES {
+            for &num_coeff in &LENGTHS {
+                for chroma_array_type in 1..=3u32 {
+                    for field in [false, true] {
+                        for _ in 0..4 {
+                            let mut coeffs = vec![0i32; num_coeff as usize];
+                            let density = 1 + rng.below(4);
+                            for c in coeffs.iter_mut() {
+                                if rng.below(4) < density {
+                                    *c = random_level(&mut rng);
+                                }
+                            }
+                            let skip_cbf = num_coeff == 64 && chroma_array_type != 3;
+                            if skip_cbf && coeffs.iter().all(|&c| c == 0) {
+                                coeffs[0] = 1;
+                            }
+                            let num_c8x8 = if chroma_array_type == 2 { 2 } else { 1 };
+                            let neighbors = (Some(rng.below(2) == 1), Some(rng.below(2) == 1));
+                            let ctxs = CabacContexts::init(SliceKind::I, None, 30).unwrap();
+                            let mut enc_ctxs = ctxs.clone();
+                            let mut enc = CabacEncoder::new();
+                            encode_residual_block_cabac_field(
+                                &mut enc,
+                                &mut enc_ctxs,
+                                block_type,
+                                &coeffs,
+                                num_coeff,
+                                neighbors.0,
+                                neighbors.1,
+                                skip_cbf,
+                                num_c8x8,
+                                field,
+                            );
+                            enc.encode_terminate(1);
+                            let bytes = enc.finish_no_trailing();
+                            let coded = assert_same(
+                                &bytes,
+                                &ctxs,
+                                block_type,
+                                num_coeff,
+                                chroma_array_type,
+                                neighbors,
+                                field,
+                            )
+                            .expect("an encoded block starts a stream")
+                            .expect("an encoded block decodes");
+                            assert_eq!(coded, coeffs.iter().any(|&c| c != 0));
+                            let out = run(
+                                true,
+                                &bytes,
+                                &ctxs,
+                                block_type,
+                                num_coeff,
+                                chroma_array_type,
+                                neighbors,
+                                field,
+                            )
+                            .unwrap();
+                            assert_eq!(&out.levels[..num_coeff as usize], &coeffs[..]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_pass_rejects_an_escape_past_21_ones_like_the_element_walk() {
+        // L - 15 = 2^22 - 1 needs 22 leading ones.
+        let mut coeffs = [0i32; 16];
+        coeffs[3] = (1 << 22) + 14;
+        let ctxs = CabacContexts::init(SliceKind::I, None, 30).unwrap();
+        let mut enc_ctxs = ctxs.clone();
+        let mut enc = CabacEncoder::new();
+        encode_residual_block_cabac_field(
+            &mut enc,
+            &mut enc_ctxs,
+            BlockType::Luma4x4,
+            &coeffs,
+            16,
+            Some(true),
+            Some(false),
+            false,
+            1,
+            false,
+        );
+        enc.encode_terminate(1);
+        let bytes = enc.finish_no_trailing();
+        let result = assert_same(
+            &bytes,
+            &ctxs,
+            BlockType::Luma4x4,
+            16,
+            1,
+            (Some(true), Some(false)),
+            false,
+        );
+        assert_eq!(
+            result,
+            Some(Err(MacroblockLayerError::Cabac(
+                CabacError::EgEscapeSuffixOverflow
+            )))
+        );
     }
 }
