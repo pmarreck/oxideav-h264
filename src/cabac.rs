@@ -254,6 +254,20 @@ static TRANS_CTX: [u8; 256] = {
     t
 };
 
+/// RenormD's doublings (§9.3.3.2.2, Figure 9-4) by `codIRange`: entry `r` is
+/// how many times `r` doubles before it reaches 256 (0 from 256 up), the
+/// leading zeros of `r` in 9 bits. A lookup, where counting leading zeros
+/// takes a slow bit scan on the x86-64-v2 baseline (no `lzcnt`).
+static RENORM_SHIFT: [u8; 512] = {
+    let mut t = [0u8; 512];
+    let mut r = 0;
+    while r < 512 {
+        t[r] = (r as u32).leading_zeros().saturating_sub(23) as u8;
+        r += 1;
+    }
+    t
+};
+
 /// One context model, `(pStateIdx, valMPS)` per §9.3.1.1, packed in one
 /// byte as `pStateIdx << 1 | valMPS`: a decision loads it once, steps both
 /// fields with one lookup in [`TRANS_CTX`] and stores it once, and finds
@@ -745,12 +759,12 @@ impl<'a> CabacDecoder<'a> {
     ///       codIOffset  = (codIOffset << 1) | read_bits(1)
     #[inline(always)]
     fn renorm_d(&mut self) -> CabacResult<()> {
-        // §9.3.3.2.2 — the doubling loop of Figure 9-6, all at once:
+        // §9.3.3.2.2 — the doubling loop of Figure 9-4, all at once:
         // `codIRange` (≥ 2 here) needs `shift` doublings to reach 256,
-        // consuming one bit per doubling.
-        // From 256 up no doubling is needed (`leading_zeros` is at most 23),
-        // and a read of no bits changes nothing.
-        let shift = self.cod_i_range.leading_zeros().saturating_sub(23);
+        // consuming one bit per doubling. From 256 up no doubling is needed,
+        // and a read of no bits changes nothing. `codIRange` stays below 512
+        // (§9.3.1.2 NOTE), so the mask only spares the table its bounds check.
+        let shift = u32::from(RENORM_SHIFT[(self.cod_i_range & 511) as usize]);
         self.cod_i_range <<= shift;
         self.read_into_offset(shift)
     }
@@ -987,6 +1001,21 @@ mod tests {
                     "LPS from {state_idx},{val_mps}"
                 );
             }
+        }
+    }
+
+    /// RenormD's shift by lookup is Figure 9-4's doubling loop for every
+    /// `codIRange` a decision or terminate bin can leave (1..=510; the
+    /// table's 0 and 511 entries are never reached).
+    #[test]
+    fn renorm_shift_table_matches_the_doubling_loop() {
+        for range in 1..=510u32 {
+            let (mut r, mut doublings) = (range, 0u8);
+            while r < 256 {
+                r <<= 1;
+                doublings += 1;
+            }
+            assert_eq!(RENORM_SHIFT[range as usize], doublings, "codIRange {range}");
         }
     }
 
