@@ -1820,6 +1820,71 @@ mod tests {
         assert_eq!(out, [1i32; 64]);
     }
 
+    /// Rows 0, 3, 4 and 7 of an 8x8 residual hold `a`, rows 1, 2, 5 and
+    /// 6 hold `b`: the shape a lone vertical-frequency-4 term gives.
+    fn rows_0347_vs_1256(a: i32, b: i32) -> [i32; 64] {
+        let mut r = [0i32; 64];
+        for (k, v) in r.iter_mut().enumerate() {
+            *v = if matches!(k / 8, 0 | 3 | 4 | 7) { a } else { b };
+        }
+        r
+    }
+
+    #[test]
+    fn inverse_transform_8x8_keeps_out_of_range_scaled_coefficients_exact() {
+        // §8.5.13.1 forbids any d_ij outside -2^(7+bitDepth) ..
+        // 2^(7+bitDepth)-1 (-32768..32767 at 8 bits), so a stream that
+        // produces one is not conforming and its output is not
+        // specified. The decoder computes eqs. 8-357..8-406 exactly
+        // (in i32) instead of truncating to 16 bits (one reference
+        // decoder truncates, its C and SIMD paths at different stages,
+        // so its output here depends on the CPU). The fuzzed
+        // stream tests/fixtures/fuzz_regressions/crash-3e4b987a... carries
+        // this very level.
+        //
+        // qP = 25: qP/6 = 4, qP%6 = 1. LevelScale8x8(1, 4, 0) =
+        // 16 * normAdjust8x8(1, 4, 0) = 16 * v_1,0 = 16 * 22 = 352 (eqs.
+        // 8-316..8-318).
+        //   d_40 = (23457 * 352 + 2^1) >> 2 = 8_256_866 >> 2 = 2_064_216 = D.
+        // Row 4 transforms to g_4j = D for every j (e_40 = e_42 = D, then
+        // f_0 = f_2 = f_4 = f_6 = D); each column then has only g_4j = D:
+        // h_0 = D, h_2 = -D, k_0 = k_6 = D, k_2 = k_4 = -D, so
+        // m_0 = m_3 = m_4 = m_7 = D and m_1 = m_2 = m_5 = m_6 = -D.
+        //   r = (D + 32) >> 6 = 32_253 and (-D + 32) >> 6 = -32_253.
+        // Storing d in 16 bits instead would give d_40 = 32_600 and
+        // r = +-509.
+        let mut coeffs = [0i32; 64];
+        coeffs[4 * 8] = 23457;
+        let sl = default_scaling_list_8x8_flat();
+        let out = inverse_transform_8x8(&coeffs, 25, &sl, 8).unwrap();
+        assert_eq!(out, rows_0347_vs_1256(32_253, -32_253));
+    }
+
+    #[test]
+    fn inverse_transform_8x8_keeps_column_stage_overflow_exact() {
+        // §8.5.13.2 forbids h_ij and k_ij outside -32768..32767 and m_ij
+        // outside -32768..32735 at 8 bits. Here every d_ij is in range
+        // but the column stage is not (the shape of the second fuzzed
+        // stream, tests/fixtures/fuzz_regressions/crash-1b14ead3...); the
+        // decoder still computes exactly.
+        //
+        // qP = 36: qP/6 = 6, eq. 8-356 shifts by 0. LevelScale8x8(0, 0, 0)
+        // = LevelScale8x8(0, 4, 0) = 16 * 20 = 320, so c_00 = c_40 = 100
+        // give d_00 = d_40 = 32_000 (in range). Rows 0 and 4 transform to
+        // g_0j = g_4j = 32_000. Each column: h_0 = 64_000 (out of range),
+        // h_2 = 0, so k_0 = k_6 = 64_000, k_2 = k_4 = 0, and
+        // m_0 = m_3 = m_4 = m_7 = 64_000, the other rows 0.
+        //   r = (64_000 + 32) >> 6 = 1_000 and (0 + 32) >> 6 = 0.
+        // Wrapping the column stage to 16 bits would give
+        // (-1_536 + 32) >> 6 = -24 instead of 1_000.
+        let mut coeffs = [0i32; 64];
+        coeffs[0] = 100;
+        coeffs[4 * 8] = 100;
+        let sl = default_scaling_list_8x8_flat();
+        let out = inverse_transform_8x8(&coeffs, 36, &sl, 8).unwrap();
+        assert_eq!(out, rows_0347_vs_1256(1_000, 0));
+    }
+
     // ------------ 16x16 luma DC Hadamard (§8.5.10) ----------------------
 
     #[test]

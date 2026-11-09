@@ -562,3 +562,120 @@ fn fuzz_crash_1743a9ce_poc_eq_8_5_frame_branch_overflow_does_not_panic() {
     // and tears the process down with `attempt to add with overflow`,
     // which would fail the test before reaching this line.
 }
+
+/// Decode one Annex B input the way the oracle harness feeds it (one
+/// packet, flush, drain) and return the single frame packed as 8-bit
+/// planar YUV, plus `decode_error_count()`.
+fn decode_one_frame_packed(data: &[u8]) -> (Vec<u8>, u64) {
+    let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+    let pkt = Packet::new(0, TimeBase::new(1, 30), data.to_vec());
+    dec.send_packet(&pkt).expect("send_packet");
+    dec.flush().expect("flush");
+    let mut frames = Vec::new();
+    while let Ok(Frame::Video(v)) = dec.receive_frame() {
+        frames.push(v);
+    }
+    assert_eq!(frames.len(), 1, "expected exactly one frame");
+    let mut out = Vec::new();
+    for (p, plane) in frames[0].planes.iter().enumerate() {
+        // 96x64 4:2:0, 8-bit, tightly packed rows.
+        let (w, h) = if p == 0 { (96, 64) } else { (48, 32) };
+        assert_eq!(plane.stride, w, "plane {p} stride");
+        out.extend_from_slice(&plane.data[..w * h]);
+    }
+    (out, dec.decode_error_count())
+}
+
+/// Index of the first differing byte, for a readable failure message.
+fn first_mismatch(got: &[u8], want: &[u8]) -> Option<(usize, u8, u8)> {
+    got.iter()
+        .zip(want)
+        .enumerate()
+        .find(|(_, (g, w))| g != w)
+        .map(|(i, (g, w))| (i, *g, *w))
+}
+
+/// Crashes `3e4b987a…` (1323 bytes) and `1b14ead3…` (1893 bytes), found
+/// by the oracle in November 2026: fuzzed 96x64 High-profile I frames
+/// whose decode differed from libavcodec's in one Intra 8x8 block each,
+/// with samples at 255 where libavcodec had 0.
+///
+/// Neither stream conforms. In `3e4b987a…`, macroblock 22's 8x8 block 2
+/// carries c_40 = 23457 at QP'Y 25, which scales (eq. 8-357) to
+/// d_40 = 2 064 216, against the §8.5.13.1 limit of 2^15 - 1 for 8-bit
+/// samples. In `1b14ead3…`, macroblock 17's block 2 (QP'Y 28, the
+/// default Intra 8x8 scaling matrix) keeps every d_ij in range, but its
+/// column transform reaches h = 34 987, k = 35 472 and m = 37 593,
+/// against §8.5.13.2's limits of 2^15 - 1 for h and k and 2^15 - 33 for
+/// m. The standard specifies no output for such streams (§7.1 NOTE:
+/// handling non-conforming bitstreams is not specified).
+///
+/// The reference decoder's output on them depends on the CPU: a
+/// black-box model of its samples matches 16-bit storage of d and of
+/// the row pass on its portable C path, and 16-bit storage of every
+/// stage on its SSE2-and-later x86 paths. Its C path gives this
+/// decoder's frame for `1b14ead3…` byte for byte (that file's expected
+/// output is the C path's frame); for `3e4b987a…` the three outputs
+/// agree everywhere except that one block, where this decoder's
+/// samples are the exact result of eqs. 8-357..8-406.
+///
+/// Chosen behavior, pinned here: decode such residuals with the
+/// equations' exact integer arithmetic (no 16-bit truncation at any
+/// stage), without flagging an error. Emulating 16-bit truncation would
+/// change nothing for conforming streams, but it would only match one
+/// build of the reference on one CPU family and would break the match
+/// with its portable path. The unit tests
+/// `inverse_transform_8x8_keeps_*_exact` in `transform.rs` pin the same
+/// arithmetic on hand-derived blocks.
+#[test]
+fn fuzz_oracle_intra8x8_range_violations_decode_with_exact_arithmetic() {
+    let cases: [(&str, &[u8], &[u8]); 2] = [
+        (
+            "3e4b987a (d_ij beyond §8.5.13.1)",
+            include_bytes!(
+                "fixtures/fuzz_regressions/crash-3e4b987afdeb29814ff3ace29c79172a8057ab8f"
+            ),
+            include_bytes!(
+                "fixtures/fuzz_regressions/crash-3e4b987afdeb29814ff3ace29c79172a8057ab8f.yuv"
+            ),
+        ),
+        (
+            "1b14ead3 (column stage beyond §8.5.13.2)",
+            include_bytes!(
+                "fixtures/fuzz_regressions/crash-1b14ead369bdf8e952b9d58cdcc945da83cf6ac4"
+            ),
+            include_bytes!(
+                "fixtures/fuzz_regressions/crash-1b14ead369bdf8e952b9d58cdcc945da83cf6ac4.yuv"
+            ),
+        ),
+    ];
+    for (name, input, want) in cases {
+        let (got, errors) = decode_one_frame_packed(input);
+        assert_eq!(errors, 0, "{name}: the stream must decode without errors");
+        assert_eq!(got.len(), want.len(), "{name}: frame size");
+        if let Some((i, g, w)) = first_mismatch(&got, want) {
+            panic!(
+                "{name}: sample {i} (luma x={} y={} if < 6144) is {g}, expected {w}",
+                i % 96,
+                i / 96
+            );
+        }
+    }
+
+    // The readable part of the pin. In 3e4b987a the dominant term
+    // c_40 alone gives residual rows of +-32 253 (rows 0, 3, 4, 7
+    // positive), so the block at x 64..71, y 56..63 saturates by rows.
+    let (y1, _) = decode_one_frame_packed(cases[0].1);
+    for row in 0..8 {
+        let want = if matches!(row, 0 | 3 | 4 | 7) { 255 } else { 0 };
+        let line = &y1[(56 + row) * 96 + 64..(56 + row) * 96 + 72];
+        assert!(
+            line.iter().all(|&s| s == want),
+            "3e4b987a: row {row} of the block is {line:?}, expected all {want}"
+        );
+    }
+    // In 1b14ead3 the oracle reported Y[40, 82]: 255 here and on the
+    // reference's C path, 0 on its SIMD path.
+    let (y2, _) = decode_one_frame_packed(cases[1].1);
+    assert_eq!(y2[40 * 96 + 82], 255, "1b14ead3: Y[40, 82]");
+}
