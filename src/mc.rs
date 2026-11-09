@@ -19,7 +19,7 @@
 //!
 //! Clean-room: derived only from ITU-T Rec. H.264 (08/2024) §8.4.2.2.
 
-use crate::picture::Sample;
+use crate::picture::{PicSample, Sample};
 use std::sync::OnceLock;
 
 /// Largest window a kernel gathers: a 16x16 luma block plus the
@@ -28,11 +28,11 @@ const WIN: usize = 21;
 
 /// A reference sample plane, addressed by row.
 #[derive(Clone, Copy)]
-pub(crate) enum PlaneSrc<'a> {
+pub(crate) enum PlaneSrc<'a, S = Sample> {
     /// A flat row-major plane: row `y` starts at `data[y * stride]`.
     /// A field of a frame is a flat plane with a doubled stride.
     Flat {
-        data: &'a [Sample],
+        data: &'a [S],
         stride: usize,
         width: usize,
         height: usize,
@@ -42,14 +42,14 @@ pub(crate) enum PlaneSrc<'a> {
     /// reads must already be published.
     #[cfg_attr(not(test), allow(dead_code))]
     Banded {
-        bands: &'a [OnceLock<Box<[Sample]>>],
+        bands: &'a [OnceLock<Box<[S]>>],
         band_rows: usize,
         width: usize,
         height: usize,
     },
 }
 
-impl<'a> PlaneSrc<'a> {
+impl<'a, S: PicSample> PlaneSrc<'a, S> {
     #[inline]
     pub(crate) fn width(&self) -> usize {
         match *self {
@@ -66,7 +66,7 @@ impl<'a> PlaneSrc<'a> {
 
     /// Row `y` (`y < height`), `width` samples long.
     #[inline]
-    fn row(&self, y: usize) -> &'a [Sample] {
+    fn row(&self, y: usize) -> &'a [S] {
         match *self {
             PlaneSrc::Flat {
                 data,
@@ -95,8 +95,8 @@ impl<'a> PlaneSrc<'a> {
 /// coordinate into the plane (eqs. 8-239 / 8-240, 8-262..8-269).
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn gather(
-    src: &PlaneSrc<'_>,
+fn gather<S: PicSample>(
+    src: &PlaneSrc<'_, S>,
     x0: i32,
     y0: i32,
     ww: usize,
@@ -117,12 +117,12 @@ fn gather(
     {
         let base = y0 as usize * stride + x0 as usize;
         match ww {
-            4 => rows_fixed::<4>(data, base, stride, wh, out, ostride),
-            8 => rows_fixed::<8>(data, base, stride, wh, out, ostride),
-            9 => rows_fixed::<9>(data, base, stride, wh, out, ostride),
-            16 => rows_fixed::<16>(data, base, stride, wh, out, ostride),
-            17 => rows_fixed::<17>(data, base, stride, wh, out, ostride),
-            21 => rows_fixed::<21>(data, base, stride, wh, out, ostride),
+            4 => rows_fixed::<S, 4>(data, base, stride, wh, out, ostride),
+            8 => rows_fixed::<S, 8>(data, base, stride, wh, out, ostride),
+            9 => rows_fixed::<S, 9>(data, base, stride, wh, out, ostride),
+            16 => rows_fixed::<S, 16>(data, base, stride, wh, out, ostride),
+            17 => rows_fixed::<S, 17>(data, base, stride, wh, out, ostride),
+            21 => rows_fixed::<S, 21>(data, base, stride, wh, out, ostride),
             _ => {
                 for r in 0..wh {
                     let s = &data[base + r * stride..base + r * stride + ww];
@@ -141,7 +141,7 @@ fn gather(
             copy_short(o, &row[x0 as usize..x0 as usize + ww]);
         } else {
             for (c, slot) in o.iter_mut().enumerate() {
-                *slot = i32::from(row[(x0 + c as i32).clamp(0, width - 1) as usize]);
+                *slot = row[(x0 + c as i32).clamp(0, width - 1) as usize].into();
             }
         }
     }
@@ -152,8 +152,8 @@ fn gather(
 /// stride `ostride`). `N` is a compile-time constant so each row is a
 /// few widening vector loads and stores.
 #[inline(always)]
-fn rows_fixed<const N: usize>(
-    data: &[Sample],
+fn rows_fixed<S: PicSample, const N: usize>(
+    data: &[S],
     base: usize,
     stride: usize,
     wh: usize,
@@ -161,13 +161,13 @@ fn rows_fixed<const N: usize>(
     ostride: usize,
 ) {
     for r in 0..wh {
-        let s: &[Sample; N] = data[base + r * stride..][..N]
+        let s: &[S; N] = data[base + r * stride..][..N]
             .try_into()
             .expect("row length");
         let d: &mut [i32; N] = (&mut out[r * ostride..][..N])
             .try_into()
             .expect("row length");
-        *d = s.map(i32::from);
+        *d = s.map(Into::<i32>::into);
     }
 }
 
@@ -176,26 +176,26 @@ fn rows_fixed<const N: usize>(
 /// which compile to a few widening vector loads and stores (a generic
 /// loop per row costs more than the copy itself at these lengths).
 #[inline(always)]
-fn copy_short(dst: &mut [i32], src: &[Sample]) {
+fn copy_short<S: PicSample>(dst: &mut [i32], src: &[S]) {
     #[inline(always)]
-    fn fixed<const N: usize>(dst: &mut [i32], src: &[Sample]) {
+    fn fixed<S: PicSample, const N: usize>(dst: &mut [i32], src: &[S]) {
         let d: &mut [i32; N] = (&mut dst[..N]).try_into().expect("row length");
-        let s: &[Sample; N] = (&src[..N]).try_into().expect("row length");
+        let s: &[S; N] = (&src[..N]).try_into().expect("row length");
         for (d, &s) in d.iter_mut().zip(s) {
-            *d = i32::from(s);
+            *d = s.into();
         }
     }
     match dst.len() {
-        2 => fixed::<2>(dst, src),
-        3 => fixed::<3>(dst, src),
-        4 => fixed::<4>(dst, src),
-        5 => fixed::<5>(dst, src),
-        8 => fixed::<8>(dst, src),
-        9 => fixed::<9>(dst, src),
-        13 => fixed::<13>(dst, src),
-        16 => fixed::<16>(dst, src),
-        17 => fixed::<17>(dst, src),
-        21 => fixed::<21>(dst, src),
+        2 => fixed::<S, 2>(dst, src),
+        3 => fixed::<S, 3>(dst, src),
+        4 => fixed::<S, 4>(dst, src),
+        5 => fixed::<S, 5>(dst, src),
+        8 => fixed::<S, 8>(dst, src),
+        9 => fixed::<S, 9>(dst, src),
+        13 => fixed::<S, 13>(dst, src),
+        16 => fixed::<S, 16>(dst, src),
+        17 => fixed::<S, 17>(dst, src),
+        21 => fixed::<S, 21>(dst, src),
         n => crate::picture::load_samples(&mut dst[..n], &src[..n]),
     }
 }
@@ -216,8 +216,8 @@ fn clip1(v: i32, max_v: i32) -> i32 {
 /// integer position `(int_x, int_y)` with quarter-sample offset
 /// `(x_frac, y_frac)` (each 0..=3), writing `dst[y * dst_stride + x]`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn luma(
-    src: &PlaneSrc<'_>,
+pub(crate) fn luma<S: PicSample>(
+    src: &PlaneSrc<'_, S>,
     int_x: i32,
     int_y: i32,
     x_frac: u8,
@@ -488,8 +488,8 @@ fn luma_fixed<const W: usize, const WS: usize>(
 /// integer position `(int_x, int_y)` with eighth-sample offset
 /// `(x_frac, y_frac)` (each 0..=7), eq. 8-270.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn chroma(
-    src: &PlaneSrc<'_>,
+pub(crate) fn chroma<S: PicSample>(
+    src: &PlaneSrc<'_, S>,
     int_x: i32,
     int_y: i32,
     x_frac: u8,

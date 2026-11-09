@@ -1,8 +1,9 @@
 //! Picture sample buffer for a decoded frame/field.
 //!
-//! Holds luma + chroma sample planes sized from the active SPS.
-//! Samples are stored as [`Sample`] (`u16`), wide enough for every bit
-//! depth the spec allows (up to 14); the actual value range is
+//! Holds luma + chroma sample planes sized from the active SPS. The
+//! stored sample type is a parameter, [`PicSample`]: `u16` holds every
+//! bit depth the spec allows (up to 14), `u8` holds 8-bit pictures in
+//! half the memory traffic; the actual value range is
 //! `0..(1 << bit_depth)`. Arithmetic on samples happens in `i32`: the
 //! accessors widen on read and [`to_sample`] narrows on write.
 //!
@@ -15,58 +16,116 @@
 //!
 //! Clean-room: derived only from ITU-T Rec. H.264 (08/2024).
 
-/// One stored picture sample. Two bytes hold every bit depth of
-/// §7.4.2.1.1 (`BitDepthY` / `BitDepthC` ≤ 14) at half the
-/// memory traffic of the `i32` the arithmetic uses.
+/// A stored picture sample. `u16` holds every bit depth of §7.4.2.1.1
+/// (`BitDepthY` / `BitDepthC` ≤ 14); `u8` holds pictures whose luma
+/// and chroma are both 8-bit in half the memory traffic. Both are
+/// narrower than the `i32` the arithmetic uses.
+pub trait PicSample:
+    Copy + Default + Eq + Ord + core::fmt::Debug + Send + Sync + 'static + Into<i32>
+{
+    /// The largest stored value.
+    const STORED_MAX: i32;
+
+    /// Narrow a reconstructed sample (already clipped to its bit depth
+    /// by the Clip1 of the producing process) to its stored form. Every
+    /// producer clips first, so the saturation is a guard, never a
+    /// change of value; debug builds assert it.
+    fn from_clipped(v: i32) -> Self;
+
+    /// Clip a row of `i32` samples to `0..=max` (Clip1, `max` at most
+    /// `i16::MAX` and at most [`Self::STORED_MAX`]) and store them: one clamp
+    /// per sample, so a producer need not clip first.
+    fn store_clipped(dst: &mut [Self], src: &[i32], max: i32);
+}
+
+/// The wide stored sample, for pictures of more than 8 bits per sample
+/// (and the default sample type of [`Picture`]).
 pub type Sample = u16;
 
-/// Narrow a reconstructed sample (already clipped to its bit depth by
-/// the Clip1 of the producing process) to its stored form. Every
-/// producer clips first, so the saturation is a guard, never a change of
-/// value; debug builds assert it.
+impl PicSample for u16 {
+    const STORED_MAX: i32 = u16::MAX as i32;
+
+    #[inline(always)]
+    fn from_clipped(v: i32) -> Self {
+        debug_assert!(
+            (0..=Self::STORED_MAX).contains(&v),
+            "sample {v} outside the stored range"
+        );
+        v.clamp(0, Self::STORED_MAX) as u16
+    }
+
+    #[inline]
+    fn store_clipped(dst: &mut [Self], src: &[i32], max: i32) {
+        debug_assert_eq!(dst.len(), src.len());
+        debug_assert!((0..=i32::from(i16::MAX)).contains(&max));
+        // Saturating to i16 first, then clamping in 16 bits, equals the
+        // 32-bit clamp for any `max` that fits i16 (every bit depth does)
+        // and maps onto 16-bit vector packs and min / max that x86-64's
+        // baseline SSE2 has (it lacks 32-bit min / max).
+        let max = max as i16;
+        for (d, &s) in dst.iter_mut().zip(src) {
+            let s = s.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            *d = s.clamp(0, max) as u16;
+        }
+    }
+}
+
+impl PicSample for u8 {
+    const STORED_MAX: i32 = u8::MAX as i32;
+
+    #[inline(always)]
+    fn from_clipped(v: i32) -> Self {
+        debug_assert!(
+            (0..=Self::STORED_MAX).contains(&v),
+            "sample {v} outside the stored range"
+        );
+        v.clamp(0, Self::STORED_MAX) as u8
+    }
+
+    #[inline]
+    fn store_clipped(dst: &mut [Self], src: &[i32], max: i32) {
+        debug_assert_eq!(dst.len(), src.len());
+        debug_assert!((0..=Self::STORED_MAX).contains(&max));
+        // As for u16: saturate to i16, clamp in 16 bits (SSE2 packs and
+        // min / max), then narrow; the clamp leaves values in 0..=255.
+        let max = max as i16;
+        for (d, &s) in dst.iter_mut().zip(src) {
+            let s = s.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            *d = s.clamp(0, max) as u8;
+        }
+    }
+}
+
+/// Narrow a reconstructed sample to its stored form
+/// ([`PicSample::from_clipped`]).
 #[inline(always)]
-pub fn to_sample(v: i32) -> Sample {
-    debug_assert!(
-        (0..=Sample::MAX as i32).contains(&v),
-        "sample {v} outside the stored range"
-    );
-    v.clamp(0, Sample::MAX as i32) as Sample
+pub fn to_sample<S: PicSample>(v: i32) -> S {
+    S::from_clipped(v)
 }
 
 /// Narrow a row of clipped `i32` samples into stored samples
 /// ([`to_sample`] for each; `dst` and `src` have equal lengths).
 #[inline]
-pub fn store_samples(dst: &mut [Sample], src: &[i32]) {
+pub fn store_samples<S: PicSample>(dst: &mut [S], src: &[i32]) {
     debug_assert_eq!(dst.len(), src.len());
     for (d, &s) in dst.iter_mut().zip(src) {
-        *d = to_sample(s);
+        *d = S::from_clipped(s);
     }
 }
 
-/// Clip a row of `i32` samples to `0..=max` (Clip1, `max` at most
-/// `i16::MAX`, which every bit depth satisfies) and store them: one clamp per sample, so a producer
-/// need not clip first.
+/// Clip a row of `i32` samples to `0..=max` and store them
+/// ([`PicSample::store_clipped`]).
 #[inline]
-pub fn store_clipped(dst: &mut [Sample], src: &[i32], max: i32) {
-    debug_assert_eq!(dst.len(), src.len());
-    debug_assert!((0..=i32::from(i16::MAX)).contains(&max));
-    // Saturating to i16 first, then clamping in 16 bits, equals the
-    // 32-bit clamp for any `max` that fits i16 (every bit depth does) and
-    // maps onto 16-bit vector packs and min / max that x86-64's baseline
-    // SSE2 has (it lacks 32-bit min / max).
-    let max = max as i16;
-    for (d, &s) in dst.iter_mut().zip(src) {
-        let s = s.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
-        *d = s.clamp(0, max) as Sample;
-    }
+pub fn store_clipped<S: PicSample>(dst: &mut [S], src: &[i32], max: i32) {
+    S::store_clipped(dst, src, max);
 }
 
 /// Widen a row of stored samples into `i32` working samples.
 #[inline]
-pub fn load_samples(dst: &mut [i32], src: &[Sample]) {
+pub fn load_samples<S: PicSample>(dst: &mut [i32], src: &[S]) {
     debug_assert_eq!(dst.len(), src.len());
     for (d, &s) in dst.iter_mut().zip(src) {
-        *d = i32::from(s);
+        *d = s.into();
     }
 }
 
@@ -89,7 +148,7 @@ pub enum PicCodingStruct {
 ///
 /// POC and frame_num are set by the caller after reconstruction.
 #[derive(Debug, Clone)]
-pub struct Picture {
+pub struct Picture<S = Sample> {
     pub width_in_samples: u32,
     pub height_in_samples: u32,
     /// §6.2 — 0 = monochrome (or separate_colour_plane_flag),
@@ -97,9 +156,9 @@ pub struct Picture {
     pub chroma_array_type: u32,
     pub bit_depth_luma: u32,
     pub bit_depth_chroma: u32,
-    pub luma: Vec<Sample>,
-    pub cb: Vec<Sample>,
-    pub cr: Vec<Sample>,
+    pub luma: Vec<S>,
+    pub cb: Vec<S>,
+    pub cr: Vec<S>,
     /// §8.2.5.2 — set on the placeholder pictures synthesised to fill a
     /// gap in `frame_num`. Their samples are "not available for
     /// prediction of other pictures": a conforming bitstream never
@@ -189,9 +248,28 @@ pub struct Picture {
     pub ref_list_1_unit_keys: Vec<u32>,
 }
 
-impl Picture {
-    /// Allocate a zero-filled picture of the requested geometry.
+impl Picture<Sample> {
+    /// Allocate a zero-filled wide-sample picture ([`Picture::zeroed`]).
     pub fn new(
+        width_in_samples: u32,
+        height_in_samples: u32,
+        chroma_array_type: u32,
+        bit_depth_luma: u32,
+        bit_depth_chroma: u32,
+    ) -> Self {
+        Self::zeroed(
+            width_in_samples,
+            height_in_samples,
+            chroma_array_type,
+            bit_depth_luma,
+            bit_depth_chroma,
+        )
+    }
+}
+
+impl<S: PicSample> Picture<S> {
+    /// Allocate a zero-filled picture of the requested geometry.
+    pub fn zeroed(
         width_in_samples: u32,
         height_in_samples: u32,
         chroma_array_type: u32,
@@ -212,9 +290,9 @@ impl Picture {
             chroma_array_type,
             bit_depth_luma,
             bit_depth_chroma,
-            luma: vec![0; luma_len],
-            cb: vec![0; chroma_len],
-            cr: vec![0; chroma_len],
+            luma: vec![S::default(); luma_len],
+            cb: vec![S::default(); chroma_len],
+            cr: vec![S::default(); chroma_len],
             non_existing: false,
             pic_order_cnt: 0,
             frame_num: 0,
@@ -248,8 +326,8 @@ impl Picture {
     /// The planes keep `old`'s samples unless `zero` is set; a caller may
     /// leave it unset only when every sample of the new picture is
     /// written before anything reads it.
-    pub fn recycled(old: Picture, zero: bool) -> Self {
-        let mut p = Picture::new(
+    pub fn recycled(old: Picture<S>, zero: bool) -> Self {
+        let mut p = Self::zeroed(
             0,
             0,
             old.chroma_array_type,
@@ -262,9 +340,9 @@ impl Picture {
         p.cb = old.cb;
         p.cr = old.cr;
         if zero {
-            p.luma.fill(0);
-            p.cb.fill(0);
-            p.cr.fill(0);
+            p.luma.fill(S::default());
+            p.cb.fill(S::default());
+            p.cr.fill(S::default());
         }
         fn emptied<T>(mut v: Vec<T>) -> Vec<T> {
             v.clear();
@@ -311,15 +389,15 @@ impl Picture {
     /// the §8.4.1.2.1 Table 8-6 "colPic = the frame containing
     /// RefPicList1[ 0 ]" row can address the containing frame. The
     /// caller stamps `pic_order_cnt` with the FIELD's own order count.
-    pub fn field_view(&self, bottom: bool) -> Picture {
-        let mut out = Picture::new(
+    pub fn field_view(&self, bottom: bool) -> Picture<S> {
+        let mut out = Self::zeroed(
             self.width_in_samples,
             self.height_in_samples / 2,
             self.chroma_array_type,
             self.bit_depth_luma,
             self.bit_depth_chroma,
         );
-        let take_rows = |src: &[Sample], width: usize, height: usize| -> Vec<Sample> {
+        let take_rows = |src: &[S], width: usize, height: usize| -> Vec<S> {
             let mut v = Vec::with_capacity(width * height / 2);
             for row in (usize::from(bottom)..height).step_by(2) {
                 v.extend_from_slice(&src[row * width..(row + 1) * width]);
@@ -398,7 +476,7 @@ impl Picture {
         }
         let xi = clip3_i32(0, self.width_in_samples as i32 - 1, x) as usize;
         let yi = clip3_i32(0, self.height_in_samples as i32 - 1, y) as usize;
-        i32::from(self.luma[yi * (self.width_in_samples as usize) + xi])
+        self.luma[yi * (self.width_in_samples as usize) + xi].into()
     }
 
     /// Clamped chroma Cb access (§6.2).
@@ -411,7 +489,7 @@ impl Picture {
         }
         let xi = clip3_i32(0, cw as i32 - 1, x) as usize;
         let yi = clip3_i32(0, ch as i32 - 1, y) as usize;
-        i32::from(self.cb[yi * (cw as usize) + xi])
+        self.cb[yi * (cw as usize) + xi].into()
     }
 
     /// Clamped chroma Cr access.
@@ -424,7 +502,7 @@ impl Picture {
         }
         let xi = clip3_i32(0, cw as i32 - 1, x) as usize;
         let yi = clip3_i32(0, ch as i32 - 1, y) as usize;
-        i32::from(self.cr[yi * (cw as usize) + xi])
+        self.cr[yi * (cw as usize) + xi].into()
     }
 
     /// Write a luma sample. Out-of-bounds writes are silently ignored
