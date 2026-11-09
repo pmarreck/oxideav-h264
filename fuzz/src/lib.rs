@@ -441,4 +441,59 @@ pub mod libavcodec {
             result
         }
     }
+
+    /// [`decode_h264`] with libavcodec's CPU-specific (SIMD) routines
+    /// switched off, so its portable C paths decode. CPU detection is
+    /// overridden for this one decode through the public
+    /// `av_force_cpu_flags` (libavutil/cpu.h: 0 forces no CPU features,
+    /// -1 restores detection) and restored afterwards; the decoder picks
+    /// its routines when it is opened.
+    ///
+    /// On conforming streams both paths give the same frame. Where they
+    /// differ, the stream depends on arithmetic the standard leaves
+    /// unspecified (residual data beyond the §8.5.12 / §8.5.13 ranges,
+    /// for one), so the reference itself has no single answer.
+    /// `Unavailable` when the symbol cannot be resolved.
+    pub fn decode_h264_portable(data: &[u8]) -> OracleResult {
+        type ForceCpuFlagsFn = unsafe extern "C" fn(i32);
+        let Some(l) = lib() else {
+            return OracleResult::Unavailable;
+        };
+        // libavutil symbols resolve through the libavcodec handle (see
+        // `av_dict_set` in `decode_h264`).
+        // SAFETY: the symbol is the public `void av_force_cpu_flags(int)`;
+        // the handle lives in a `'static` `OnceLock` and is never
+        // unloaded, so the detached function pointer cannot dangle.
+        let force: ForceCpuFlagsFn =
+            match unsafe { l.get::<ForceCpuFlagsFn>(c"av_force_cpu_flags") } {
+                Ok(s) => unsafe { s.into_inner() },
+                Err(_) => return OracleResult::Unavailable,
+            };
+        /// Restores CPU detection even if the decode unwinds.
+        struct Restore(ForceCpuFlagsFn);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: plain call of the resolved libavutil function
+                // with its documented "restore detection" argument.
+                unsafe { (self.0)(-1) }
+            }
+        }
+        // SAFETY: as above, with the documented "no CPU features" value.
+        unsafe { force(0) };
+        let _restore = Restore(force);
+        decode_h264(data)
+    }
+
+    impl DecodedYuv {
+        /// Same geometry and the same samples in every plane.
+        pub fn identical(&self, other: &DecodedYuv) -> bool {
+            self.width == other.width
+                && self.height == other.height
+                && self.chroma_w_log2 == other.chroma_w_log2
+                && self.chroma_h_log2 == other.chroma_h_log2
+                && self.y == other.y
+                && self.cb == other.cb
+                && self.cr == other.cr
+        }
+    }
 }

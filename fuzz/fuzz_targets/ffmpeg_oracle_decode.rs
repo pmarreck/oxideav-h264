@@ -47,6 +47,14 @@
 //!   applies the §7.4.2.1.1 frame-cropping window in full (by default
 //!   a left or top crop stops short of an unaligned plane offset and the
 //!   frame comes back wider or taller than the cropped picture).
+//! - A frame mismatch is checked against a second decode on the
+//!   reference's portable C paths (`decode_h264_portable`). If our
+//!   frame matches that one, or the reference's two paths disagree with
+//!   each other, the stream relies on arithmetic the standard leaves
+//!   unspecified (residuals beyond the §8.5.12 / §8.5.13 ranges, for
+//!   one) and the reference's answer depends on the CPU: reported as
+//!   `[oracle cpu-dependent]`, not as a divergence. Only a mismatch
+//!   with both reference paths agreeing is a crash.
 //!
 //! Skips silently when libavcodec isn't loadable so the harness still
 //! runs against the panic_free coverage even on hosts without ffmpeg
@@ -233,7 +241,37 @@ fuzz_target!(|data: &[u8]| {
             if area > MAX_AREA {
                 return;
             }
-            assert_oracle_frame_matches_one_of_ours(&o, &ours_frames, data.len());
+            let Some(mismatch) = oracle_mismatch(&o, &ours_frames, data.len()) else {
+                return;
+            };
+            // Second opinion before calling it a divergence: the
+            // reference's portable C paths. On conforming streams they
+            // decode exactly as its default (SIMD) paths do. Where the
+            // two disagree, the stream depends on arithmetic the
+            // standard leaves open, and the reference's answer depends
+            // on the CPU it runs on. Two fuzzed Intra 8x8 streams with
+            // residuals beyond the §8.5.13 ranges did exactly that: the
+            // reference truncates intermediate values to 16 bits, at
+            // different stages on its two paths, while this decoder
+            // computes the equations exactly (pinned in
+            // tests/integration_fuzz_oracle_regression.rs).
+            match libavcodec::decode_h264_portable(data) {
+                OracleResult::Frame(p)
+                    if oracle_mismatch(&p, &ours_frames, data.len()).is_none() =>
+                {
+                    eprintln!(
+                        "[oracle cpu-dependent] oxideav matches libavcodec's portable C path, \
+                         not its default path: {mismatch}"
+                    );
+                }
+                OracleResult::Frame(p) if !p.identical(&o) => {
+                    eprintln!(
+                        "[oracle cpu-dependent] libavcodec's portable C path and default path \
+                         disagree, so the stream's output is implementation-defined: {mismatch}"
+                    );
+                }
+                _ => panic!("{mismatch}"),
+            }
         }
     }
 });
@@ -376,12 +414,13 @@ fn pack_plane(w: usize, h: usize, plane: &VideoPlane) -> Vec<u8> {
 
 /// The oracle drained exactly one frame; our decoder drained every AU
 /// in the buffer. The oracle's frame must match at least one of ours
-/// (dimensions + subsampling exact, samples within ±`TOL`).
-fn assert_oracle_frame_matches_one_of_ours(
+/// (dimensions + subsampling exact, samples within ±`TOL`): `None` when
+/// it does, otherwise the divergence report.
+fn oracle_mismatch(
     o: &libavcodec::DecodedYuv,
     ours: &[DecodedYuv],
     input_len: usize,
-) {
+) -> Option<String> {
     let mut geometry_matched = false;
     let mut best: Option<(usize, String)> = None; // (worst diff, detail)
     for (idx, r) in ours.iter().enumerate() {
@@ -435,7 +474,7 @@ fn assert_oracle_frame_matches_one_of_ours(
             }
         }
         if worst <= TOL as usize {
-            return; // matched — parity holds
+            return None; // matched — parity holds
         }
         if best.as_ref().is_none_or(|(b, _)| worst < *b) {
             best = Some((worst, format!("ours[{idx}]: {detail}")));
@@ -451,7 +490,7 @@ fn assert_oracle_frame_matches_one_of_ours(
                 )
             })
             .collect();
-        panic!(
+        return Some(format!(
             "divergence ({input_len} bytes): libavcodec frame {}x{} c=({},{}) matches no oxideav \
              frame geometry [{}]",
             o.width,
@@ -459,11 +498,11 @@ fn assert_oracle_frame_matches_one_of_ours(
             o.chroma_w_log2,
             o.chroma_h_log2,
             shapes.join(", ")
-        );
+        ));
     }
     let (worst, detail) = best.unwrap();
-    panic!(
+    Some(format!(
         "divergence ({input_len} bytes): no oxideav frame within tol={TOL} of the libavcodec \
          frame; closest differs by {worst} at {detail}"
-    );
+    ))
 }
