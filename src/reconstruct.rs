@@ -3190,18 +3190,14 @@ fn reconstruct_chroma_intra(
             intra_bypass_dpcm(rmb, mbw_c as usize, mbh_c as usize, chroma_mode_idx == 1);
         }
 
-        // §8.5.4 step 4 (eq. 8-308) — prediction add + clip + write.
-        for y in 0..mbh_c as usize {
-            for x in 0..mbw_c as usize {
-                let pidx = y * (mbw_c as usize) + x;
-                let v = clip_sample(pred_samples[pidx] + rmb[pidx], bit_depth_c);
-                if plane == 0 {
-                    writer.set_cb(pic, x as i32, y as i32, v);
-                } else {
-                    writer.set_cr(pic, x as i32, y as i32, v);
-                }
-            }
+        // §8.5.4 step 4 (eq. 8-308) — prediction add, then Clip1C as the
+        // samples are stored, by rows (not sample by sample through the
+        // writer, which works out the chroma origin for every sample).
+        for (r, &p) in rmb.iter_mut().zip(&pred_samples[..out_len]) {
+            *r += p;
         }
+        let max_c = (1i32 << bit_depth_c) - 1;
+        writer.write_chroma_mb(pic, plane, rmb, mbw_c as usize, mbh_c as usize, max_c);
     }
     let _ = c_mb_px;
     let _ = c_mb_py;
@@ -3352,17 +3348,11 @@ fn reconstruct_chroma_intra_444(
             intra_bypass_dpcm(&mut rmb, 16, 16, pred_mode_idx == 1);
         }
 
-        for y in 0..16i32 {
-            for x in 0..16i32 {
-                let idx = (y * 16 + x) as usize;
-                let v = clip_sample(pred[idx] + rmb[idx], bit_depth_c);
-                if plane == 0 {
-                    writer.set_cb(pic, x, y, v);
-                } else {
-                    writer.set_cr(pic, x, y, v);
-                }
-            }
+        // Prediction add, then Clip1C as the samples are stored, by rows.
+        for (r, &p) in rmb.iter_mut().zip(&pred) {
+            *r += p;
         }
+        writer.write_chroma_mb(pic, plane, &rmb, 16, 16, (1i32 << bit_depth_c) - 1);
     }
     Ok(())
 }
