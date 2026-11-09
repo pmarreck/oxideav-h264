@@ -1064,7 +1064,7 @@ fn synth_mb_inter<R: RefPicProvider>(
         sps,
         pps,
         &writer,
-        &pred_luma,
+        &mut pred_luma,
         pred_cb,
         pred_cr,
         scratch,
@@ -5011,7 +5011,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
         sps,
         pps,
         &writer,
-        &pred_luma,
+        &mut pred_luma,
         pred_cb,
         pred_cr,
         pic,
@@ -5036,9 +5036,9 @@ fn inter_residual_write(
     sps: &Sps,
     pps: &Pps,
     writer: &MbWriter,
-    pred_luma: &[i32; 256],
-    pred_cb: &[i32],
-    pred_cr: &[i32],
+    pred_luma: &mut [i32; 256],
+    pred_cb: &mut [i32],
+    pred_cr: &mut [i32],
     pic: &mut Picture,
     mbaff_field_mb: bool,
     inter_debug: bool,
@@ -5069,8 +5069,9 @@ fn inter_residual_write(
     let field_scan = mbaff_field_mb || slice_header.field_pic_flag;
 
     // The reconstructed macroblock: prediction plus residual, clipped
-    // (eq. 8-x Clip1Y of the §8.5.14 picture construction).
-    let mut out = *pred_luma;
+    // (eq. 8-x Clip1Y of the §8.5.14 picture construction). The residual
+    // is added to the prediction in place, without a copy of the macroblock.
+    let out = pred_luma;
     // Every §8.5.12 / §8.5.13 transform call validates qP'Y / the bit
     // depth first, whether or not the block carries coefficients.
     if !bypass {
@@ -5159,7 +5160,7 @@ fn inter_residual_write(
         }
     }
     // §8.5.14 — Clip1Y as the samples are stored.
-    writer.write_luma_mb(pic, &out, (1i32 << bit_depth_y) - 1);
+    writer.write_luma_mb(pic, out, (1i32 << bit_depth_y) - 1);
 
     // -------- Chroma residual + write --------------------------------
     if chroma_array_type == 1 || chroma_array_type == 2 {
@@ -8804,8 +8805,8 @@ fn reconstruct_inter_chroma_residual(
     sps: &Sps,
     pps: &Pps,
     cbp_chroma: u8,
-    pred_cb: &[i32],
-    pred_cr: &[i32],
+    pred_cb: &mut [i32],
+    pred_cr: &mut [i32],
     pic: &mut Picture,
     field_scan: bool,
 ) -> Result<(), ReconstructError> {
@@ -8892,13 +8893,12 @@ fn reconstruct_inter_chroma_residual(
         };
         let (_, mbh_c) = chroma_mb_dims(chroma_array_type);
         let n_c = (mbw_c * mbh_c) as usize;
-        let mut out = [0i32; 128];
-        let out = &mut out[..n_c];
-        out.copy_from_slice(if plane == 0 {
-            &pred_cb[..n_c]
+        // The residual is added to the plane's prediction in place.
+        let out = if plane == 0 {
+            &mut pred_cb[..n_c]
         } else {
-            &pred_cr[..n_c]
-        });
+            &mut pred_cr[..n_c]
+        };
         // Every §8.5.12 call validates qP'C / the bit depth, whether or
         // not the block carries coefficients.
         if !bypass {
