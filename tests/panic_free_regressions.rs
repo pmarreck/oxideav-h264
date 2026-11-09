@@ -19,6 +19,11 @@
 //!   serial path's slice-level threads, which split the picture's rows
 //!   by the slice's own geometry. Such a slice is now refused at every
 //!   thread count (§7.4.1.2.1: one SPS is active for a whole picture).
+//! * `crash-64b94fe4` (found by the FFmpeg oracle target): residual
+//!   levels so large that the scaled coefficients wrap 32 bits, after
+//!   which the inverse transform's own sums overflowed (a panic where
+//!   overflow checks are on; a silent wrap in release builds). The
+//!   inverse transforms now wrap explicitly at every step.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -47,6 +52,10 @@ const FIXTURES: &[(&str, &[u8])] = &[
     (
         "9c17665a (slice of another size, serial slice threads)",
         include_bytes!("fixtures/fuzz_regressions/crash-9c17665a0ce208fb785aca82d063874c6060ccbc"),
+    ),
+    (
+        "64b94fe4 (residual beyond 32 bits in the 8x8 transform)",
+        include_bytes!("fixtures/fuzz_regressions/crash-64b94fe401a7b5cd8f5bbf562be65a34b0c5ba48"),
     ),
 ];
 

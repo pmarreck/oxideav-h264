@@ -21,6 +21,8 @@
 
 #![allow(dead_code)]
 
+use std::num::Wrapping as W;
+
 use thiserror::Error;
 
 use crate::pps::Pps;
@@ -738,10 +740,10 @@ fn inverse_core_4x4(d: &[i32; 16]) -> [i32; 16] {
     // f[i][j] = row-transformed value at position (i,j).
     let mut f = [0i32; 16];
     for i in 0..4 {
-        let d_i0 = d[i * 4];
-        let d_i1 = d[i * 4 + 1];
-        let d_i2 = d[i * 4 + 2];
-        let d_i3 = d[i * 4 + 3];
+        let d_i0 = W(d[i * 4]);
+        let d_i1 = W(d[i * 4 + 1]);
+        let d_i2 = W(d[i * 4 + 2]);
+        let d_i3 = W(d[i * 4 + 3]);
 
         // Intermediate e (eqs. 8-338..8-341).
         let e_i0 = d_i0 + d_i2;
@@ -750,19 +752,19 @@ fn inverse_core_4x4(d: &[i32; 16]) -> [i32; 16] {
         let e_i3 = d_i1 + (d_i3 >> 1);
 
         // Butterfly to f (eqs. 8-342..8-345).
-        f[i * 4] = e_i0 + e_i3;
-        f[i * 4 + 1] = e_i1 + e_i2;
-        f[i * 4 + 2] = e_i1 - e_i2;
-        f[i * 4 + 3] = e_i0 - e_i3;
+        f[i * 4] = (e_i0 + e_i3).0;
+        f[i * 4 + 1] = (e_i1 + e_i2).0;
+        f[i * 4 + 2] = (e_i1 - e_i2).0;
+        f[i * 4 + 3] = (e_i0 - e_i3).0;
     }
 
     // Column transform (eqs. 8-346..8-353). Produces h_ij.
     let mut h = [0i32; 16];
     for j in 0..4 {
-        let f_0j = f[j];
-        let f_1j = f[4 + j];
-        let f_2j = f[8 + j];
-        let f_3j = f[12 + j];
+        let f_0j = W(f[j]);
+        let f_1j = W(f[4 + j]);
+        let f_2j = W(f[8 + j]);
+        let f_3j = W(f[12 + j]);
 
         // Intermediate g (eqs. 8-346..8-349).
         let g_0j = f_0j + f_2j;
@@ -771,16 +773,16 @@ fn inverse_core_4x4(d: &[i32; 16]) -> [i32; 16] {
         let g_3j = f_1j + (f_3j >> 1);
 
         // Butterfly to h (eqs. 8-350..8-353).
-        h[j] = g_0j + g_3j;
-        h[4 + j] = g_1j + g_2j;
-        h[8 + j] = g_1j - g_2j;
-        h[12 + j] = g_0j - g_3j;
+        h[j] = (g_0j + g_3j).0;
+        h[4 + j] = (g_1j + g_2j).0;
+        h[8 + j] = (g_1j - g_2j).0;
+        h[12 + j] = (g_0j - g_3j).0;
     }
 
     // §8.5.12.2 eq. 8-354 — final right shift with rounding by 2^5 / 6.
     let mut r = [0i32; 16];
     for k in 0..16 {
-        r[k] = (h[k] + 32) >> 6;
+        r[k] = h[k].wrapping_add(32) >> 6;
     }
     r
 }
@@ -792,7 +794,7 @@ fn inverse_core_4x4(d: &[i32; 16]) -> [i32; 16] {
 #[inline]
 fn inverse_core_4x4_sparse(d: &[i32; 16]) -> [i32; 16] {
     if d[1..].iter().all(|&v| v == 0) {
-        return [(d[0] + 32) >> 6; 16];
+        return [d[0].wrapping_add(32) >> 6; 16];
     }
     inverse_core_4x4(d)
 }
@@ -911,14 +913,14 @@ fn inverse_core_8x8(d: &[i32; 64]) -> [i32; 64] {
     let mut g = [0i32; 64];
     for i in 0..8 {
         let base = i * 8;
-        let d0 = d[base];
-        let d1 = d[base + 1];
-        let d2 = d[base + 2];
-        let d3 = d[base + 3];
-        let d4 = d[base + 4];
-        let d5 = d[base + 5];
-        let d6 = d[base + 6];
-        let d7 = d[base + 7];
+        let d0 = W(d[base]);
+        let d1 = W(d[base + 1]);
+        let d2 = W(d[base + 2]);
+        let d3 = W(d[base + 3]);
+        let d4 = W(d[base + 4]);
+        let d5 = W(d[base + 5]);
+        let d6 = W(d[base + 6]);
+        let d7 = W(d[base + 7]);
 
         // eqs. 8-358..8-365.
         let e0 = d0 + d4;
@@ -941,14 +943,14 @@ fn inverse_core_8x8(d: &[i32; 64]) -> [i32; 64] {
         let f7 = e7 - (e1 >> 2);
 
         // eqs. 8-374..8-381.
-        g[base] = f0 + f7;
-        g[base + 1] = f2 + f5;
-        g[base + 2] = f4 + f3;
-        g[base + 3] = f6 + f1;
-        g[base + 4] = f6 - f1;
-        g[base + 5] = f4 - f3;
-        g[base + 6] = f2 - f5;
-        g[base + 7] = f0 - f7;
+        g[base] = (f0 + f7).0;
+        g[base + 1] = (f2 + f5).0;
+        g[base + 2] = (f4 + f3).0;
+        g[base + 3] = (f6 + f1).0;
+        g[base + 4] = (f6 - f1).0;
+        g[base + 5] = (f4 - f3).0;
+        g[base + 6] = (f2 - f5).0;
+        g[base + 7] = (f0 - f7).0;
     }
 
     // Column (vertical) transform.
@@ -957,14 +959,14 @@ fn inverse_core_8x8(d: &[i32; 64]) -> [i32; 64] {
     // 8-382..8-405.
     let mut m = [0i32; 64];
     for j in 0..8 {
-        let g0 = g[j];
-        let g1 = g[8 + j];
-        let g2 = g[16 + j];
-        let g3 = g[24 + j];
-        let g4 = g[32 + j];
-        let g5 = g[40 + j];
-        let g6 = g[48 + j];
-        let g7 = g[56 + j];
+        let g0 = W(g[j]);
+        let g1 = W(g[8 + j]);
+        let g2 = W(g[16 + j]);
+        let g3 = W(g[24 + j]);
+        let g4 = W(g[32 + j]);
+        let g5 = W(g[40 + j]);
+        let g6 = W(g[48 + j]);
+        let g7 = W(g[56 + j]);
 
         // eqs. 8-382..8-389.
         let h0 = g0 + g4;
@@ -987,20 +989,20 @@ fn inverse_core_8x8(d: &[i32; 64]) -> [i32; 64] {
         let k7 = h7 - (h1 >> 2);
 
         // eqs. 8-398..8-405.
-        m[j] = k0 + k7;
-        m[8 + j] = k2 + k5;
-        m[16 + j] = k4 + k3;
-        m[24 + j] = k6 + k1;
-        m[32 + j] = k6 - k1;
-        m[40 + j] = k4 - k3;
-        m[48 + j] = k2 - k5;
-        m[56 + j] = k0 - k7;
+        m[j] = (k0 + k7).0;
+        m[8 + j] = (k2 + k5).0;
+        m[16 + j] = (k4 + k3).0;
+        m[24 + j] = (k6 + k1).0;
+        m[32 + j] = (k6 - k1).0;
+        m[40 + j] = (k4 - k3).0;
+        m[48 + j] = (k2 - k5).0;
+        m[56 + j] = (k0 - k7).0;
     }
 
     // §8.5.13.2 eq. 8-406 — final right shift with rounding by 2^5 / 6.
     let mut r = [0i32; 64];
     for k in 0..64 {
-        r[k] = (m[k] + 32) >> 6;
+        r[k] = m[k].wrapping_add(32) >> 6;
     }
     r
 }
@@ -1087,34 +1089,34 @@ pub fn inverse_hadamard_luma_dc_16x16(
     //          [1,-1, 1,-1]].
     // Being a Hadamard this is self-inverse up to a factor of 4; the
     // factor is absorbed into the scaling step below.
-    let c = dc_coeffs;
+    let c = dc_coeffs.map(W);
     let mut t = [0i32; 16]; // t = H * c
     for j in 0..4 {
         // Row 0 of H: [ 1,  1,  1,  1]
-        t[j] = c[j] + c[4 + j] + c[8 + j] + c[12 + j];
+        t[j] = (c[j] + c[4 + j] + c[8 + j] + c[12 + j]).0;
         // Row 1: [ 1,  1, -1, -1]
-        t[4 + j] = c[j] + c[4 + j] - c[8 + j] - c[12 + j];
+        t[4 + j] = (c[j] + c[4 + j] - c[8 + j] - c[12 + j]).0;
         // Row 2: [ 1, -1, -1,  1]
-        t[8 + j] = c[j] - c[4 + j] - c[8 + j] + c[12 + j];
+        t[8 + j] = (c[j] - c[4 + j] - c[8 + j] + c[12 + j]).0;
         // Row 3: [ 1, -1,  1, -1]
-        t[12 + j] = c[j] - c[4 + j] + c[8 + j] - c[12 + j];
+        t[12 + j] = (c[j] - c[4 + j] + c[8 + j] - c[12 + j]).0;
     }
     let mut f = [0i32; 16]; // f = t * H
     for i in 0..4 {
         let base = i * 4;
-        let t0 = t[base];
-        let t1 = t[base + 1];
-        let t2 = t[base + 2];
-        let t3 = t[base + 3];
+        let t0 = W(t[base]);
+        let t1 = W(t[base + 1]);
+        let t2 = W(t[base + 2]);
+        let t3 = W(t[base + 3]);
         // Right-multiplying by H above yields:
         //   f[i][0] = t[i][0]+t[i][1]+t[i][2]+t[i][3]
         //   f[i][1] = t[i][0]+t[i][1]-t[i][2]-t[i][3]
         //   f[i][2] = t[i][0]-t[i][1]-t[i][2]+t[i][3]
         //   f[i][3] = t[i][0]-t[i][1]+t[i][2]-t[i][3]
-        f[base] = t0 + t1 + t2 + t3;
-        f[base + 1] = t0 + t1 - t2 - t3;
-        f[base + 2] = t0 - t1 - t2 + t3;
-        f[base + 3] = t0 - t1 + t2 - t3;
+        f[base] = (t0 + t1 + t2 + t3).0;
+        f[base + 1] = (t0 + t1 - t2 - t3).0;
+        f[base + 2] = (t0 - t1 - t2 + t3).0;
+        f[base + 3] = (t0 - t1 + t2 - t3).0;
     }
 
     // §8.5.10 — Scale per Eq. 8-321 / 8-322 using LevelScale4x4(qP%6, 0, 0).
@@ -1127,14 +1129,14 @@ pub fn inverse_hadamard_luma_dc_16x16(
         // Eq. 8-321.
         let shift = qp_div - 6;
         for k in 0..16 {
-            dc_y[k] = (f[k] * ls) << shift;
+            dc_y[k] = f[k].wrapping_mul(ls).wrapping_shl(shift as u32);
         }
     } else {
         // Eq. 8-322.
         let shift = 6 - qp_div;
         let round = 1 << (5 - qp_div);
         for k in 0..16 {
-            dc_y[k] = (f[k] * ls + round) >> shift;
+            dc_y[k] = f[k].wrapping_mul(ls).wrapping_add(round) >> shift;
         }
     }
     Ok(dc_y)
@@ -1883,6 +1885,63 @@ mod tests {
         let sl = default_scaling_list_8x8_flat();
         let out = inverse_transform_8x8(&coeffs, 36, &sl, 8).unwrap();
         assert_eq!(out, rows_0347_vs_1256(1_000, 0));
+    }
+
+    #[test]
+    fn inverse_cores_wrap_32_bits_instead_of_overflowing() {
+        // Scaling wraps (eqs. 8-336 / 8-337 / 8-356 / 8-357 on hostile
+        // levels), so a core can see any i32. A lone d_00 = i32::MAX
+        // passes unchanged through every butterfly of both cores (the DC
+        // basis is all ones), then (m + 32) >> 6 wraps:
+        // (i32::MAX + 32) wraps to i32::MIN + 31, and >> 6 gives
+        // -33_554_432. Overflow checks used to panic here instead.
+        let wrapped = (i32::MAX.wrapping_add(32)) >> 6;
+        assert_eq!(wrapped, -33_554_432);
+        let mut d4 = [0i32; 16];
+        d4[0] = i32::MAX;
+        assert_eq!(inverse_core_4x4(&d4), [wrapped; 16]);
+        assert_eq!(inverse_core_4x4_sparse(&d4), [wrapped; 16]);
+        let mut d8 = [0i32; 64];
+        d8[0] = i32::MAX;
+        assert_eq!(inverse_core_8x8(&d8), [wrapped; 64]);
+        // Mixed extremes through every stage: no overflow panic.
+        for (a, b) in [
+            (i32::MAX, i32::MIN),
+            (i32::MIN, i32::MIN),
+            (i32::MAX, i32::MAX),
+        ] {
+            let d4: [i32; 16] = core::array::from_fn(|k| if k % 3 == 0 { a } else { b });
+            let d8: [i32; 64] = core::array::from_fn(|k| if k % 5 < 2 { a } else { b });
+            let _ = inverse_core_4x4(&d4);
+            let _ = inverse_core_8x8(&d8);
+        }
+    }
+
+    #[test]
+    fn inverse_transforms_take_hostile_levels_at_every_qp() {
+        // The largest levels the entropy decoders accept (about 2^22),
+        // the steepest scaling lists, every QP: each transform wraps, as
+        // release builds always did, instead of overflowing.
+        let big = 1 << 22;
+        let sl4 = [255i32; 16];
+        let sl8 = [255i32; 64];
+        for qp in 0..=51 {
+            for sign in [1, -1] {
+                let c16: [i32; 16] =
+                    core::array::from_fn(|k| sign * if k % 2 == 0 { big } else { -big });
+                let c64: [i32; 64] =
+                    core::array::from_fn(|k| sign * if k % 3 == 0 { big } else { -big });
+                let c4: [i32; 4] = [sign * big, -sign * big, sign * big, sign * big];
+                let c8: [i32; 8] =
+                    core::array::from_fn(|k| if k % 2 == 0 { sign * big } else { -sign * big });
+                inverse_transform_4x4(&c16, qp, &sl4, 8).unwrap();
+                inverse_transform_4x4_dc_preserved(&c16, qp, &sl4, 8).unwrap();
+                inverse_transform_8x8(&c64, qp, &sl8, 8).unwrap();
+                inverse_hadamard_luma_dc_16x16(&c16, qp, &sl4, 8).unwrap();
+                inverse_hadamard_chroma_dc_420(&c4, qp, &sl4, 8).unwrap();
+                inverse_hadamard_chroma_dc_422(&c8, qp, &sl4, 8).unwrap();
+            }
+        }
     }
 
     // ------------ 16x16 luma DC Hadamard (§8.5.10) ----------------------
