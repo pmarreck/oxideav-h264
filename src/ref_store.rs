@@ -14,7 +14,7 @@
 //!
 //! Clean-room: derived only from ITU-T Rec. H.264 (08/2024).
 
-use crate::picture::{PicSample, Picture, Sample};
+use crate::picture::{AnyPicture, PicSample, Picture, Sample};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -113,7 +113,7 @@ pub trait RefPicProvider<S: PicSample = Sample> {
     /// thread (its [`Self::ref_pic`] then carries no samples). `None`
     /// for an ordinary, fully reconstructed reference.
     #[doc(hidden)] // internal — frame-threading plumbing
-    fn ref_planes(&self, _list: u8, _idx: u32) -> Option<&crate::frame_thread::SharedPlanes<S>> {
+    fn ref_planes(&self, _list: u8, _idx: u32) -> Option<&crate::frame_thread::SharedPlanes> {
         None
     }
 }
@@ -137,7 +137,7 @@ pub trait RefPicProvider<S: PicSample = Sample> {
 /// (unbounded growth — the 2026-07-25 scheduled-fuzz OOM triage
 /// surfaced it).
 pub struct RefPicStore {
-    pictures: HashMap<u32, Arc<Picture>>,
+    pictures: HashMap<u32, Arc<AnyPicture>>,
     ref_pic_list_0: Vec<u32>,
     ref_pic_list_1: Vec<u32>,
 }
@@ -158,12 +158,12 @@ impl RefPicStore {
     }
 
     /// Insert (or replace) the picture stored at `key`.
-    pub fn insert(&mut self, key: u32, pic: Picture) {
-        self.pictures.insert(key, Arc::new(pic));
+    pub fn insert(&mut self, key: u32, pic: impl Into<AnyPicture>) {
+        self.pictures.insert(key, Arc::new(pic.into()));
     }
 
     /// The shared handle of the picture stored at `key`.
-    pub(crate) fn get_arc(&self, key: u32) -> Option<Arc<Picture>> {
+    pub(crate) fn get_arc(&self, key: u32) -> Option<Arc<AnyPicture>> {
         self.pictures.get(&key).cloned()
     }
 
@@ -183,7 +183,7 @@ impl RefPicStore {
 
     /// [`Self::retain_keys`], handing back the dropped pictures (for the
     /// decoder to reuse their buffers).
-    pub fn take_unlisted(&mut self, live: &[u32]) -> Vec<Arc<Picture>> {
+    pub fn take_unlisted(&mut self, live: &[u32]) -> Vec<Arc<AnyPicture>> {
         let dead: Vec<u32> = self
             .pictures
             .keys()
@@ -212,20 +212,20 @@ impl RefPicStore {
     }
 
     /// Fetch a picture directly by key.
-    pub fn get_by_key(&self, key: u32) -> Option<&Picture> {
+    pub fn get_by_key(&self, key: u32) -> Option<&AnyPicture> {
         self.pictures.get(&key).map(|p| &**p)
     }
 }
 
-impl RefPicProvider for RefPicStore {
-    fn ref_pic(&self, list: u8, idx: u32) -> Option<&Picture> {
+impl<S: PicSample> RefPicProvider<S> for RefPicStore {
+    fn ref_pic(&self, list: u8, idx: u32) -> Option<&Picture<S>> {
         let keys = match list {
             0 => &self.ref_pic_list_0,
             1 => &self.ref_pic_list_1,
             _ => return None,
         };
         let key = keys.get(idx as usize).copied()?;
-        self.get_by_key(key)
+        S::picture(self.get_by_key(key)?)
     }
 }
 
@@ -270,12 +270,18 @@ mod tests {
         s.insert(5, pic(16, 42));
         s.insert(7, pic(16, 99));
         s.set_list_0(vec![5, 7]);
-        assert_eq!(s.ref_pic(0, 0).unwrap().luma[0], 42);
-        assert_eq!(s.ref_pic(0, 1).unwrap().luma[0], 99);
+        assert_eq!(
+            RefPicProvider::<Sample>::ref_pic(&s, 0, 0).unwrap().luma[0],
+            42
+        );
+        assert_eq!(
+            RefPicProvider::<Sample>::ref_pic(&s, 0, 1).unwrap().luma[0],
+            99
+        );
         // Out-of-bounds index.
-        assert!(s.ref_pic(0, 2).is_none());
+        assert!(RefPicProvider::<Sample>::ref_pic(&s, 0, 2).is_none());
         // Wrong list.
-        assert!(s.ref_pic(1, 0).is_none());
+        assert!(RefPicProvider::<Sample>::ref_pic(&s, 1, 0).is_none());
     }
 
     #[test]
@@ -283,7 +289,10 @@ mod tests {
         let mut s = RefPicStore::new();
         s.insert(0, pic(16, 1));
         s.set_list_1(vec![0]);
-        assert_eq!(s.ref_pic(1, 0).unwrap().luma[0], 1);
+        assert_eq!(
+            RefPicProvider::<Sample>::ref_pic(&s, 1, 0).unwrap().luma[0],
+            1
+        );
     }
 
     /// Round 430 — `retain_keys` drops every picture not named live so
@@ -312,7 +321,7 @@ mod tests {
     #[test]
     fn store_unknown_list_returns_none() {
         let s = RefPicStore::new();
-        assert!(s.ref_pic(2, 0).is_none());
+        assert!(RefPicProvider::<Sample>::ref_pic(&s, 2, 0).is_none());
     }
 
     #[test]

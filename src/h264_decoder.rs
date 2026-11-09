@@ -56,7 +56,7 @@ use crate::dpb_output::{DpbOutput, OutputEntry};
 use crate::frame_thread::{Deferred, FtProvider, FtRef, FtSliceWork, Pool, SharedPlanes};
 use crate::mb_grid::MbGrid;
 use crate::out_shape::{OutShape, ShapeTraits};
-use crate::picture::Picture;
+use crate::picture::{AnyPicture, PicSample, Picture, with_pic};
 use crate::poc::{PocResult, PocSlice, PocSps, PocState, derive_poc};
 use crate::ref_list::{self, DpbEntry, MmcoOp as RefMmcoOp, PicStructure, RefMarking, RplmOp};
 use crate::ref_store::{RefPicProvider, RefPicStore};
@@ -143,7 +143,7 @@ struct FtPicture {
 /// fresh one is started from the triggering slice.
 struct PictureInProgress {
     /// Reconstructed samples.
-    pic: Picture,
+    pic: AnyPicture,
     /// MB metadata for the assembled picture. Carries §6.4.11 availability
     /// plus per-MB QP/CBP/etc. across slice boundaries so continuation
     /// slices see prior slices' MBs as neighbours during intra prediction
@@ -219,7 +219,7 @@ struct PictureInProgress {
 /// access-unit `frame_num`).
 struct PendingField {
     /// Reconstructed half-height field samples (field rows only).
-    pic: Picture,
+    pic: AnyPicture,
     /// `true` for a bottom field (the field occupies the odd output
     /// rows), `false` for a top field (even output rows).
     is_bottom: bool,
@@ -444,7 +444,7 @@ pub struct H264CodecDecoder {
     /// Sample planes and macroblock grid of finished pictures, reused by
     /// the next pictures of the same geometry instead of being freed and
     /// allocated (and page-faulted) again. At most two pictures.
-    spare_pictures: Vec<Picture>,
+    spare_pictures: Vec<AnyPicture>,
     spare_grid: Option<MbGrid>,
     /// The parameter-set NAL units of the `avcC` record, replayed into
     /// the fresh NAL driver of a `reset` (a seek keeps the stream's
@@ -1413,9 +1413,9 @@ impl H264CodecDecoder {
         // an IDR) is refused, at every thread count alike, rather than
         // reconstructed into planes laid out for another geometry.
         let fits = self.in_progress.as_ref().is_none_or(|p| {
-            p.pic.chroma_array_type == sps.chroma_array_type()
-                && p.pic.width_in_samples == sps.pic_width_in_mbs() * 16
-                && p.pic.height_in_samples == sps.pic_height_in_mbs(header.field_pic_flag) * 16
+            p.pic.chroma_array_type() == sps.chroma_array_type()
+                && p.pic.width_in_samples() == sps.pic_width_in_mbs() * 16
+                && p.pic.height_in_samples() == sps.pic_height_in_mbs(header.field_pic_flag) * 16
         });
         if !fits {
             return Err(Error::invalid(
@@ -1488,8 +1488,8 @@ impl H264CodecDecoder {
         // (highest PicNum but opposite parity) at index 0 for a second
         // field — the §8.2.4.2.5 alternation instead starts with the
         // same-parity field of the previous frame.
-        let mut l0_overrides: Vec<Option<Picture>> = Vec::new();
-        let mut l1_overrides: Vec<Option<Picture>> = Vec::new();
+        let mut l0_overrides: Vec<Option<AnyPicture>> = Vec::new();
+        let mut l1_overrides: Vec<Option<AnyPicture>> = Vec::new();
         let mut l0_parities: Vec<Option<u8>> = Vec::new();
         let mut l1_parities: Vec<Option<u8>> = Vec::new();
         let mut l0_unit_keys: Vec<u32> = Vec::new();
@@ -1676,7 +1676,7 @@ impl H264CodecDecoder {
             // — the stored top FIELD picture alone carries only its
             // own field POC).
             type FrameListResolution = (
-                Vec<Option<Picture>>,
+                Vec<Option<AnyPicture>>,
                 Vec<i32>,
                 Vec<bool>,
                 Vec<(i32, i32)>,
@@ -1694,10 +1694,12 @@ impl H264CodecDecoder {
                     let ov = pairing.and_then(|p| {
                         let top = self.ref_store.get_by_key(p.top_key)?;
                         let bottom = self.ref_store.get_by_key(p.bottom_key)?;
-                        let mut merged = interleave_fields(top, bottom);
+                        let mut merged = interleave_any(top, bottom)?;
                         if let Some(u) = unit {
-                            merged.pic_order_cnt = u.pic_order_cnt;
-                            merged.frame_num = u.frame_num;
+                            with_pic!(&mut merged, m => {
+                                m.pic_order_cnt = u.pic_order_cnt;
+                                m.frame_num = u.frame_num;
+                            });
                         }
                         Some(merged)
                     });
@@ -1705,7 +1707,7 @@ impl H264CodecDecoder {
                     pocs.push(unit.map(|u| u.pic_order_cnt).unwrap_or_else(|| {
                         self.ref_store
                             .get_by_key(key)
-                            .map(|p| p.pic_order_cnt)
+                            .map(|p| p.pic_order_cnt())
                             .unwrap_or(0)
                     }));
                     lts.push(unit.map(|u| u.is_long_term()).unwrap_or(false));
@@ -1739,21 +1741,24 @@ impl H264CodecDecoder {
         // temporal-direct derivation can consult it. Idempotent across
         // the slices of a coded picture (§7.4.1.2.4 requires POC
         // consistency).
-        in_progress.pic.pic_order_cnt = in_progress.poc.pic_order_cnt;
-        in_progress.pic.frame_num = header.frame_num;
+        let poc = &in_progress.poc;
+        with_pic!(&mut in_progress.pic, p => {
+            p.pic_order_cnt = poc.pic_order_cnt;
+            p.frame_num = header.frame_num;
         // §8.4.1.2.1 Table 8-7 + §8.4.1.2.3 — the current picture's
         // coding structure, field parity and per-field order counts
         // feed the temporal-direct co-located derivation.
-        in_progress.pic.coding_struct = if header.field_pic_flag {
-            crate::picture::PicCodingStruct::Fld
-        } else if sps.mb_adaptive_frame_field_flag {
-            crate::picture::PicCodingStruct::Afrm
-        } else {
-            crate::picture::PicCodingStruct::Frm
-        };
-        in_progress.pic.is_bottom_field = header.bottom_field_flag;
-        in_progress.pic.top_field_order_cnt = in_progress.poc.top_field_order_cnt;
-        in_progress.pic.bottom_field_order_cnt = in_progress.poc.bottom_field_order_cnt;
+            p.coding_struct = if header.field_pic_flag {
+                crate::picture::PicCodingStruct::Fld
+            } else if sps.mb_adaptive_frame_field_flag {
+                crate::picture::PicCodingStruct::Afrm
+            } else {
+                crate::picture::PicCodingStruct::Frm
+            };
+            p.is_bottom_field = header.bottom_field_flag;
+            p.top_field_order_cnt = poc.top_field_order_cnt;
+            p.bottom_field_order_cnt = poc.bottom_field_order_cnt;
+        });
 
         // §8.4.1.2.3 — precompute POCs + long-term flags for the
         // slice's RefPicList0. A later B-slice uses this picture as
@@ -1773,7 +1778,7 @@ impl H264CodecDecoder {
                     .map(|&key| {
                         self.ref_store
                             .get_by_key(key)
-                            .map(|p| p.pic_order_cnt)
+                            .map(|p| p.pic_order_cnt())
                             .unwrap_or(0)
                     })
                     .collect();
@@ -1792,7 +1797,7 @@ impl H264CodecDecoder {
                     .map(|&key| {
                         self.ref_store
                             .get_by_key(key)
-                            .map(|p| p.pic_order_cnt)
+                            .map(|p| p.pic_order_cnt())
                             .unwrap_or(0)
                     })
                     .collect();
@@ -1813,21 +1818,23 @@ impl H264CodecDecoder {
         // primary coded picture have the same POCs — but RPLM may
         // differ. Using the first non-empty snapshot matches the
         // common "first slice wins" convention for primary MB 0).
-        if in_progress.pic.ref_list_0_pocs.is_empty() {
-            in_progress.pic.ref_list_0_pocs = list_0_pocs.clone();
-            in_progress.pic.ref_list_0_longterm = list_0_longterm.clone();
-            in_progress.pic.ref_list_1_pocs = list_1_pocs.clone();
-            in_progress.pic.ref_list_1_longterm = list_1_longterm.clone();
-            // §8.4.1.2.3 MapColToList0 — picture-identity snapshot: a
+        with_pic!(&mut in_progress.pic, p => {
+            if p.ref_list_0_pocs.is_empty() {
+                p.ref_list_0_pocs = list_0_pocs.clone();
+                p.ref_list_0_longterm = list_0_longterm.clone();
+                p.ref_list_1_pocs = list_1_pocs.clone();
+                p.ref_list_1_longterm = list_1_longterm.clone();
+                // §8.4.1.2.3 MapColToList0 — picture-identity snapshot: a
             // later B slice using this picture as colPic resolves the
             // colocated block's refIdxCol to a concrete DPB unit.
-            in_progress.pic.ref_list_0_keys = list0.clone();
-            in_progress.pic.ref_list_1_keys = list1.clone();
-            in_progress.pic.ref_list_0_parities = l0_parities.clone();
-            in_progress.pic.ref_list_1_parities = l1_parities.clone();
-            in_progress.pic.ref_list_0_unit_keys = l0_unit_keys.clone();
-            in_progress.pic.ref_list_1_unit_keys = l1_unit_keys.clone();
-        }
+                p.ref_list_0_keys = list0.clone();
+                p.ref_list_1_keys = list1.clone();
+                p.ref_list_0_parities = l0_parities.clone();
+                p.ref_list_1_parities = l1_parities.clone();
+                p.ref_list_0_unit_keys = l0_unit_keys.clone();
+                p.ref_list_1_unit_keys = l1_unit_keys.clone();
+            }
+        });
         let _ = list_1_pocs;
         let provider = BorrowedRefProvider {
             store: &self.ref_store,
@@ -1858,15 +1865,15 @@ impl H264CodecDecoder {
         let recon = if ft_slice {
             // Frame threading — the decoding-order part now; the sample
             // stage later, on the pool, with owned reference handles.
-            let (plan, res) = reconstruct::ft_motion_pass(
+            let (plan, res) = with_pic!(&mut in_progress.pic, p => reconstruct::ft_motion_pass(
                 &sd,
                 header,
                 sps,
                 pps,
                 &provider,
-                &mut in_progress.pic,
+                p,
                 &mut in_progress.grid,
-            );
+            ));
             let ft = self.ft.as_ref().expect("frame threading active");
             let refs = ft_provider(provider, &self.ref_store, &ft.slots);
             let mb_field_decoding_flags = sd.mb_field_decoding_flags.clone();
@@ -1885,16 +1892,16 @@ impl H264CodecDecoder {
                 });
             res.map(|()| mb_field_decoding_flags)
         } else {
-            reconstruct::reconstruct_slice_no_deblock_threaded(
+            with_pic!(&mut in_progress.pic, p => reconstruct::reconstruct_slice_no_deblock_threaded(
                 &sd,
                 header,
                 sps,
                 pps,
                 &provider,
-                &mut in_progress.pic,
+                p,
                 &mut in_progress.grid,
                 self.threads,
-            )
+            ))
             .map(|()| sd.mb_field_decoding_flags.clone())
         };
         let mb_field_decoding_flags =
@@ -2000,7 +2007,7 @@ impl H264CodecDecoder {
                 PicStructure::Frame | PicStructure::FieldPair => {
                     let ov = ref_store.get_by_key(e.dpb_key).map(|p| {
                         let mut v = p.field_view(bottom);
-                        v.pic_order_cnt = field_poc;
+                        with_pic!(&mut v, f => f.pic_order_cnt = field_poc);
                         v
                     });
                     keys.push(e.dpb_key);
@@ -2090,7 +2097,7 @@ impl H264CodecDecoder {
         // decoded MV grid into the Picture so `ref_store` carries it
         // forward. Idempotent: overwrites whatever was in the Picture
         // before.
-        snapshot_grid_into_picture(&mut pic, &grid);
+        with_pic!(&mut pic, p => snapshot_grid_into_picture(p, &grid));
 
         // Frame threading — the decoder keeps the picture's metadata and
         // motion (`pic`, now without samples: its reference-store entry
@@ -2100,32 +2107,42 @@ impl H264CodecDecoder {
         let mut grid = Some(grid);
         let ft_job = match ft {
             Some(ftp) => {
-                let mut samples = Picture::new(
-                    0,
-                    0,
-                    pic.chroma_array_type,
-                    pic.bit_depth_luma,
-                    pic.bit_depth_chroma,
-                );
-                samples.width_in_samples = pic.width_in_samples;
-                samples.height_in_samples = pic.height_in_samples;
-                samples.pic_order_cnt = pic.pic_order_cnt;
-                samples.frame_num = pic.frame_num;
-                samples.luma = std::mem::take(&mut pic.luma);
-                samples.cb = std::mem::take(&mut pic.cb);
-                samples.cr = std::mem::take(&mut pic.cr);
-                let planes = Arc::new(SharedPlanes::new(
-                    samples.width_in_samples as usize,
-                    samples.height_in_samples as usize,
-                    samples.chroma_width() as usize,
-                    samples.chroma_height() as usize,
-                    match samples.chroma_array_type {
+                /// Move `pic`'s planes into a new picture with its
+                /// geometry, POC and frame_num.
+                fn split_samples<S: PicSample>(pic: &mut Picture<S>) -> Picture<S> {
+                    let mut samples = Picture::zeroed(
+                        0,
+                        0,
+                        pic.chroma_array_type,
+                        pic.bit_depth_luma,
+                        pic.bit_depth_chroma,
+                    );
+                    samples.width_in_samples = pic.width_in_samples;
+                    samples.height_in_samples = pic.height_in_samples;
+                    samples.pic_order_cnt = pic.pic_order_cnt;
+                    samples.frame_num = pic.frame_num;
+                    samples.luma = std::mem::take(&mut pic.luma);
+                    samples.cb = std::mem::take(&mut pic.cb);
+                    samples.cr = std::mem::take(&mut pic.cr);
+                    samples
+                }
+                let samples: AnyPicture = match &mut pic {
+                    AnyPicture::Narrow(p) => split_samples(p).into(),
+                    AnyPicture::Wide(p) => split_samples(p).into(),
+                };
+                let planes = with_pic!(&samples, s => SharedPlanes::new(
+                    s.width_in_samples as usize,
+                    s.height_in_samples as usize,
+                    s.chroma_width() as usize,
+                    s.chroma_height() as usize,
+                    match s.chroma_array_type {
                         1 => 8,
                         2 => 16,
                         _ => 0,
                     },
+                    matches!(samples, AnyPicture::Narrow(_)),
                 ));
-                Some((ftp, samples, grid.take().expect("grid"), planes))
+                Some((ftp, samples, grid.take().expect("grid"), Arc::new(planes)))
             }
             None => None,
         };
@@ -2150,8 +2167,8 @@ impl H264CodecDecoder {
         let bit_depth_c = 8 + sps.bit_depth_chroma_minus8;
         let mbaff_frame_flag = sps.mb_adaptive_frame_field_flag && !first_header.field_pic_flag;
         if deblock_enabled && let Some(grid) = grid.as_ref() {
-            reconstruct::deblock_picture_full_threaded(
-                &mut pic,
+            with_pic!(&mut pic, p => reconstruct::deblock_picture_full_threaded(
+                p,
                 grid,
                 deblock_alpha_off,
                 deblock_beta_off,
@@ -2162,14 +2179,14 @@ impl H264CodecDecoder {
                 first_header.field_pic_flag,
                 &mb_field_flags,
                 self.threads,
-            );
+            ));
         }
 
         // The output frame of a serially reconstructed frame picture,
         // converted now so the picture itself can move into the
         // reference store instead of being copied.
         let mut early_vf = if ft_planes.is_none() && !first_header.field_pic_flag {
-            Some(picture_to_video_frame(&pic, pts, sps.frame_crop_margins()))
+            Some(any_to_video_frame(&pic, pts, sps.frame_crop_margins()))
         } else {
             None
         };
@@ -2240,12 +2257,14 @@ impl H264CodecDecoder {
                 current_entry.pic_order_cnt = current_entry
                     .top_field_order_cnt
                     .min(current_entry.bottom_field_order_cnt);
-                pic.pic_order_cnt = current_entry.pic_order_cnt;
-                pic.frame_num = 0;
+                with_pic!(&mut pic, p => {
+                    p.pic_order_cnt = current_entry.pic_order_cnt;
+                    p.frame_num = 0;
+                });
             }
 
             let stored = if early_vf.is_some() {
-                std::mem::replace(&mut pic, Picture::new(0, 0, 0, 8, 8))
+                std::mem::replace(&mut pic, AnyPicture::empty())
             } else {
                 pic.clone()
             };
@@ -2374,9 +2393,7 @@ impl H264CodecDecoder {
         let out_pic = match (&ft_planes, early_vf.take()) {
             (Some(planes), _) => OutPic::Pending(planes.clone()),
             (None, Some(vf)) => OutPic::Ready(vf),
-            (None, None) => {
-                OutPic::Ready(picture_to_video_frame(&pic, pts, sps.frame_crop_margins()))
-            }
+            (None, None) => OutPic::Ready(any_to_video_frame(&pic, pts, sps.frame_crop_margins())),
         };
         let out = OutFrame {
             pic: out_pic,
@@ -2404,7 +2421,7 @@ impl H264CodecDecoder {
     #[allow(clippy::too_many_arguments)]
     fn handle_field_output(
         &mut self,
-        pic: Picture,
+        pic: AnyPicture,
         is_bottom: bool,
         frame_num: u32,
         field_poc: i32,
@@ -2418,19 +2435,25 @@ impl H264CodecDecoder {
             // same-parity field, or a field with a different frame_num,
             // means the first field was unpaired — emit it on its own and
             // start a fresh pending pair with the current field.
-            if prev.is_bottom != is_bottom && prev.frame_num == frame_num {
+            let paired = if prev.is_bottom != is_bottom && prev.frame_num == frame_num {
                 let (top, bottom) = if prev.is_bottom {
                     (&pic, &prev.pic)
                 } else {
                     (&prev.pic, &pic)
                 };
-                let frame = interleave_fields(top, bottom);
+                // Fields of one frame share their SPS: two fields of
+                // different sample types (a broken stream) stay unpaired.
+                interleave_any(top, bottom)
+            } else {
+                None
+            };
+            if let Some(frame) = paired {
                 // §8.2.1 eq. 8-1 — PicOrderCnt(frame) =
                 // Min(TopFieldOrderCnt, BottomFieldOrderCnt).
                 let frame_poc = prev.field_poc.min(field_poc);
                 let frame_pts = prev.pts.or(pts);
-                let vf = picture_to_video_frame(&frame, frame_pts, crop);
-                let shape = traits.shape(frame.width_in_samples, frame.height_in_samples, crop);
+                let vf = any_to_video_frame(&frame, frame_pts, crop);
+                let shape = traits.shape(frame.width_in_samples(), frame.height_in_samples(), crop);
                 let entry = OutputEntry {
                     picture: OutFrame {
                         pic: OutPic::Ready(vf),
@@ -2466,10 +2489,10 @@ impl H264CodecDecoder {
     fn emit_unpaired_field(&mut self, field: PendingField) {
         // A lone field is half the frame's height: the vertical
         // cropping margins shrink with it.
-        let vf = picture_to_video_frame(&field.pic, field.pts, field.crop.for_field());
+        let vf = any_to_video_frame(&field.pic, field.pts, field.crop.for_field());
         let shape = field.traits.shape(
-            field.pic.width_in_samples,
-            field.pic.height_in_samples,
+            field.pic.width_in_samples(),
+            field.pic.height_in_samples(),
             field.crop.for_field(),
         );
         let entry = OutputEntry {
@@ -2563,7 +2586,7 @@ impl H264CodecDecoder {
         chroma_array_type: u32,
         bit_depth_luma: u32,
         bit_depth_chroma: u32,
-    ) -> Picture {
+    ) -> AnyPicture {
         let spare = self.spare_pictures.iter().position(|p| {
             p.has_shape(
                 width,
@@ -2574,8 +2597,8 @@ impl H264CodecDecoder {
             )
         });
         match spare {
-            Some(i) => Picture::recycled(self.spare_pictures.swap_remove(i), self.threads > 1),
-            None => Picture::new(
+            Some(i) => AnyPicture::recycled(self.spare_pictures.swap_remove(i), self.threads > 1),
+            None => AnyPicture::zeroed(
                 width,
                 height,
                 chroma_array_type,
@@ -2599,8 +2622,8 @@ impl H264CodecDecoder {
 
     /// Keep a finished picture's planes (if it still has them) and grid
     /// for [`Self::fresh_picture`] / [`Self::fresh_grid`].
-    fn recycle_picture(&mut self, pic: Picture, grid: Option<MbGrid>) {
-        if !pic.luma.is_empty() && self.spare_pictures.len() < 2 {
+    fn recycle_picture(&mut self, pic: AnyPicture, grid: Option<MbGrid>) {
+        if !pic.has_no_samples() && self.spare_pictures.len() < 2 {
             self.spare_pictures.push(pic);
         }
         if let Some(g) = grid {
@@ -2770,27 +2793,24 @@ fn gray_picture(
     chroma_array_type: u32,
     bit_depth_y: u32,
     bit_depth_c: u32,
-) -> Picture {
-    let mut p = Picture::new(
+) -> AnyPicture {
+    let mut any = AnyPicture::zeroed(
         width_samples,
         height_samples,
         chroma_array_type,
         bit_depth_y,
         bit_depth_c,
     );
-    p.non_existing = true;
-    let grey_y = crate::picture::to_sample(1 << (bit_depth_y.saturating_sub(1)));
-    let grey_c = crate::picture::to_sample(1 << (bit_depth_c.saturating_sub(1)));
-    for v in p.luma.iter_mut() {
-        *v = grey_y;
+    fn fill<S: PicSample>(p: &mut Picture<S>, bit_depth_y: u32, bit_depth_c: u32) {
+        p.non_existing = true;
+        let grey_y: S = crate::picture::to_sample(1 << (bit_depth_y.saturating_sub(1)));
+        let grey_c: S = crate::picture::to_sample(1 << (bit_depth_c.saturating_sub(1)));
+        p.luma.fill(grey_y);
+        p.cb.fill(grey_c);
+        p.cr.fill(grey_c);
     }
-    for v in p.cb.iter_mut() {
-        *v = grey_c;
-    }
-    for v in p.cr.iter_mut() {
-        *v = grey_c;
-    }
-    p
+    with_pic!(&mut any, p => fill(p, bit_depth_y, bit_depth_c));
+    any
 }
 
 /// Per-slice [`RefPicProvider`] that borrows pictures from a long-running
@@ -2805,7 +2825,7 @@ type FieldListPocsLt = (Vec<i32>, Vec<bool>, Vec<i32>, Vec<bool>);
 /// parallel per-index vectors (see `resolve_field_list`).
 struct ResolvedFieldList {
     keys: Vec<u32>,
-    overrides: Vec<Option<Picture>>,
+    overrides: Vec<Option<AnyPicture>>,
     pocs: Vec<i32>,
     longterm: Vec<bool>,
     /// Parity of each reference FIELD (0 = top, 1 = bottom) for the
@@ -2824,8 +2844,8 @@ struct BorrowedRefProvider<'a> {
     list_1: &'a [u32],
     /// `list_0` / `list_1` resolved through `store` once at slice
     /// setup (motion compensation looks references up per partition).
-    resolved_0: Vec<Option<&'a Picture>>,
-    resolved_1: Vec<Option<&'a Picture>>,
+    resolved_0: Vec<Option<&'a AnyPicture>>,
+    resolved_1: Vec<Option<&'a AnyPicture>>,
     /// §8.4.1.2.3 — precomputed POCs of the pictures in `list_0`,
     /// supplied to the temporal-direct MapColToList0 derivation.
     list_0_pocs: Vec<i32>,
@@ -2841,8 +2861,8 @@ struct BorrowedRefProvider<'a> {
     /// shadow the key-based `ref_store` lookup at that index; entries
     /// resolving to stored coded fields stay `None` and read the
     /// half-height stored picture directly.
-    list_0_overrides: Vec<Option<Picture>>,
-    list_1_overrides: Vec<Option<Picture>>,
+    list_0_overrides: Vec<Option<AnyPicture>>,
+    list_1_overrides: Vec<Option<AnyPicture>>,
     /// Round-416 PAFF — §8.4.1.4 Table 8-10: per-index parity of the
     /// reference FIELD (0 = top, 1 = bottom) for field slices; empty
     /// for frame slices.
@@ -2861,17 +2881,17 @@ struct BorrowedRefProvider<'a> {
     list_1_pair_keys: Vec<Option<(u32, u32)>>,
 }
 
-impl RefPicProvider for BorrowedRefProvider<'_> {
-    fn ref_pic(&self, list: u8, idx: u32) -> Option<&Picture> {
+impl<S: PicSample> RefPicProvider<S> for BorrowedRefProvider<'_> {
+    fn ref_pic(&self, list: u8, idx: u32) -> Option<&Picture<S>> {
         let (resolved, overrides) = match list {
             0 => (&self.resolved_0, &self.list_0_overrides),
             1 => (&self.resolved_1, &self.list_1_overrides),
             _ => return None,
         };
         if let Some(Some(p)) = overrides.get(idx as usize) {
-            return Some(p);
+            return S::picture(p);
         }
-        resolved.get(idx as usize).copied().flatten()
+        S::picture(resolved.get(idx as usize).copied().flatten()?)
     }
 
     fn ref_field_parity(&self, list: u8, idx: u32) -> Option<u8> {
@@ -2928,15 +2948,17 @@ impl RefPicProvider for BorrowedRefProvider<'_> {
         focs.get(idx as usize).copied()
     }
 
-    fn ref_pair_field(&self, list: u8, idx: u32, bottom: bool) -> Option<&Picture> {
+    fn ref_pair_field(&self, list: u8, idx: u32, bottom: bool) -> Option<&Picture<S>> {
         let pair_keys = match list {
             0 => &self.list_0_pair_keys,
             1 => &self.list_1_pair_keys,
             _ => return None,
         };
         let (top_key, bottom_key) = (*pair_keys.get(idx as usize)?)?;
-        self.store
-            .get_by_key(if bottom { bottom_key } else { top_key })
+        S::picture(
+            self.store
+                .get_by_key(if bottom { bottom_key } else { top_key })?,
+        )
     }
 }
 
@@ -2960,7 +2982,7 @@ fn ft_provider(
         list_1_focs,
         ..
     } = p;
-    let resolve = |keys: &[u32], overrides: Vec<Option<Picture>>| -> Vec<Option<FtRef>> {
+    let resolve = |keys: &[u32], overrides: Vec<Option<AnyPicture>>| -> Vec<Option<FtRef>> {
         let mut overrides = overrides.into_iter();
         keys.iter()
             .map(|&key| match overrides.next().flatten() {
@@ -3407,19 +3429,28 @@ impl H264CodecDecoder {
             let Some(shell) = self.ref_store.get_by_key(key) else {
                 continue;
             };
-            let mut full = shell.clone();
-            let (luma, cb, cr) = planes.assemble();
-            let n_l = (full.width_in_samples * full.height_in_samples) as usize;
-            let n_c = (full.chroma_width() * full.chroma_height()) as usize;
-            if ok && luma.len() == n_l && cb.len() == n_c && cr.len() == n_c {
-                full.luma = luma;
-                full.cb = cb;
-                full.cr = cr;
-            } else {
-                full.luma = vec![0; n_l];
-                full.cb = vec![0; n_c];
-                full.cr = vec![0; n_c];
+            /// Give the sample-less `full` the planes the pool published
+            /// (zeroed planes when the job failed).
+            fn fill<S: PicSample>(full: &mut Picture<S>, planes: &SharedPlanes, ok: bool) {
+                let n_l = (full.width_in_samples * full.height_in_samples) as usize;
+                let n_c = (full.chroma_width() * full.chroma_height()) as usize;
+                match planes.assemble::<S>() {
+                    Some((luma, cb, cr))
+                        if ok && luma.len() == n_l && cb.len() == n_c && cr.len() == n_c =>
+                    {
+                        full.luma = luma;
+                        full.cb = cb;
+                        full.cr = cr;
+                    }
+                    _ => {
+                        full.luma = vec![S::default(); n_l];
+                        full.cb = vec![S::default(); n_c];
+                        full.cr = vec![S::default(); n_c];
+                    }
+                }
             }
+            let mut full = shell.clone();
+            with_pic!(&mut full, p => fill(p, &planes, ok));
             self.ref_store.insert(key, full);
         }
     }
@@ -3435,7 +3466,13 @@ impl H264CodecDecoder {
         let Some(ftp) = ip.ft.take() else {
             return;
         };
-        crate::frame_thread::run_pixels(&mut ip.pic, &mut ip.grid, &ftp.works, None, None);
+        with_pic!(&mut ip.pic, p => crate::frame_thread::run_pixels(
+            p,
+            &mut ip.grid,
+            &ftp.works,
+            None,
+            None,
+        ));
         self.ft_materialize();
     }
 
@@ -3445,7 +3482,7 @@ impl H264CodecDecoder {
         &mut self,
         planes: Arc<SharedPlanes>,
         ftp: FtPicture,
-        mut samples: Picture,
+        mut samples: AnyPicture,
         mut grid: MbGrid,
         deblock: Option<(i32, i32)>,
         sps: Sps,
@@ -3478,16 +3515,16 @@ impl H264CodecDecoder {
                     pps: &pps,
                     mb_field_flags: &mb_field_flags,
                 });
-                if crate::frame_thread::run_pixels(
-                    &mut samples,
+                if with_pic!(&mut samples, p => crate::frame_thread::run_pixels(
+                    p,
                     &mut grid,
                     &ftp.works,
                     db,
                     Some(&planes),
-                ) {
+                )) {
                     drop(ftp);
                     drop(grid);
-                    let vf = picture_to_video_frame(&samples, pts, crop);
+                    let vf = any_to_video_frame(&samples, pts, crop);
                     planes.finish(Some(vf));
                 } else {
                     planes.abort();
@@ -3620,7 +3657,7 @@ impl H264CodecDecoder {
 /// reference or not — non-reference pictures never feed a later B
 /// slice, but the per-picture cost of the copy is tiny and it keeps
 /// the code path uniform.
-fn snapshot_grid_into_picture(pic: &mut Picture, grid: &MbGrid) {
+fn snapshot_grid_into_picture<S: PicSample>(pic: &mut Picture<S>, grid: &MbGrid) {
     let w = grid.width_in_mbs as usize;
     let h = grid.height_in_mbs as usize;
     let nmb = w * h;
@@ -3663,11 +3700,11 @@ fn snapshot_grid_into_picture(pic: &mut Picture, grid: &MbGrid) {
 /// so their luma + chroma plane geometries are identical apart from
 /// occupying alternate output lines. The frame inherits the fields' bit
 /// depth, chroma format and width.
-fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
+fn interleave_fields<S: PicSample>(top: &Picture<S>, bottom: &Picture<S>) -> Picture<S> {
     let w = top.width_in_samples;
     let field_h = top.height_in_samples;
     let frame_h = field_h * 2;
-    let mut frame = Picture::new(
+    let mut frame = Picture::zeroed(
         w,
         frame_h,
         top.chroma_array_type,
@@ -3725,7 +3762,27 @@ fn interleave_fields(top: &Picture, bottom: &Picture) -> Picture {
 /// The slim `VideoFrame` shape only carries `pts` + `planes`; the pixel
 /// format / resolution / time_base live on the stream's
 /// [`CodecParameters`] (set by the decoder from the SPS).
-fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargins) -> VideoFrame {
+/// [`picture_to_video_frame`] of whichever picture is inside.
+fn any_to_video_frame(pic: &AnyPicture, pts: Option<i64>, crop: FrameCropMargins) -> VideoFrame {
+    with_pic!(pic, p => picture_to_video_frame(p, pts, crop))
+}
+
+/// [`interleave_fields`] of two coded fields, `None` when they store
+/// different sample types (fields of one frame share their SPS, so a
+/// mismatch only comes from a broken stream).
+fn interleave_any(top: &AnyPicture, bottom: &AnyPicture) -> Option<AnyPicture> {
+    match (top, bottom) {
+        (AnyPicture::Narrow(t), AnyPicture::Narrow(b)) => Some(interleave_fields(t, b).into()),
+        (AnyPicture::Wide(t), AnyPicture::Wide(b)) => Some(interleave_fields(t, b).into()),
+        _ => None,
+    }
+}
+
+fn picture_to_video_frame<S: PicSample>(
+    pic: &Picture<S>,
+    pts: Option<i64>,
+    crop: FrameCropMargins,
+) -> VideoFrame {
     let w = pic.width_in_samples as usize;
     let h = pic.height_in_samples as usize;
     let cw = pic.chroma_width() as usize;
@@ -3761,8 +3818,8 @@ fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargin
     // Pack the `rect_w` x `rect_h` window at (`x0`, `y0`) of a plane
     // whose row stride is `src_stride` samples.
     #[allow(clippy::too_many_arguments)]
-    fn pack(
-        src: &[crate::picture::Sample],
+    fn pack<S: PicSample>(
+        src: &[S],
         src_stride: usize,
         x0: usize,
         y0: usize,
@@ -3776,10 +3833,11 @@ fn picture_to_video_frame(pic: &Picture, pts: Option<i64>, crop: FrameCropMargin
             let row = &row[x0.min(row.len())..(x0 + rect_w).min(row.len())];
             if wide {
                 for &s in row {
-                    out.extend_from_slice(&s.min(max as u16).to_le_bytes());
+                    let s: i32 = s.into();
+                    out.extend_from_slice(&(s.min(max) as u16).to_le_bytes());
                 }
             } else {
-                out.extend(row.iter().map(|&s| s.min(255) as u8));
+                S::extend_8bit(&mut out, row);
             }
         }
         out
@@ -4469,7 +4527,7 @@ mod tests {
         let pic = Picture::new(16, 16, 1, 8, 8);
         let grid = MbGrid::new(1, 1);
         dec.in_progress = Some(PictureInProgress {
-            pic,
+            pic: pic.into(),
             grid,
             first_nal_unit_type: nut,
             first_nal_ref_idc: nri,
@@ -4966,7 +5024,7 @@ mod tests {
         // Top field then bottom field of the same frame_num.
         let top = field_pic(16, 4, 30, 128, 8, 3);
         dec.handle_field_output(
-            top,
+            top.into(),
             false,
             3,
             8,
@@ -4980,7 +5038,7 @@ mod tests {
 
         let bottom = field_pic(16, 4, 40, 128, 10, 3);
         dec.handle_field_output(
-            bottom,
+            bottom.into(),
             true,
             3,
             10,
@@ -5018,7 +5076,7 @@ mod tests {
         // first must be emitted on its own, the second held pending.
         let top1 = field_pic(16, 4, 30, 128, 8, 3);
         dec.handle_field_output(
-            top1,
+            top1.into(),
             false,
             3,
             8,
@@ -5028,7 +5086,7 @@ mod tests {
         );
         let top2 = field_pic(16, 4, 50, 128, 12, 4);
         dec.handle_field_output(
-            top2,
+            top2.into(),
             false,
             4,
             12,
@@ -5166,7 +5224,7 @@ mod tests {
         };
         let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
         dec.handle_field_output(
-            field_pic(16, 4, 30, 128, 8, 3),
+            field_pic(16, 4, 30, 128, 8, 3).into(),
             false,
             3,
             8,
@@ -5175,7 +5233,7 @@ mod tests {
             ShapeTraits::default(),
         );
         dec.handle_field_output(
-            field_pic(16, 4, 40, 128, 10, 3),
+            field_pic(16, 4, 40, 128, 10, 3).into(),
             true,
             3,
             10,
@@ -5185,7 +5243,7 @@ mod tests {
         );
         // An orphan top field (next frame_num), flushed at EOF.
         dec.handle_field_output(
-            field_pic(16, 4, 50, 128, 12, 4),
+            field_pic(16, 4, 50, 128, 12, 4).into(),
             false,
             4,
             12,
@@ -5269,7 +5327,10 @@ mod tests {
         assert_eq!(dec.ref_picture_count(), 3);
         for e in &dec.dpb_entries {
             let pic = dec.ref_store.get_by_key(e.dpb_key).expect("stored");
-            assert!(pic.non_existing, "gap placeholders are non-existing");
+            assert!(
+                with_pic!(pic, p => p.non_existing),
+                "gap placeholders are non-existing"
+            );
         }
 
         // §8.2.5.2 stepped the POC state across every gap frame.
@@ -5280,5 +5341,92 @@ mod tests {
         dec.fill_frame_num_gap(&sps, 40_010).expect("second gap");
         assert_eq!(dec.dpb_entries.len(), 3);
         assert_eq!(dec.ref_picture_count(), 3);
+    }
+
+    /// 8-bit streams decode into byte pictures (half the memory traffic
+    /// of `u16`), deeper ones into `u16` pictures, with one thread and
+    /// with frame threads. Output equality cannot show this: both
+    /// sample types give the same frames.
+    #[test]
+    fn eight_bit_streams_decode_into_byte_pictures() {
+        use crate::encoder::deep::{DeepConfig, encode_deep_sequence};
+        for bd in [8u32, 10] {
+            let y: Vec<u16> = (0..32 * 32)
+                .map(|i| ((i * 7 + i / 32 * 3) % (1 << bd)) as u16)
+                .collect();
+            let c = vec![1u16 << (bd - 1); 16 * 16];
+            let frames = [(&y[..], &c[..], &c[..]); 3];
+            let enc = encode_deep_sequence(
+                &DeepConfig {
+                    width: 32,
+                    height: 32,
+                    bit_depth_luma: bd,
+                    bit_depth_chroma: bd,
+                    chroma_format_idc: 1,
+                    qp: 26,
+                    p_frames: true,
+                    intra_in_p: false,
+                    deblock: true,
+                    lossless: false,
+                    lossless_interop: false,
+                    cabac: false,
+                    transform_8x8: false,
+                },
+                &frames,
+            );
+            // The stored references of the serial decode, to compare the
+            // frame-threaded ones with: those are rebuilt from the bands
+            // the pool published (`ft_materialize`).
+            let mut serial: Vec<AnyPicture> = Vec::new();
+            for threads in [1, 4] {
+                let mut dec = H264CodecDecoder::new(CodecId::new("h264"));
+                dec.set_threads(threads);
+                let pkt = Packet::new(0, TimeBase::new(1, 30), enc.annex_b.clone());
+                dec.send_packet(&pkt).expect("send_packet");
+                // Frame threading holds slices back; replay them and wait
+                // for the pool's pictures.
+                dec.ft_pump(true);
+                dec.ft_materialize();
+                assert_eq!(dec.decode_error_count(), 0, "{bd}-bit, {threads} threads");
+                let mut stored = Vec::new();
+                for e in &dec.dpb_entries {
+                    let pic = dec.ref_store.get_by_key(e.dpb_key).expect("stored");
+                    assert_eq!(
+                        matches!(pic, AnyPicture::Narrow(_)),
+                        bd == 8,
+                        "{bd}-bit stream, {threads} threads: stored sample type"
+                    );
+                    assert!(!pic.has_no_samples());
+                    stored.push(pic.clone());
+                }
+                assert!(
+                    !stored.is_empty(),
+                    "{bd}-bit, {threads} threads: no reference stored"
+                );
+                if threads == 1 {
+                    serial = stored;
+                } else {
+                    assert_eq!(stored.len(), serial.len());
+                    for (t, s) in stored.iter().zip(&serial) {
+                        let same = match (t, s) {
+                            (AnyPicture::Narrow(t), AnyPicture::Narrow(s)) => {
+                                (&t.luma, &t.cb, &t.cr) == (&s.luma, &s.cb, &s.cr)
+                            }
+                            (AnyPicture::Wide(t), AnyPicture::Wide(s)) => {
+                                (&t.luma, &t.cb, &t.cr) == (&s.luma, &s.cb, &s.cr)
+                            }
+                            _ => false,
+                        };
+                        assert!(same, "{bd}-bit: a frame-threaded reference differs");
+                    }
+                }
+                dec.flush().expect("flush");
+                let mut frames_out = 0;
+                while let Ok(Frame::Video(_)) = dec.receive_frame() {
+                    frames_out += 1;
+                }
+                assert_eq!(frames_out, 3, "{bd}-bit, {threads} threads");
+            }
+        }
     }
 }
