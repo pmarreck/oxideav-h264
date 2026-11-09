@@ -2647,6 +2647,33 @@ fn cbf_cond_for(
     is_cr: bool,
     chroma_array_type: u32,
 ) -> bool {
+    cbf_cond_located(
+        grid,
+        |xn, yn, max_w, max_h| grid.neighbour_block_loc(current_mb_addr, xn, yn, max_w, max_h),
+        current_mb,
+        current_is_intra,
+        block_type,
+        loc,
+        is_cr,
+        chroma_array_type,
+    )
+}
+
+/// [`cbf_cond_for`] with the §6.4.12 neighbor location process given as
+/// `locate` (`(xN, yN, maxW, maxH)` to the macroblock and location inside it,
+/// as [`CabacNeighbourGrid::neighbour_block_loc`] for the current macroblock).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn cbf_cond_located(
+    grid: &CabacNeighbourGrid,
+    locate: impl Fn(i32, i32, i32, i32) -> Option<(u32, i32, i32)>,
+    current_mb: &CabacMbNeighbourInfo,
+    current_is_intra: bool,
+    block_type: BlockType,
+    loc: CbfLoc,
+    is_cr: bool,
+    chroma_array_type: u32,
+) -> bool {
     match loc {
         CbfLoc::Internal8x8(px, py) => {
             if px >= 0 && py >= 0 {
@@ -2661,9 +2688,7 @@ fn cbf_cond_for(
             } else {
                 // External — §6.4.11.2 / §6.4.11.3 via §6.4.12 (raster)
                 // or §6.4.12.2 Table 6-4 (MBAFF).
-                let Some((addr, wx, wy)) =
-                    grid.neighbour_block_loc(current_mb_addr, px, py, 16, 16)
-                else {
+                let Some((addr, wx, wy)) = locate(px, py, 16, 16) else {
                     return unavail_cbf(current_is_intra, block_type);
                 };
                 let Some(info) = grid.mbs.get(addr as usize) else {
@@ -2701,9 +2726,7 @@ fn cbf_cond_for(
             } else {
                 // External — §6.4.11.4 via §6.4.12 (raster, eq.
                 // 6-34/6-35 wrap) or §6.4.12.2 Table 6-4 (MBAFF).
-                let Some((addr, wx, wy)) =
-                    grid.neighbour_block_loc(current_mb_addr, xn, yn, 16, 16)
-                else {
+                let Some((addr, wx, wy)) = locate(xn, yn, 16, 16) else {
                     return unavail_cbf(current_is_intra, block_type);
                 };
                 let Some(info) = grid.mbs.get(addr as usize) else {
@@ -2793,9 +2816,7 @@ fn cbf_cond_for(
                 // of the above MB, so containment / the MBAFF Table
                 // 6-4 remap must use the true chroma MB height.
                 let mbh_c = if chroma_array_type == 2 { 16 } else { 8 };
-                let Some((addr, wx, wy)) =
-                    grid.neighbour_block_loc(current_mb_addr, xn, yn, 8, mbh_c)
-                else {
+                let Some((addr, wx, wy)) = locate(xn, yn, 8, mbh_c) else {
                     return unavail_cbf(current_is_intra, block_type);
                 };
                 let Some(info) = grid.mbs.get(addr as usize) else {
@@ -2827,8 +2848,7 @@ fn cbf_cond_for(
             }
         }
         CbfLoc::MbLevel(xn, yn) => {
-            let Some((addr, _wx, _wy)) = grid.neighbour_block_loc(current_mb_addr, xn, yn, 16, 16)
-            else {
+            let Some((addr, _wx, _wy)) = locate(xn, yn, 16, 16) else {
                 return unavail_cbf(current_is_intra, block_type);
             };
             let Some(info) = grid.mbs.get(addr as usize) else {
@@ -2997,6 +3017,218 @@ fn cbf_mb_level_for(info: &CabacMbNeighbourInfo, block_type: BlockType, is_cr: b
         BlockType::CbIntra16x16Dc => info.cbf_cb_16x16_dc,
         BlockType::CrIntra16x16Dc => info.cbf_cr_16x16_dc,
         _ => false,
+    }
+}
+
+/// The coded_block_flag condTermFlagA / condTermFlagB (§9.3.3.1.1.9) of a
+/// macroblock's residual blocks of one kind, on its grid of at most 4x4
+/// blocks (luma 4x4 blocks, chroma AC blocks, 8x8 blocks): bit
+/// `(y + 1) * 5 + x + 1` is the coded_block_flag decoded so far for the block
+/// at column `x`, row `y` (0 until it is decoded, and for blocks that are not
+/// coded); column and row -1 hold the condTermFlagN of the blocks along the
+/// left and top edges, derived from the neighboring macroblocks once per edge
+/// block when the grid is made. A block's condTermFlagA is then the bit left
+/// of its own and its condTermFlagB the bit above, where
+/// [`cabac_cbf_cond_terms`] derives both from scratch for every block. Inside
+/// a macroblock the neighbors to the left and above a block come before it
+/// in decoding order (§6.4.3), so their bits are set by then.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CbfTermGrid(u32);
+
+impl CbfTermGrid {
+    #[inline(always)]
+    fn bit(x: i32, y: i32) -> u32 {
+        ((y + 1) * 5 + x + 1) as u32 & 31
+    }
+
+    /// Records the coded_block_flag of the block at column `x`, row `y`, or,
+    /// with `x` or `y` -1, the condTermFlagN of an edge block.
+    #[inline(always)]
+    fn set(&mut self, x: i32, y: i32, flag: bool) {
+        self.0 |= u32::from(flag) << Self::bit(x, y);
+    }
+
+    /// condTermFlagA and condTermFlagB of the block at column `x`, row `y`.
+    #[inline(always)]
+    fn terms(self, x: i32, y: i32) -> (bool, bool) {
+        (
+            (self.0 >> Self::bit(x - 1, y)) & 1 != 0,
+            (self.0 >> Self::bit(x, y - 1)) & 1 != 0,
+        )
+    }
+}
+
+/// Column and row of each luma 4x4 block (`luma4x4BlkIdx`, §6.4.3) on the
+/// macroblock's 4x4 grid of blocks.
+const LUMA4X4_COL_ROW: [(i8, i8); 16] = {
+    let mut t = [(0i8, 0i8); 16];
+    let mut i = 0;
+    while i < 16 {
+        t[i] = (
+            (((i / 4) % 2) * 2 + (i % 4) % 2) as i8,
+            (((i / 4) / 2) * 2 + (i % 4) / 2) as i8,
+        );
+        i += 1;
+    }
+    t
+};
+
+/// What a macroblock's coded_block_flag terms need from outside it: the
+/// grid of decoded neighbors, its address and whether it is intra (§9.3.3.1.1.9
+/// "mbAddrN not available"), the chroma format.
+#[derive(Clone, Copy)]
+struct MbCbfNeighbors<'g> {
+    grid: &'g CabacNeighbourGrid,
+    mb_addr: u32,
+    current_is_intra: bool,
+    chroma_array_type: u32,
+    /// Outside an MBAFF frame, mbAddrA and mbAddrB (§6.4.9, `None` outside
+    /// the picture), located once for every probe of the macroblock; `None`
+    /// in an MBAFF frame, where each probe goes through §6.4.12.2.
+    raster: Option<(Option<u32>, Option<u32>)>,
+}
+
+impl<'g> MbCbfNeighbors<'g> {
+    fn new(
+        grid: &'g CabacNeighbourGrid,
+        mb_addr: u32,
+        current_is_intra: bool,
+        chroma_array_type: u32,
+    ) -> Self {
+        let w = grid.width_in_mbs;
+        let raster = (!grid.mbaff_frame_flag && w != 0).then(|| {
+            (
+                (!mb_addr.is_multiple_of(w)).then(|| mb_addr - 1),
+                (mb_addr >= w).then(|| mb_addr - w),
+            )
+        });
+        Self {
+            grid,
+            mb_addr,
+            current_is_intra,
+            chroma_array_type,
+            raster,
+        }
+    }
+
+    /// condTermFlagN at `loc` outside the macroblock, by [`cbf_cond_for`]:
+    /// outside MBAFF with the macroblock's mbAddrA / mbAddrB located once
+    /// (§6.4.12.1, as [`CabacNeighbourGrid::neighbour_block_loc`] does it
+    /// for every probe).
+    fn edge(
+        &self,
+        curr: &CabacMbNeighbourInfo,
+        block_type: BlockType,
+        loc: CbfLoc,
+        is_cr: bool,
+    ) -> bool {
+        let Some((addr_a, addr_b)) = self.raster else {
+            return cbf_cond_for(
+                self.grid,
+                self.mb_addr,
+                curr,
+                self.current_is_intra,
+                block_type,
+                loc,
+                is_cr,
+                self.chroma_array_type,
+            );
+        };
+        let mb_addr = self.mb_addr;
+        let locate = |xn: i32, yn: i32, max_w: i32, max_h: i32| {
+            if xn < 0 && (0..max_h).contains(&yn) {
+                addr_a.map(|a| (a, xn + max_w, yn))
+            } else if yn < 0 && (0..max_w).contains(&xn) {
+                addr_b.map(|b| (b, xn, yn + max_h))
+            } else if (0..max_w).contains(&xn) && (0..max_h).contains(&yn) {
+                Some((mb_addr, xn, yn))
+            } else {
+                None
+            }
+        };
+        cbf_cond_located(
+            self.grid,
+            locate,
+            curr,
+            self.current_is_intra,
+            block_type,
+            loc,
+            is_cr,
+            self.chroma_array_type,
+        )
+    }
+
+    /// The term grid for luma-like 4x4 blocks (ctxBlockCat 1, 2, 7, 8, 11,
+    /// 12) of the 8x8 quadrants set in `quadrants`, with the edge terms of
+    /// those quadrants' edge blocks.
+    fn luma_grid(
+        &self,
+        curr: &CabacMbNeighbourInfo,
+        block_type: BlockType,
+        quadrants: u32,
+    ) -> CbfTermGrid {
+        let mut g = CbfTermGrid::default();
+        for i in 0..4i32 {
+            // Left edge row i lies in quadrant 0 or 2, top edge column i in 0 or 1.
+            if (quadrants >> ((i / 2) * 2)) & 1 != 0 {
+                g.set(
+                    -1,
+                    i,
+                    self.edge(curr, block_type, CbfLoc::Internal4x4(-1, 4 * i), false),
+                );
+            }
+            if (quadrants >> (i / 2)) & 1 != 0 {
+                g.set(
+                    i,
+                    -1,
+                    self.edge(curr, block_type, CbfLoc::Internal4x4(4 * i, -1), false),
+                );
+            }
+        }
+        g
+    }
+
+    /// The term grid for 8x8 blocks (ctxBlockCat 5, 9, 13) of the quadrants
+    /// set in `quadrants`.
+    fn grid_8x8(
+        &self,
+        curr: &CabacMbNeighbourInfo,
+        block_type: BlockType,
+        quadrants: u32,
+    ) -> CbfTermGrid {
+        let mut g = CbfTermGrid::default();
+        for i in 0..2i32 {
+            if (quadrants >> (i * 2)) & 1 != 0 {
+                g.set(
+                    -1,
+                    i,
+                    self.edge(curr, block_type, CbfLoc::Internal8x8(-1, 8 * i), false),
+                );
+            }
+            if (quadrants >> i) & 1 != 0 {
+                g.set(
+                    i,
+                    -1,
+                    self.edge(curr, block_type, CbfLoc::Internal8x8(8 * i, -1), false),
+                );
+            }
+        }
+        g
+    }
+
+    /// The term grid for one chroma plane's AC blocks (ctxBlockCat 4): two
+    /// columns, two rows (4:2:0) or four (4:2:2).
+    fn chroma_ac_grid(&self, curr: &CabacMbNeighbourInfo, rows: i32, is_cr: bool) -> CbfTermGrid {
+        let mut g = CbfTermGrid::default();
+        for y in 0..rows {
+            let loc = CbfLoc::InternalChromaAc(-1, 4 * y, (2 * y) as u8);
+            g.set(-1, y, self.edge(curr, BlockType::ChromaAc, loc, is_cr));
+        }
+        for x in 0..2 {
+            let loc = CbfLoc::InternalChromaAc(4 * x, -1, x as u8);
+            g.set(x, -1, self.edge(curr, BlockType::ChromaAc, loc, is_cr));
+        }
+        g
     }
 }
 
@@ -5156,6 +5388,20 @@ fn parse_residual_cabac_only(
     // frame. With ~3600 MBs/frame × 3960 frames that is ~10 TB of
     // memmove traffic and dominated decoder wall time on real content.
     let grid_ref: Option<&CabacNeighbourGrid> = nb_grid.as_deref();
+    // §9.3.3.1.1.9 — the 4x4, 8x8 and chroma AC blocks' coded_block_flag
+    // terms come from a `CbfTermGrid` per block kind: the neighboring
+    // macroblocks' terms derived once per edge block, the macroblock's own
+    // from the flags decoded so far.
+    let nbs = grid_ref.map(|grid| {
+        MbCbfNeighbors::new(grid, current_mb_addr, current_is_intra, chroma_array_type)
+    });
+    let grid_terms = |g: &Option<CbfTermGrid>, x: i32, y: i32| match g {
+        Some(g) => {
+            let (a, b) = g.terms(x, y);
+            (Some(a), Some(b))
+        }
+        None => (None, None),
+    };
 
     // --- Luma DC (Intra_16x16) ---
     if mb_type.is_intra_16x16() {
@@ -5193,22 +5439,11 @@ fn parse_residual_cabac_only(
     // --- Luma AC / 4x4 blocks / 8x8 blocks ---
     if mb_type.is_intra_16x16() {
         if cbp_luma == 15 {
+            let mut terms = nbs.map(|n| n.luma_grid(&curr_cbf, BlockType::Luma16x16Ac, 0b1111));
             for blk_idx in 0..16u8 {
-                let (ca, cb) = if let Some(g) = grid_ref {
-                    let (a, b) = cabac_cbf_cond_terms(
-                        g,
-                        current_mb_addr,
-                        &curr_cbf,
-                        current_is_intra,
-                        BlockType::Luma16x16Ac,
-                        blk_idx,
-                        false,
-                        chroma_array_type,
-                    );
-                    (Some(a), Some(b))
-                } else {
-                    (None, None)
-                };
+                let (x, y) = LUMA4X4_COL_ROW[usize::from(blk_idx)];
+                let (x, y) = (i32::from(x), i32::from(y));
+                let (ca, cb) = grid_terms(&terms, x, y);
                 let coded = parse_residual_block_cabac(
                     cabac,
                     ctxs,
@@ -5222,31 +5457,24 @@ fn parse_residual_cabac_only(
                     field,
                     &mut sink.append(ResidualList::Luma, 1)[0],
                 )?;
+                if let Some(t) = terms.as_mut() {
+                    t.set(x, y, coded);
+                }
                 curr_cbf.cbf_luma_16x16_ac[blk_idx as usize] = coded;
             }
         }
     } else if transform_size_8x8_flag {
+        // 8x8 blocks. At ChromaArrayType != 3 the CBF is inferred from CBP
+        // (not decoded), so no terms are derived; at 4:4:4 the CBF *is*
+        // decoded (§7.3.5.3.3) and the §9.3.3.1.1.9 cat-5 neighbor
+        // derivation applies.
+        let mut terms = nbs
+            .filter(|_| chroma_array_type == 3)
+            .map(|n| n.grid_8x8(&curr_cbf, BlockType::Luma8x8, cbp_luma));
         for blk8 in 0..4u8 {
             if (cbp_luma >> blk8) & 1 == 1 {
-                // 8x8 block. At ChromaArrayType != 3 the CBF is inferred
-                // from CBP (not decoded) and the cond terms are unused;
-                // at 4:4:4 the CBF *is* decoded (§7.3.5.3.3) and the
-                // §9.3.3.1.1.9 cat-5 neighbour derivation applies.
-                let (ca, cb) = if let Some(g) = grid_ref {
-                    let (a, b) = cabac_cbf_cond_terms(
-                        g,
-                        current_mb_addr,
-                        &curr_cbf,
-                        current_is_intra,
-                        BlockType::Luma8x8,
-                        blk8,
-                        false,
-                        chroma_array_type,
-                    );
-                    (Some(a), Some(b))
-                } else {
-                    (None, None)
-                };
+                let (x, y) = (i32::from(blk8 % 2), i32::from(blk8 / 2));
+                let (ca, cb) = grid_terms(&terms, x, y);
                 // The 64 coefficients fill four consecutive 16-level
                 // blocks.
                 let coded = parse_residual_block_cabac(
@@ -5268,28 +5496,20 @@ fn parse_residual_cabac_only(
                     let idx = (blk8 * 4 + sub) as usize;
                     curr_cbf.cbf_luma_4x4[idx] = coded;
                 }
+                if let Some(t) = terms.as_mut() {
+                    t.set(x, y, coded);
+                }
             }
         }
     } else {
+        let mut terms = nbs.map(|n| n.luma_grid(&curr_cbf, BlockType::Luma4x4, cbp_luma));
         for blk8 in 0..4u8 {
             if (cbp_luma >> blk8) & 1 == 1 {
                 for sub in 0..4u8 {
                     let blk_idx = blk8 * 4 + sub;
-                    let (ca, cb) = if let Some(g) = grid_ref {
-                        let (a, b) = cabac_cbf_cond_terms(
-                            g,
-                            current_mb_addr,
-                            &curr_cbf,
-                            current_is_intra,
-                            BlockType::Luma4x4,
-                            blk_idx,
-                            false,
-                            chroma_array_type,
-                        );
-                        (Some(a), Some(b))
-                    } else {
-                        (None, None)
-                    };
+                    let (x, y) = LUMA4X4_COL_ROW[usize::from(blk_idx)];
+                    let (x, y) = (i32::from(x), i32::from(y));
+                    let (ca, cb) = grid_terms(&terms, x, y);
                     let coded = parse_residual_block_cabac(
                         cabac,
                         ctxs,
@@ -5303,6 +5523,9 @@ fn parse_residual_cabac_only(
                         field,
                         &mut sink.append(ResidualList::Luma, 1)[0],
                     )?;
+                    if let Some(t) = terms.as_mut() {
+                        t.set(x, y, coded);
+                    }
                     curr_cbf.cbf_luma_4x4[blk_idx as usize] = coded;
                 }
             }
@@ -5383,22 +5606,10 @@ fn parse_residual_cabac_only(
 
         if cbp_chroma == 2 {
             let num_ac = 4 * num_c8x8 as usize;
+            let mut terms = nbs.map(|n| n.chroma_ac_grid(&curr_cbf, 2 * num_c8x8, false));
             for blk_idx in 0..num_ac as u8 {
-                let (ca, cb) = if let Some(g) = grid_ref {
-                    let (a, b) = cabac_cbf_cond_terms(
-                        g,
-                        current_mb_addr,
-                        &curr_cbf,
-                        current_is_intra,
-                        BlockType::ChromaAc,
-                        blk_idx,
-                        false,
-                        chroma_array_type,
-                    );
-                    (Some(a), Some(b))
-                } else {
-                    (None, None)
-                };
+                let (x, y) = (i32::from(blk_idx % 2), i32::from(blk_idx / 2));
+                let (ca, cb) = grid_terms(&terms, x, y);
                 let coded = parse_residual_block_cabac(
                     cabac,
                     ctxs,
@@ -5412,24 +5623,15 @@ fn parse_residual_cabac_only(
                     field,
                     &mut sink.append(ResidualList::ChromaAcCb, 1)[0],
                 )?;
+                if let Some(t) = terms.as_mut() {
+                    t.set(x, y, coded);
+                }
                 curr_cbf.cbf_cb_ac[blk_idx as usize] = coded;
             }
+            let mut terms = nbs.map(|n| n.chroma_ac_grid(&curr_cbf, 2 * num_c8x8, true));
             for blk_idx in 0..num_ac as u8 {
-                let (ca, cb) = if let Some(g) = grid_ref {
-                    let (a, b) = cabac_cbf_cond_terms(
-                        g,
-                        current_mb_addr,
-                        &curr_cbf,
-                        current_is_intra,
-                        BlockType::ChromaAc,
-                        blk_idx,
-                        true,
-                        chroma_array_type,
-                    );
-                    (Some(a), Some(b))
-                } else {
-                    (None, None)
-                };
+                let (x, y) = (i32::from(blk_idx % 2), i32::from(blk_idx / 2));
+                let (ca, cb) = grid_terms(&terms, x, y);
                 let coded = parse_residual_block_cabac(
                     cabac,
                     ctxs,
@@ -5443,6 +5645,9 @@ fn parse_residual_cabac_only(
                     field,
                     &mut sink.append(ResidualList::ChromaAcCr, 1)[0],
                 )?;
+                if let Some(t) = terms.as_mut() {
+                    t.set(x, y, coded);
+                }
                 curr_cbf.cbf_cr_ac[blk_idx as usize] = coded;
             }
         }
@@ -5516,22 +5721,11 @@ fn parse_residual_cabac_only(
             // --- Plane AC / 4x4 / 8x8 ---
             if mb_type.is_intra_16x16() {
                 if cbp_luma == 15 {
+                    let mut terms = nbs.map(|n| n.luma_grid(&curr_cbf, bt_ac, 0b1111));
                     for blk_idx in 0..16u8 {
-                        let (ca, cb) = if let Some(g) = grid_ref {
-                            let (a, b) = cabac_cbf_cond_terms(
-                                g,
-                                current_mb_addr,
-                                &curr_cbf,
-                                current_is_intra,
-                                bt_ac,
-                                blk_idx,
-                                plane_is_cr,
-                                chroma_array_type,
-                            );
-                            (Some(a), Some(b))
-                        } else {
-                            (None, None)
-                        };
+                        let (x, y) = LUMA4X4_COL_ROW[usize::from(blk_idx)];
+                        let (x, y) = (i32::from(x), i32::from(y));
+                        let (ca, cb) = grid_terms(&terms, x, y);
                         let coded = parse_residual_block_cabac(
                             cabac,
                             ctxs,
@@ -5545,6 +5739,9 @@ fn parse_residual_cabac_only(
                             field,
                             &mut sink.append(l_like, 1)[0],
                         )?;
+                        if let Some(t) = terms.as_mut() {
+                            t.set(x, y, coded);
+                        }
                         if plane_is_cr {
                             curr_cbf.cbf_cr_16x16_ac[blk_idx as usize] = coded;
                         } else {
@@ -5553,27 +5750,15 @@ fn parse_residual_cabac_only(
                     }
                 }
             } else if transform_size_8x8_flag {
+                // 8x8 chroma blocks at 4:4:4: the CBF IS coded
+                // (max_num_coeff == 64 AND chroma_array_type == 3 per
+                // §7.3.5.3.3), with the §9.3.3.1.1.9 cat-9/13
+                // neighboring-8x8-block cond terms.
+                let mut terms = nbs.map(|n| n.grid_8x8(&curr_cbf, bt_8x8, cbp_luma));
                 for blk8 in 0..4u8 {
                     if (cbp_luma >> blk8) & 1 == 1 {
-                        // 8x8 chroma block at 4:4:4: the CBF IS coded
-                        // (max_num_coeff == 64 AND chroma_array_type
-                        // == 3 per §7.3.5.3.3), with the §9.3.3.1.1.9
-                        // cat-9/13 neighbouring-8x8-block cond terms.
-                        let (ca, cb) = if let Some(g) = grid_ref {
-                            let (a, b) = cabac_cbf_cond_terms(
-                                g,
-                                current_mb_addr,
-                                &curr_cbf,
-                                current_is_intra,
-                                bt_8x8,
-                                blk8,
-                                plane_is_cr,
-                                chroma_array_type,
-                            );
-                            (Some(a), Some(b))
-                        } else {
-                            (None, None)
-                        };
+                        let (x, y) = (i32::from(blk8 % 2), i32::from(blk8 / 2));
+                        let (ca, cb) = grid_terms(&terms, x, y);
                         let coded = parse_residual_block_cabac(
                             cabac,
                             ctxs,
@@ -5598,28 +5783,20 @@ fn parse_residual_cabac_only(
                                 curr_cbf.cbf_cb_luma_4x4[idx] = coded;
                             }
                         }
+                        if let Some(t) = terms.as_mut() {
+                            t.set(x, y, coded);
+                        }
                     }
                 }
             } else {
+                let mut terms = nbs.map(|n| n.luma_grid(&curr_cbf, bt_4x4, cbp_luma));
                 for blk8 in 0..4u8 {
                     if (cbp_luma >> blk8) & 1 == 1 {
                         for sub in 0..4u8 {
                             let blk_idx = blk8 * 4 + sub;
-                            let (ca, cb) = if let Some(g) = grid_ref {
-                                let (a, b) = cabac_cbf_cond_terms(
-                                    g,
-                                    current_mb_addr,
-                                    &curr_cbf,
-                                    current_is_intra,
-                                    bt_4x4,
-                                    blk_idx,
-                                    plane_is_cr,
-                                    chroma_array_type,
-                                );
-                                (Some(a), Some(b))
-                            } else {
-                                (None, None)
-                            };
+                            let (x, y) = LUMA4X4_COL_ROW[usize::from(blk_idx)];
+                            let (x, y) = (i32::from(x), i32::from(y));
+                            let (ca, cb) = grid_terms(&terms, x, y);
                             let coded = parse_residual_block_cabac(
                                 cabac,
                                 ctxs,
@@ -5633,6 +5810,9 @@ fn parse_residual_cabac_only(
                                 field,
                                 &mut sink.append(l_like, 1)[0],
                             )?;
+                            if let Some(t) = terms.as_mut() {
+                                t.set(x, y, coded);
+                            }
                             if plane_is_cr {
                                 curr_cbf.cbf_cr_luma_4x4[blk_idx as usize] = coded;
                             } else {
@@ -8821,5 +9001,264 @@ mod cabac_residual_block_tests {
                 CabacError::EgEscapeSuffixOverflow
             )))
         );
+    }
+}
+
+#[cfg(test)]
+mod cbf_term_grid_tests {
+    //! The per-macroblock coded_block_flag term grids ([`CbfTermGrid`],
+    //! [`MbCbfNeighbors`]) against [`cabac_cbf_cond_terms`], the derivation
+    //! from scratch for every block.
+    use super::*;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            // xorshift64*
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        fn flag(&mut self) -> bool {
+            self.next() & 1 != 0
+        }
+
+        fn flags<const N: usize>(&mut self) -> [bool; N] {
+            core::array::from_fn(|_| self.flag())
+        }
+    }
+
+    /// A decoded neighbor of any kind: unavailable, skipped, I_PCM, intra
+    /// (16x16 or NxN) or inter, with random CBP, transform size, field flag
+    /// and coded_block_flags.
+    fn random_neighbor(rng: &mut Rng) -> CabacMbNeighbourInfo {
+        let is_intra = rng.flag();
+        CabacMbNeighbourInfo {
+            available: rng.below(5) != 0,
+            is_skip: rng.below(6) == 0,
+            is_intra,
+            is_i_pcm: rng.below(10) == 0,
+            is_i_nxn: is_intra && rng.flag(),
+            coded_block_pattern_luma: rng.below(16) as u8,
+            coded_block_pattern_chroma: rng.below(3) as u8,
+            transform_size_8x8_flag: rng.flag(),
+            mb_field_decoding_flag: rng.flag(),
+            cbf_luma_4x4: rng.flags(),
+            cbf_cb_dc: rng.flag(),
+            cbf_cr_dc: rng.flag(),
+            cbf_cb_ac: rng.flags(),
+            cbf_cr_ac: rng.flags(),
+            cbf_luma_16x16_dc: rng.flag(),
+            cbf_luma_16x16_ac: rng.flags(),
+            cbf_cb_16x16_dc: rng.flag(),
+            cbf_cb_16x16_ac: rng.flags(),
+            cbf_cb_luma_4x4: rng.flags(),
+            cbf_cr_16x16_dc: rng.flag(),
+            cbf_cr_16x16_ac: rng.flags(),
+            cbf_cr_luma_4x4: rng.flags(),
+            ..CabacMbNeighbourInfo::default()
+        }
+    }
+
+    /// What one walk checks: the neighborhood, the macroblock and how it
+    /// records a decoded flag in its own state.
+    struct Walk<'a> {
+        nbs: MbCbfNeighbors<'a>,
+        curr: CabacMbNeighbourInfo,
+        rng: Rng,
+        blocks: usize,
+    }
+
+    impl Walk<'_> {
+        /// Walks the blocks of one kind in decoding order, `(blkIdx, column,
+        /// row)`, checking each block's terms from `terms` against the
+        /// per-block derivation before recording a random decoded flag with
+        /// `record` (as the residual walker does).
+        fn blocks(
+            &mut self,
+            mut terms: CbfTermGrid,
+            block_type: BlockType,
+            is_cr: bool,
+            order: &[(u8, i32, i32)],
+            record: fn(&mut CabacMbNeighbourInfo, u8, bool),
+        ) {
+            for &(blk_idx, x, y) in order {
+                let want = cabac_cbf_cond_terms(
+                    self.nbs.grid,
+                    self.nbs.mb_addr,
+                    &self.curr,
+                    self.nbs.current_is_intra,
+                    block_type,
+                    blk_idx,
+                    is_cr,
+                    self.nbs.chroma_array_type,
+                );
+                assert_eq!(
+                    terms.terms(x, y),
+                    want,
+                    "{block_type:?} block {blk_idx} (cr {is_cr}) at MB {}",
+                    self.nbs.mb_addr
+                );
+                let coded = self.rng.flag();
+                terms.set(x, y, coded);
+                record(&mut self.curr, blk_idx, coded);
+                self.blocks += 1;
+            }
+        }
+    }
+
+    fn luma_order(cbp: u32) -> Vec<(u8, i32, i32)> {
+        (0..16u8)
+            .filter(|i| (cbp >> (i / 4)) & 1 != 0)
+            .map(|i| {
+                let (x, y) = LUMA4X4_COL_ROW[usize::from(i)];
+                (i, i32::from(x), i32::from(y))
+            })
+            .collect()
+    }
+
+    fn order_8x8(cbp: u32) -> Vec<(u8, i32, i32)> {
+        (0..4u8)
+            .filter(|i| (cbp >> i) & 1 != 0)
+            .map(|i| (i, i32::from(i % 2), i32::from(i / 2)))
+            .collect()
+    }
+
+    /// Random neighborhoods (raster and MBAFF grids, every neighbor kind),
+    /// positions, intra or inter macroblocks, CBP, transform sizes and
+    /// decoded flags, for every chroma format and every block kind with
+    /// coded_block_flag terms on a grid: each block's terms are the per-block
+    /// derivation's.
+    #[test]
+    fn term_grids_match_the_per_block_derivation() {
+        let mut rng = Rng(0x00dd_b1a5_e5c0_ffee);
+        let mut blocks = 0usize;
+        for case in 0..6000u32 {
+            let mbaff = rng.below(3) == 0;
+            let w = 1 + rng.below(4) as u32;
+            let h = 2 * (1 + rng.below(3) as u32);
+            let mut grid = CabacNeighbourGrid::new_mbaff(w, h, mbaff);
+            for slot in grid.mbs.iter_mut() {
+                *slot = random_neighbor(&mut rng);
+            }
+            let mb_addr = rng.below(u64::from(w * h)) as u32;
+            let current_is_intra = rng.flag();
+            let chroma_array_type = 1 + rng.below(3) as u32;
+            let mut walk = Walk {
+                nbs: MbCbfNeighbors::new(&grid, mb_addr, current_is_intra, chroma_array_type),
+                curr: CabacMbNeighbourInfo {
+                    is_intra: current_is_intra,
+                    ..CabacMbNeighbourInfo::default()
+                },
+                rng: Rng(rng.next() | 1),
+                blocks: 0,
+            };
+            let intra_16x16 = current_is_intra && rng.flag();
+            let cbp = if intra_16x16 {
+                15 * (rng.below(2) as u32)
+            } else {
+                rng.below(16) as u32
+            };
+            let transform_8x8 = !intra_16x16 && rng.flag();
+            // Luma, then Cb and Cr: chroma AC at 4:2:0 / 4:2:2, the luma kinds again at 4:4:4.
+            let planes: &[(BlockType, BlockType, BlockType, bool)] = if chroma_array_type == 3 {
+                &[
+                    (
+                        BlockType::Luma16x16Ac,
+                        BlockType::Luma4x4,
+                        BlockType::Luma8x8,
+                        false,
+                    ),
+                    (
+                        BlockType::CbIntra16x16Ac,
+                        BlockType::CbLuma4x4,
+                        BlockType::Cb8x8,
+                        false,
+                    ),
+                    (
+                        BlockType::CrIntra16x16Ac,
+                        BlockType::CrLuma4x4,
+                        BlockType::Cr8x8,
+                        true,
+                    ),
+                ]
+            } else {
+                &[(
+                    BlockType::Luma16x16Ac,
+                    BlockType::Luma4x4,
+                    BlockType::Luma8x8,
+                    false,
+                )]
+            };
+            for &(bt_ac, bt_4x4, bt_8x8, is_cr) in planes {
+                let nbs = walk.nbs;
+                if intra_16x16 {
+                    if cbp == 15 {
+                        let terms = nbs.luma_grid(&walk.curr, bt_ac, 15);
+                        let record: fn(&mut CabacMbNeighbourInfo, u8, bool) = match bt_ac {
+                            BlockType::Luma16x16Ac => {
+                                |c, i, f| c.cbf_luma_16x16_ac[usize::from(i)] = f
+                            }
+                            BlockType::CbIntra16x16Ac => {
+                                |c, i, f| c.cbf_cb_16x16_ac[usize::from(i)] = f
+                            }
+                            _ => |c, i, f| c.cbf_cr_16x16_ac[usize::from(i)] = f,
+                        };
+                        walk.blocks(terms, bt_ac, is_cr, &luma_order(15), record);
+                    }
+                } else if transform_8x8 {
+                    // Coded (and so with terms) only at 4:4:4 (§7.3.5.3.3).
+                    if chroma_array_type == 3 {
+                        let terms = nbs.grid_8x8(&walk.curr, bt_8x8, cbp);
+                        let record: fn(&mut CabacMbNeighbourInfo, u8, bool) = match bt_8x8 {
+                            BlockType::Luma8x8 => {
+                                |c, i, f| c.cbf_luma_4x4[usize::from(i) * 4..][..4].fill(f)
+                            }
+                            BlockType::Cb8x8 => {
+                                |c, i, f| c.cbf_cb_luma_4x4[usize::from(i) * 4..][..4].fill(f)
+                            }
+                            _ => |c, i, f| c.cbf_cr_luma_4x4[usize::from(i) * 4..][..4].fill(f),
+                        };
+                        walk.blocks(terms, bt_8x8, is_cr, &order_8x8(cbp), record);
+                    }
+                } else {
+                    let terms = nbs.luma_grid(&walk.curr, bt_4x4, cbp);
+                    let record: fn(&mut CabacMbNeighbourInfo, u8, bool) = match bt_4x4 {
+                        BlockType::Luma4x4 => |c, i, f| c.cbf_luma_4x4[usize::from(i)] = f,
+                        BlockType::CbLuma4x4 => |c, i, f| c.cbf_cb_luma_4x4[usize::from(i)] = f,
+                        _ => |c, i, f| c.cbf_cr_luma_4x4[usize::from(i)] = f,
+                    };
+                    walk.blocks(terms, bt_4x4, is_cr, &luma_order(cbp), record);
+                }
+            }
+            if chroma_array_type != 3 && rng.below(3) != 0 {
+                let rows = 2 * chroma_array_type as i32;
+                let order: Vec<(u8, i32, i32)> = (0..2 * rows as u8)
+                    .map(|i| (i, i32::from(i % 2), i32::from(i / 2)))
+                    .collect();
+                walk.curr.cbf_cb_dc = rng.flag();
+                walk.curr.cbf_cr_dc = rng.flag();
+                let nbs = walk.nbs;
+                let terms = nbs.chroma_ac_grid(&walk.curr, rows, false);
+                walk.blocks(terms, BlockType::ChromaAc, false, &order, |c, i, f| {
+                    c.cbf_cb_ac[usize::from(i)] = f
+                });
+                let terms = nbs.chroma_ac_grid(&walk.curr, rows, true);
+                walk.blocks(terms, BlockType::ChromaAc, true, &order, |c, i, f| {
+                    c.cbf_cr_ac[usize::from(i)] = f
+                });
+            }
+            blocks += walk.blocks;
+            let _ = case;
+        }
+        // Enough blocks were compared for the check to mean something.
+        assert!(blocks > 50_000, "only {blocks} blocks compared");
     }
 }
