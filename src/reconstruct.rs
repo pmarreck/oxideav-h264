@@ -6730,7 +6730,7 @@ fn mc_luma_partition<S: PicSample>(
     bit_depth: u32,
     dst: &mut [i32],
     field: Option<u8>,
-    planes: Option<&crate::frame_thread::SharedPlanes<S>>,
+    planes: Option<&crate::frame_thread::SharedPlanes>,
 ) -> Result<(), ReconstructError> {
     // §8.4.2 — reference picture must have positive luma dims. A
     // zero-dim ref pic (e.g. uninitialised DPB slot) drives the slow-
@@ -6786,7 +6786,10 @@ fn mc_luma_partition<S: PicSample>(
         return Err(ReconstructError::IntraPredOutOfBounds);
     }
     let plane = match planes {
-        Some(p) => p.luma_src(),
+        // The shared planes belong to `ref_pic`, so they store `S` too.
+        Some(p) => p
+            .luma_src()
+            .ok_or(ReconstructError::SliceDoesNotFitPicture)?,
         None => crate::mc::PlaneSrc::Flat {
             data: src,
             stride: src_stride,
@@ -6826,7 +6829,7 @@ fn mc_chroma_partition<S: PicSample>(
     dst_cb: &mut [i32],
     dst_cr: &mut [i32],
     field: Option<u8>,
-    planes: Option<&crate::frame_thread::SharedPlanes<S>>,
+    planes: Option<&crate::frame_thread::SharedPlanes>,
 ) -> Result<(), ReconstructError> {
     // §8.4.1.4 — chroma MV derivation:
     // - 4:2:0 (ChromaArrayType == 1): mvC = mv / 2 (both components).
@@ -6885,7 +6888,9 @@ fn mc_chroma_partition<S: PicSample>(
         .enumerate()
     {
         let src = match planes {
-            Some(p) => p.chroma_src(i as u8),
+            Some(p) => p
+                .chroma_src(i as u8)
+                .ok_or(ReconstructError::SliceDoesNotFitPicture)?,
             None => crate::mc::PlaneSrc::Flat {
                 data: &plane[row_off..],
                 stride: src_stride,

@@ -36,6 +36,23 @@ pub trait PicSample:
     /// `i16::MAX` and at most [`Self::STORED_MAX`]) and store them: one clamp
     /// per sample, so a producer need not clip first.
     fn store_clipped(dst: &mut [Self], src: &[i32], max: i32);
+
+    /// Append a row of samples of an 8-bit plane to an output buffer,
+    /// one byte each.
+    fn extend_8bit(out: &mut Vec<u8>, row: &[Self]);
+
+    /// The picture inside `any` when it stores this sample type.
+    fn picture(any: &AnyPicture) -> Option<&Picture<Self>>;
+
+    /// The picture inside `any` when it stores this sample type.
+    fn picture_mut(any: &mut AnyPicture) -> Option<&mut Picture<Self>>;
+
+    /// Frame threading: the published bands of `planes` when they store
+    /// this sample type.
+    #[doc(hidden)]
+    fn bands(
+        planes: &crate::frame_thread::SharedBands,
+    ) -> Option<&crate::frame_thread::BandSet<Self>>;
 }
 
 /// The wide stored sample, for pictures of more than 8 bits per sample
@@ -44,6 +61,37 @@ pub type Sample = u16;
 
 impl PicSample for u16 {
     const STORED_MAX: i32 = u16::MAX as i32;
+
+    #[inline]
+    fn extend_8bit(out: &mut Vec<u8>, row: &[Self]) {
+        out.extend(row.iter().map(|&s| s.min(255) as u8));
+    }
+
+    #[inline]
+    fn picture(any: &AnyPicture) -> Option<&Picture<Self>> {
+        match any {
+            AnyPicture::Wide(p) => Some(p),
+            AnyPicture::Narrow(_) => None,
+        }
+    }
+
+    #[inline]
+    fn picture_mut(any: &mut AnyPicture) -> Option<&mut Picture<Self>> {
+        match any {
+            AnyPicture::Wide(p) => Some(p),
+            AnyPicture::Narrow(_) => None,
+        }
+    }
+
+    #[inline]
+    fn bands(
+        planes: &crate::frame_thread::SharedBands,
+    ) -> Option<&crate::frame_thread::BandSet<Self>> {
+        match planes {
+            crate::frame_thread::SharedBands::Wide(b) => Some(b),
+            crate::frame_thread::SharedBands::Narrow(_) => None,
+        }
+    }
 
     #[inline(always)]
     fn from_clipped(v: i32) -> Self {
@@ -72,6 +120,37 @@ impl PicSample for u16 {
 
 impl PicSample for u8 {
     const STORED_MAX: i32 = u8::MAX as i32;
+
+    #[inline]
+    fn extend_8bit(out: &mut Vec<u8>, row: &[Self]) {
+        out.extend_from_slice(row);
+    }
+
+    #[inline]
+    fn picture(any: &AnyPicture) -> Option<&Picture<Self>> {
+        match any {
+            AnyPicture::Narrow(p) => Some(p),
+            AnyPicture::Wide(_) => None,
+        }
+    }
+
+    #[inline]
+    fn picture_mut(any: &mut AnyPicture) -> Option<&mut Picture<Self>> {
+        match any {
+            AnyPicture::Narrow(p) => Some(p),
+            AnyPicture::Wide(_) => None,
+        }
+    }
+
+    #[inline]
+    fn bands(
+        planes: &crate::frame_thread::SharedBands,
+    ) -> Option<&crate::frame_thread::BandSet<Self>> {
+        match planes {
+            crate::frame_thread::SharedBands::Narrow(b) => Some(b),
+            crate::frame_thread::SharedBands::Wide(_) => None,
+        }
+    }
 
     #[inline(always)]
     fn from_clipped(v: i32) -> Self {
@@ -602,6 +681,157 @@ impl<S: PicSample> Picture<S> {
 
 /// §6.2 / Table 6-1 — chroma plane (width, height) given
 /// `chroma_array_type` and the luma frame dimensions.
+/// Whether a picture of these bit depths stores its samples as `u8`
+/// ([`AnyPicture::Narrow`]): both luma and chroma 8-bit.
+#[inline]
+pub fn stores_narrow(bit_depth_luma: u32, bit_depth_chroma: u32) -> bool {
+    bit_depth_luma == 8 && bit_depth_chroma == 8
+}
+
+/// A decoded picture of either stored sample type. The decoder keeps
+/// pictures in this form; reconstruction runs on the [`Picture`]
+/// inside, generic over its sample type. A sequence's bit depths are
+/// fixed by its SPS (§7.4.2.1.1), so every picture a slice references
+/// has the current picture's variant.
+#[derive(Debug, Clone)]
+pub enum AnyPicture {
+    /// Both bit depths 8: `u8` samples.
+    Narrow(Picture<u8>),
+    /// Any bit depth above 8: `u16` samples.
+    Wide(Picture<u16>),
+}
+
+/// Evaluate `$body` with `$p` bound to the [`Picture`] inside an
+/// [`AnyPicture`] (or a reference to one), whichever its sample type.
+macro_rules! with_pic {
+    ($any:expr, $p:ident => $body:expr) => {
+        match $any {
+            $crate::picture::AnyPicture::Narrow($p) => $body,
+            $crate::picture::AnyPicture::Wide($p) => $body,
+        }
+    };
+}
+pub(crate) use with_pic;
+
+impl From<Picture<u8>> for AnyPicture {
+    fn from(p: Picture<u8>) -> Self {
+        AnyPicture::Narrow(p)
+    }
+}
+
+impl From<Picture<u16>> for AnyPicture {
+    fn from(p: Picture<u16>) -> Self {
+        AnyPicture::Wide(p)
+    }
+}
+
+impl AnyPicture {
+    /// Allocate a zero-filled picture, `u8` samples when both bit depths
+    /// are 8 ([`stores_narrow`]), `u16` otherwise.
+    pub fn zeroed(
+        width_in_samples: u32,
+        height_in_samples: u32,
+        chroma_array_type: u32,
+        bit_depth_luma: u32,
+        bit_depth_chroma: u32,
+    ) -> Self {
+        if stores_narrow(bit_depth_luma, bit_depth_chroma) {
+            AnyPicture::Narrow(Picture::zeroed(
+                width_in_samples,
+                height_in_samples,
+                chroma_array_type,
+                bit_depth_luma,
+                bit_depth_chroma,
+            ))
+        } else {
+            AnyPicture::Wide(Picture::zeroed(
+                width_in_samples,
+                height_in_samples,
+                chroma_array_type,
+                bit_depth_luma,
+                bit_depth_chroma,
+            ))
+        }
+    }
+
+    /// An empty picture (no samples, no metadata), as a placeholder.
+    pub fn empty() -> Self {
+        AnyPicture::Narrow(Picture::zeroed(0, 0, 0, 8, 8))
+    }
+
+    /// [`Picture::recycled`] on whichever picture is inside.
+    pub fn recycled(old: AnyPicture, zero: bool) -> Self {
+        match old {
+            AnyPicture::Narrow(p) => AnyPicture::Narrow(Picture::recycled(p, zero)),
+            AnyPicture::Wide(p) => AnyPicture::Wide(Picture::recycled(p, zero)),
+        }
+    }
+
+    /// [`Picture::has_shape`], and the sample type those bit depths store.
+    pub fn has_shape(
+        &self,
+        width_in_samples: u32,
+        height_in_samples: u32,
+        chroma_array_type: u32,
+        bit_depth_luma: u32,
+        bit_depth_chroma: u32,
+    ) -> bool {
+        matches!(self, AnyPicture::Narrow(_)) == stores_narrow(bit_depth_luma, bit_depth_chroma)
+            && with_pic!(self, p => p.has_shape(
+                width_in_samples,
+                height_in_samples,
+                chroma_array_type,
+                bit_depth_luma,
+                bit_depth_chroma,
+            ))
+    }
+
+    /// [`Picture::field_view`] of whichever picture is inside.
+    pub fn field_view(&self, bottom: bool) -> AnyPicture {
+        match self {
+            AnyPicture::Narrow(p) => AnyPicture::Narrow(p.field_view(bottom)),
+            AnyPicture::Wide(p) => AnyPicture::Wide(p.field_view(bottom)),
+        }
+    }
+
+    /// Whether the picture holds no luma samples (a metadata-only shell).
+    pub fn has_no_samples(&self) -> bool {
+        with_pic!(self, p => p.luma.is_empty())
+    }
+
+    pub fn width_in_samples(&self) -> u32 {
+        with_pic!(self, p => p.width_in_samples)
+    }
+
+    pub fn height_in_samples(&self) -> u32 {
+        with_pic!(self, p => p.height_in_samples)
+    }
+
+    pub fn chroma_array_type(&self) -> u32 {
+        with_pic!(self, p => p.chroma_array_type)
+    }
+
+    pub fn pic_order_cnt(&self) -> i32 {
+        with_pic!(self, p => p.pic_order_cnt)
+    }
+
+    pub fn frame_num(&self) -> u32 {
+        with_pic!(self, p => p.frame_num)
+    }
+
+    pub fn luma_at(&self, x: i32, y: i32) -> i32 {
+        with_pic!(self, p => p.luma_at(x, y))
+    }
+
+    pub fn cb_at(&self, x: i32, y: i32) -> i32 {
+        with_pic!(self, p => p.cb_at(x, y))
+    }
+
+    pub fn cr_at(&self, x: i32, y: i32) -> i32 {
+        with_pic!(self, p => p.cr_at(x, y))
+    }
+}
+
 fn chroma_dims(chroma_array_type: u32, w: u32, h: u32) -> (u32, u32) {
     match chroma_array_type {
         0 => (0, 0),
@@ -747,5 +977,82 @@ mod tests {
         p.set_luma(100, 100, 42);
         p.set_luma(-1, -1, 42);
         assert_eq!(p.luma, vec![0; 16]);
+    }
+
+    #[test]
+    fn eight_bit_pictures_store_bytes_and_deeper_ones_u16() {
+        assert!(stores_narrow(8, 8));
+        for (y, c) in [(8, 9), (9, 8), (10, 10), (8, 14), (14, 14)] {
+            assert!(!stores_narrow(y, c), "{y}/{c}-bit");
+        }
+        assert!(matches!(
+            AnyPicture::zeroed(32, 16, 1, 8, 8),
+            AnyPicture::Narrow(_)
+        ));
+        assert!(matches!(
+            AnyPicture::zeroed(32, 16, 1, 8, 10),
+            AnyPicture::Wide(_)
+        ));
+        assert!(matches!(
+            AnyPicture::zeroed(32, 16, 1, 10, 8),
+            AnyPicture::Wide(_)
+        ));
+    }
+
+    #[test]
+    fn any_picture_keeps_its_sample_type_through_recycling_and_views() {
+        let narrow = AnyPicture::zeroed(32, 16, 1, 8, 8);
+        let wide = AnyPicture::zeroed(32, 16, 1, 10, 10);
+        // A spare picture is reused only for the sample type the new
+        // picture's bit depths store.
+        assert!(narrow.has_shape(32, 16, 1, 8, 8));
+        assert!(!narrow.has_shape(32, 16, 1, 10, 10));
+        assert!(wide.has_shape(32, 16, 1, 10, 10));
+        assert!(!wide.has_shape(32, 16, 1, 8, 8));
+        // A wide picture whose recorded depths are 8-bit (as a test or an
+        // encoder helper may build) is still not a narrow one's spare.
+        assert!(!AnyPicture::Wide(Picture::new(32, 16, 1, 8, 8)).has_shape(32, 16, 1, 8, 8));
+        assert!(matches!(
+            AnyPicture::recycled(narrow.clone(), true),
+            AnyPicture::Narrow(_)
+        ));
+        assert!(matches!(
+            AnyPicture::recycled(wide.clone(), false),
+            AnyPicture::Wide(_)
+        ));
+        assert!(matches!(narrow.field_view(true), AnyPicture::Narrow(_)));
+        assert!(matches!(wide.field_view(false), AnyPicture::Wide(_)));
+        // The selectors hand out only the matching variant.
+        assert!(u8::picture(&narrow).is_some() && u16::picture(&narrow).is_none());
+        assert!(u16::picture(&wide).is_some() && u8::picture(&wide).is_none());
+    }
+
+    #[test]
+    fn narrow_and_wide_pictures_hold_the_same_samples() {
+        let mut n = Picture::<u8>::zeroed(8, 8, 1, 8, 8);
+        let mut w = Picture::<u16>::zeroed(8, 8, 1, 8, 8);
+        for (i, v) in [0, 1, 127, 128, 254, 255].into_iter().enumerate() {
+            let (x, y) = (i as i32, (i as i32 * 3) % 8);
+            n.set_luma(x, y, v);
+            w.set_luma(x, y, v);
+            n.set_cb(y % 4, x % 4, 255 - v);
+            w.set_cb(y % 4, x % 4, 255 - v);
+            assert_eq!(n.luma_at(x, y), v);
+            assert_eq!(n.luma_at(x, y), w.luma_at(x, y));
+            assert_eq!(n.cb_at(y % 4, x % 4), w.cb_at(y % 4, x % 4));
+        }
+        // Clip-and-store of a row: identical values at every 8-bit max.
+        let src = [-70000, -1, 0, 1, 128, 254, 255, 256, 1000, 70000];
+        let mut dn = [0u8; 10];
+        let mut dw = [0u16; 10];
+        store_clipped(&mut dn, &src, 255);
+        store_clipped(&mut dw, &src, 255);
+        assert_eq!(dn.map(u16::from), dw);
+        assert_eq!(dn, [0, 0, 0, 1, 128, 254, 255, 255, 255, 255]);
+        // The 8-bit output pack of either type gives the same bytes.
+        let (mut on, mut ow) = (Vec::new(), Vec::new());
+        u8::extend_8bit(&mut on, &dn);
+        u16::extend_8bit(&mut ow, &dw);
+        assert_eq!(on, ow);
     }
 }
