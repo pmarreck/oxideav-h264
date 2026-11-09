@@ -33,16 +33,16 @@ use crate::mc::PlaneSrc;
 /// pool, published one macroblock row (16 luma rows, `MbHeightC`
 /// chroma rows) at a time, plus its finished output frame.
 #[doc(hidden)] // internal — frame-threading plumbing
-pub struct SharedPlanes {
+pub struct SharedPlanes<S = Sample> {
     width: usize,
     height: usize,
     chroma_width: usize,
     chroma_height: usize,
     /// Chroma rows per macroblock row (0 for monochrome).
     chroma_band_rows: usize,
-    luma: Vec<OnceLock<Box<[Sample]>>>,
-    cb: Vec<OnceLock<Box<[Sample]>>>,
-    cr: Vec<OnceLock<Box<[Sample]>>>,
+    luma: Vec<OnceLock<Box<[S]>>>,
+    cb: Vec<OnceLock<Box<[S]>>>,
+    cr: Vec<OnceLock<Box<[S]>>>,
     /// Number of bands published, or `usize::MAX` once the job failed.
     progress: Mutex<usize>,
     cond: Condvar,
@@ -51,7 +51,7 @@ pub struct SharedPlanes {
     done: OnceLock<bool>,
 }
 
-impl SharedPlanes {
+impl<S: PicSample> SharedPlanes<S> {
     pub(crate) fn new(
         width: usize,
         height: usize,
@@ -83,7 +83,7 @@ impl SharedPlanes {
     }
 
     /// The luma plane (every band read must be published).
-    pub(crate) fn luma_src(&self) -> PlaneSrc<'_> {
+    pub(crate) fn luma_src(&self) -> PlaneSrc<'_, S> {
         PlaneSrc::Banded {
             bands: &self.luma,
             band_rows: 16,
@@ -93,7 +93,7 @@ impl SharedPlanes {
     }
 
     /// Chroma plane `plane` (0 = Cb, 1 = Cr).
-    pub(crate) fn chroma_src(&self, plane: u8) -> PlaneSrc<'_> {
+    pub(crate) fn chroma_src(&self, plane: u8) -> PlaneSrc<'_, S> {
         PlaneSrc::Banded {
             bands: if plane == 0 { &self.cb } else { &self.cr },
             band_rows: self.chroma_band_rows.max(1),
@@ -104,7 +104,7 @@ impl SharedPlanes {
 
     /// Publish band `b` from the picture's planes (`luma` /
     /// `cb` / `cr` are whole row-major planes).
-    pub(crate) fn publish(&self, b: usize, luma: &[Sample], cb: &[Sample], cr: &[Sample]) {
+    pub(crate) fn publish(&self, b: usize, luma: &[S], cb: &[S], cr: &[S]) {
         let w = self.width;
         let l0 = (16 * b).min(self.height);
         let l1 = (16 * b + 16).min(self.height);
@@ -177,8 +177,8 @@ impl SharedPlanes {
     }
 
     /// Assemble the whole picture's planes (after [`Self::wait_done`]).
-    pub(crate) fn assemble(&self) -> (Vec<Sample>, Vec<Sample>, Vec<Sample>) {
-        let cat = |v: &[OnceLock<Box<[Sample]>>]| {
+    pub(crate) fn assemble(&self) -> (Vec<S>, Vec<S>, Vec<S>) {
+        let cat = |v: &[OnceLock<Box<[S]>>]| {
             let mut out = Vec::new();
             for b in v {
                 if let Some(b) = b.get() {
@@ -372,7 +372,7 @@ impl<I: Send + 'static, O: Send + 'static> Deferred<I, O> {
 
 /// Run `f` as the job producing `planes`: a panic marks the planes
 /// failed (waking their waiters) instead of leaving them hanging.
-pub(crate) fn run_job(planes: &SharedPlanes, f: impl FnOnce()) {
+pub(crate) fn run_job<S: PicSample>(planes: &SharedPlanes<S>, f: impl FnOnce()) {
     if catch_unwind(AssertUnwindSafe(f)).is_err() {
         planes.abort();
     }
@@ -383,7 +383,7 @@ pub(crate) fn run_job(planes: &SharedPlanes, f: impl FnOnce()) {
 // ---------------------------------------------------------------------
 
 use crate::mb_grid::MbGrid;
-use crate::picture::{Picture, Sample};
+use crate::picture::{PicSample, Picture, Sample};
 use crate::pps::Pps;
 use crate::reconstruct::{self, FtSlicePlan};
 use crate::ref_store::RefPicProvider;
@@ -395,23 +395,23 @@ use crate::sps::Sps;
 /// metadata, and its samples unless `planes` is set) and, for a
 /// picture still being reconstructed, its published planes.
 #[derive(Clone)]
-pub(crate) struct FtRef {
-    pub(crate) pic: Arc<Picture>,
-    pub(crate) planes: Option<Arc<SharedPlanes>>,
+pub(crate) struct FtRef<S = Sample> {
+    pub(crate) pic: Arc<Picture<S>>,
+    pub(crate) planes: Option<Arc<SharedPlanes<S>>>,
 }
 
 /// The reference lists of one slice, owned, for the sample stage on a
 /// pool worker. Mirrors what the decoder thread's provider answers for
 /// the queries §8.4.2 makes.
 #[derive(Default)]
-pub(crate) struct FtProvider {
-    pub(crate) refs: [Vec<Option<FtRef>>; 2],
+pub(crate) struct FtProvider<S = Sample> {
+    pub(crate) refs: [Vec<Option<FtRef<S>>>; 2],
     pub(crate) parities: [Vec<Option<u8>>; 2],
     pub(crate) focs: [Vec<(i32, i32)>; 2],
 }
 
-impl RefPicProvider for FtProvider {
-    fn ref_pic(&self, list: u8, idx: u32) -> Option<&Picture> {
+impl<S: PicSample> RefPicProvider<S> for FtProvider<S> {
+    fn ref_pic(&self, list: u8, idx: u32) -> Option<&Picture<S>> {
         let l = self.refs.get(list as usize)?;
         l.get(idx as usize)?.as_ref().map(|r| &*r.pic)
     }
@@ -428,7 +428,7 @@ impl RefPicProvider for FtProvider {
         self.focs.get(list as usize)?.get(idx as usize).copied()
     }
 
-    fn ref_planes(&self, list: u8, idx: u32) -> Option<&SharedPlanes> {
+    fn ref_planes(&self, list: u8, idx: u32) -> Option<&SharedPlanes<S>> {
         let l = self.refs.get(list as usize)?;
         l.get(idx as usize)?.as_ref()?.planes.as_deref()
     }
@@ -437,12 +437,12 @@ impl RefPicProvider for FtProvider {
 /// One slice of a frame-threaded picture: its parsed data, the
 /// parameter sets and reference lists it decodes with, and the plan
 /// [`reconstruct::ft_motion_pass`] made.
-pub(crate) struct FtSliceWork {
+pub(crate) struct FtSliceWork<S = Sample> {
     pub(crate) sd: SliceData,
     pub(crate) header: SliceHeader,
     pub(crate) sps: Sps,
     pub(crate) pps: Pps,
-    pub(crate) refs: FtProvider,
+    pub(crate) refs: FtProvider<S>,
     pub(crate) plan: FtSlicePlan,
 }
 
@@ -462,12 +462,12 @@ pub(crate) struct FtDeblock<'a> {
 /// filtered once row `r` is reconstructed. With `publish`, every band
 /// is published as soon as it is final. `false` when a reference
 /// picture's job failed.
-pub(crate) fn run_pixels(
-    pic: &mut Picture,
+pub(crate) fn run_pixels<S: PicSample>(
+    pic: &mut Picture<S>,
     grid: &mut MbGrid,
-    works: &[FtSliceWork],
+    works: &[FtSliceWork<S>],
     deblock: Option<FtDeblock<'_>>,
-    publish: Option<&SharedPlanes>,
+    publish: Option<&SharedPlanes<S>>,
 ) -> bool {
     let mb_w = grid.width_in_mbs as usize;
     let mb_h = grid.height_in_mbs as usize;
@@ -492,9 +492,9 @@ pub(crate) fn run_pixels(
         2 => 16,
         _ => 0,
     };
-    let mut scratch = Picture::new(16, 16, cat, pic.bit_depth_luma, pic.bit_depth_chroma);
+    let mut scratch = Picture::zeroed(16, 16, cat, pic.bit_depth_luma, pic.bit_depth_chroma);
     let mut published = 0usize;
-    let publish_upto = |pic: &Picture, published: &mut usize, end: usize| {
+    let publish_upto = |pic: &Picture<S>, published: &mut usize, end: usize| {
         if let Some(p) = publish {
             while *published < end.min(mb_h) {
                 p.publish(*published, &pic.luma, &pic.cb, &pic.cr);
@@ -502,7 +502,7 @@ pub(crate) fn run_pixels(
             }
         }
     };
-    let mut needs: Vec<(*const SharedPlanes, usize, &SharedPlanes)> = Vec::new();
+    let mut needs: Vec<(*const SharedPlanes<S>, usize, &SharedPlanes<S>)> = Vec::new();
     for y in 0..mb_h {
         // Wait for the reference rows this row's motion reaches.
         needs.clear();
@@ -519,7 +519,7 @@ pub(crate) fn run_pixels(
                         r.height_in_samples == height && r.chroma_array_type == cat
                     });
                     let band = if same { band } else { usize::MAX };
-                    let key = p as *const SharedPlanes;
+                    let key = p as *const SharedPlanes<S>;
                     match needs.iter_mut().find(|n| n.0 == key) {
                         Some(n) => n.1 = n.1.max(band),
                         None => needs.push((key, band, p)),

@@ -51,7 +51,7 @@ use crate::mv_deriv::{
     Mv, MvpredInputs, MvpredShape, NeighbourMv, derive_b_spatial_direct_with_d,
     derive_median_mvpred, derive_mvpred_with_d, derive_p_skip_mv_with_d,
 };
-use crate::picture::{Picture, Sample, to_sample};
+use crate::picture::{PicSample, Picture, to_sample};
 use crate::pps::Pps;
 use crate::ref_store::RefPicProvider;
 use crate::slice_data::SliceData;
@@ -589,7 +589,7 @@ impl MbWriter {
     /// relative to the MB origin, in luma samples. Applies the field-
     /// MB y-stride (§6.4.1 eq. 6-10).
     #[inline]
-    fn set_luma(&self, pic: &mut Picture, x_in_mb: i32, y_in_mb: i32, v: i32) {
+    fn set_luma<S: PicSample>(&self, pic: &mut Picture<S>, x_in_mb: i32, y_in_mb: i32, v: i32) {
         let ax = self.mb_px + x_in_mb;
         let ay = self.mb_py + y_in_mb * self.luma_y_stride();
         pic.set_luma(ax, ay, v);
@@ -597,7 +597,7 @@ impl MbWriter {
 
     /// Write the macroblock's 16x16 luma samples (`samples[y * 16 + x]`),
     /// clipped to `0..=max` — [`Self::set_luma`] for each sample, by row.
-    fn write_luma_mb(&self, pic: &mut Picture, samples: &[i32; 256], max: i32) {
+    fn write_luma_mb<S: PicSample>(&self, pic: &mut Picture<S>, samples: &[i32; 256], max: i32) {
         let w = pic.width_in_samples as i32;
         let h = pic.height_in_samples as i32;
         let ys = self.luma_y_stride();
@@ -623,7 +623,7 @@ impl MbWriter {
     /// Write a Cb sample at `(x_in_mb, y_in_mb)` — coordinates relative
     /// to the chroma MB origin, in chroma samples.
     #[inline]
-    fn set_cb(&self, pic: &mut Picture, x_in_mb: i32, y_in_mb: i32, v: i32) {
+    fn set_cb<S: PicSample>(&self, pic: &mut Picture<S>, x_in_mb: i32, y_in_mb: i32, v: i32) {
         let ax = self.chroma_mb_px() + x_in_mb;
         let ay = self.chroma_mb_py() + y_in_mb * self.chroma_y_stride();
         pic.set_cb(ax, ay, v);
@@ -631,7 +631,7 @@ impl MbWriter {
 
     /// Write a Cr sample at `(x_in_mb, y_in_mb)`.
     #[inline]
-    fn set_cr(&self, pic: &mut Picture, x_in_mb: i32, y_in_mb: i32, v: i32) {
+    fn set_cr<S: PicSample>(&self, pic: &mut Picture<S>, x_in_mb: i32, y_in_mb: i32, v: i32) {
         let ax = self.chroma_mb_px() + x_in_mb;
         let ay = self.chroma_mb_py() + y_in_mb * self.chroma_y_stride();
         pic.set_cr(ax, ay, v);
@@ -640,9 +640,9 @@ impl MbWriter {
     /// Write the macroblock's `w`x`h` chroma samples of plane `plane`
     /// (0 = Cb, 1 = Cr; `samples[y * w + x]`) — [`Self::set_cb`] /
     /// [`Self::set_cr`] for each sample, by row, clipped to `0..=max`.
-    fn write_chroma_mb(
+    fn write_chroma_mb<S: PicSample>(
         &self,
-        pic: &mut Picture,
+        pic: &mut Picture<S>,
         plane: u8,
         samples: &[i32],
         w: usize,
@@ -687,13 +687,13 @@ impl MbWriter {
 ///
 /// `ref_pics` supplies reference pictures for inter prediction
 /// (§8.4.2). Pass [`crate::ref_store::NoRefs`] for I-only reconstruction.
-pub fn reconstruct_slice<R: RefPicProvider>(
+pub fn reconstruct_slice<S: PicSample, R: RefPicProvider<S>>(
     slice_data: &SliceData,
     slice_header: &SliceHeader,
     sps: &Sps,
     pps: &Pps,
     ref_pics: &R,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     grid: &mut MbGrid,
 ) -> Result<(), ReconstructError> {
     reconstruct_slice_no_deblock(slice_data, slice_header, sps, pps, ref_pics, pic, grid)?;
@@ -732,13 +732,13 @@ pub fn reconstruct_slice<R: RefPicProvider>(
 /// `Picture` + `MbGrid`. Callers must invoke [`deblock_picture_full`]
 /// exactly once after the final slice of the picture has been
 /// reconstructed so the deblocker sees the fully-populated grid.
-pub fn reconstruct_slice_no_deblock<R: RefPicProvider>(
+pub fn reconstruct_slice_no_deblock<S: PicSample, R: RefPicProvider<S>>(
     slice_data: &SliceData,
     slice_header: &SliceHeader,
     sps: &Sps,
     pps: &Pps,
     ref_pics: &R,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     grid: &mut MbGrid,
 ) -> Result<(), ReconstructError> {
     // -------- Preconditions -----------------------------------------
@@ -944,13 +944,13 @@ pub(crate) struct InterMbJob {
 /// macroblock without predicting any samples (the motion half of
 /// [`reconstruct_mb_inter`]).
 #[allow(clippy::too_many_arguments)]
-fn derive_mb_inter_motion<R: RefPicProvider>(
+fn derive_mb_inter_motion<S: PicSample, R: RefPicProvider<S>>(
     mb: &Macroblock,
     mb_addr: u32,
     slice_header: &SliceHeader,
     sps: &Sps,
     ref_pics: &R,
-    pic: &Picture,
+    pic: &Picture<S>,
     grid: &mut MbGrid,
     current_slice_id: i32,
 ) -> Result<Vec<(InterPartition, Mv, Mv)>, ReconstructError> {
@@ -989,7 +989,7 @@ fn derive_mb_inter_motion<R: RefPicProvider>(
 /// macroblock whose motion is derived, into `scratch`, a one-macroblock
 /// picture (luma 16x16, chroma one MB) addressed from its origin.
 #[allow(clippy::too_many_arguments)]
-fn synth_mb_inter<R: RefPicProvider>(
+fn synth_mb_inter<S: PicSample, R: RefPicProvider<S>>(
     mb: &MbView<'_>,
     job: &InterMbJob,
     chroma_array_type: u32,
@@ -1000,7 +1000,7 @@ fn synth_mb_inter<R: RefPicProvider>(
     pps: &Pps,
     ref_pics: &R,
     curr_poc: i32,
-    scratch: &mut Picture,
+    scratch: &mut Picture<S>,
 ) -> Result<(), ReconstructError> {
     let mb_px = job.mb_x as i32 * 16;
     let mb_py = job.mb_y as i32 * 16;
@@ -1075,11 +1075,11 @@ fn synth_mb_inter<R: RefPicProvider>(
 
 /// One macroblock row of the picture's sample planes, owned by one
 /// worker of the inter sample stage.
-struct MbRowBand<'a> {
+struct MbRowBand<'a, S> {
     mb_y: u32,
-    luma: &'a mut [Sample],
-    cb: &'a mut [Sample],
-    cr: &'a mut [Sample],
+    luma: &'a mut [S],
+    cb: &'a mut [S],
+    cr: &'a mut [S],
 }
 
 /// Whether [`reconstruct_slice_no_deblock_threaded`] can split this
@@ -1117,13 +1117,13 @@ fn parallel_inter_eligible(slice_header: &SliceHeader, sps: &Sps, pps: &Pps) -> 
 /// order like the serial path does; samples of inter macroblocks after
 /// it may already have been written.
 #[allow(clippy::too_many_arguments)]
-pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
+pub fn reconstruct_slice_no_deblock_threaded<S: PicSample, R: RefPicProvider<S> + Sync>(
     slice_data: &SliceData,
     slice_header: &SliceHeader,
     sps: &Sps,
     pps: &Pps,
     ref_pics: &R,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     grid: &mut MbGrid,
     threads: usize,
 ) -> Result<(), ReconstructError> {
@@ -1237,11 +1237,11 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
             _ => rows.push((j.mb_y, i..i + 1)),
         }
     }
-    let mut bands: Vec<Option<MbRowBand<'_>>> = Vec::new();
+    let mut bands: Vec<Option<MbRowBand<'_, S>>> = Vec::new();
     {
-        let mut luma_rest: &mut [Sample] = &mut pic.luma;
-        let mut cb_rest: &mut [Sample] = &mut pic.cb;
-        let mut cr_rest: &mut [Sample] = &mut pic.cr;
+        let mut luma_rest: &mut [S] = &mut pic.luma;
+        let mut cb_rest: &mut [S] = &mut pic.cb;
+        let mut cr_rest: &mut [S] = &mut pic.cr;
         let mut consumed_rows = 0u32;
         for (mb_y, _) in &rows {
             let skip = (*mb_y - consumed_rows) as usize;
@@ -1273,7 +1273,8 @@ pub fn reconstruct_slice_no_deblock_threaded<R: RefPicProvider + Sync>(
             let (bands, next, errors, rows, jobs) = (&bands, &next, &errors, &rows, &jobs);
             let mbs = slice_data;
             scope.spawn(move || {
-                let mut scratch = Picture::new(16, 16, chroma_array_type, bit_depth_y, bit_depth_c);
+                let mut scratch =
+                    Picture::zeroed(16, 16, chroma_array_type, bit_depth_y, bit_depth_c);
                 loop {
                     let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if k >= rows.len() {
@@ -1434,8 +1435,8 @@ fn next_qp_y(prev_qp_y: i32, mb_qp_delta: i32, bit_depth_luma_minus8: u32) -> i3
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn deblock_picture_full(
-    pic: &mut Picture,
+pub fn deblock_picture_full<S: PicSample>(
+    pic: &mut Picture<S>,
     grid: &MbGrid,
     alpha_off: i32,
     beta_off: i32,
@@ -1466,8 +1467,8 @@ pub fn deblock_picture_full(
 /// a wavefront (see [`deblock_rows_threaded`]); the output equals the
 /// serial filter's for every `threads`.
 #[allow(clippy::too_many_arguments)]
-pub fn deblock_picture_full_threaded(
-    pic: &mut Picture,
+pub fn deblock_picture_full_threaded<S: PicSample>(
+    pic: &mut Picture<S>,
     grid: &MbGrid,
     alpha_off: i32,
     beta_off: i32,
@@ -1563,7 +1564,7 @@ fn sp_si_ctx_for_slice(
 /// samples are `Clip1C(rij)` of the §8.5.12 output at qP = QSC
 /// (eqs. 8-333, 8-426, 8-438 — the prediction is not added again).
 #[allow(clippy::too_many_arguments)]
-fn sp_reconstruct_chroma_plane(
+fn sp_reconstruct_chroma_plane<S: PicSample>(
     mb: &MbView<'_>,
     plane: u8,
     cbp_chroma: u8,
@@ -1574,7 +1575,7 @@ fn sp_reconstruct_chroma_plane(
     weight_scale: &[i32; 16],
     field_scan: bool,
     writer: &MbWriter,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     bit_depth_c: u32,
 ) -> Result<(), ReconstructError> {
     let mut pred64 = [0i32; 64];
@@ -1634,7 +1635,7 @@ fn sp_reconstruct_chroma_plane(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn reconstruct_mb_intra(
+fn reconstruct_mb_intra<S: PicSample>(
     mb: &MbView<'_>,
     mb_addr: u32,
     qp_y: i32,
@@ -1643,7 +1644,7 @@ fn reconstruct_mb_intra(
     bit_depth_c: u32,
     sps: &Sps,
     pps: &Pps,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     grid: &mut MbGrid,
     mbaff_frame_flag: bool,
     mb_field_decoding_flag: bool,
@@ -1827,7 +1828,7 @@ fn reconstruct_mb_intra(
 // -------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn reconstruct_intra_16x16(
+fn reconstruct_intra_16x16<S: PicSample>(
     luma_plane: usize,
     mb: &MbView<'_>,
     pred_mode_idx: u8,
@@ -1843,7 +1844,7 @@ fn reconstruct_intra_16x16(
     writer: &MbWriter,
     sps: &Sps,
     pps: &Pps,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     grid: &MbGrid,
     current_slice_id: i32,
     field_scan: bool,
@@ -2264,8 +2265,8 @@ fn mbaff_neigh_mb_usable(
 /// sample offset relative to the current MB's own block origin, in the
 /// plane's sample units. Returns `None` when the §6.4.12 process marks
 /// the sample not available for intra prediction.
-fn mbaff_neigh_sample(
-    pic: &Picture,
+fn mbaff_neigh_sample<S: PicSample>(
+    pic: &Picture<S>,
     grid: &MbGrid,
     mb_addr: u32,
     plane: u8,
@@ -2309,8 +2310,8 @@ fn mbaff_neigh_sample(
 /// edge come from macroblocks of one neighbouring pair with identical
 /// availability).
 #[allow(clippy::too_many_arguments)]
-fn mbaff_gather_edge<const N: usize>(
-    pic: &Picture,
+fn mbaff_gather_edge<S: PicSample, const N: usize>(
+    pic: &Picture<S>,
     grid: &MbGrid,
     mb_addr: u32,
     plane: u8,
@@ -2590,7 +2591,7 @@ fn derive_intra_8x8_pred_mode(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn reconstruct_intra_nxn(
+fn reconstruct_intra_nxn<S: PicSample>(
     luma_plane: usize,
     mb: &MbView<'_>,
     qp_y: i32,
@@ -2601,7 +2602,7 @@ fn reconstruct_intra_nxn(
     writer: &MbWriter,
     sps: &Sps,
     pps: &Pps,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     grid: &mut MbGrid,
     current_slice_id: i32,
     field_scan: bool,
@@ -2927,7 +2928,7 @@ fn pred_block_to_mb(src4: &[i32; 16], bx: i32, by: i32) -> [i32; 256] {
 // -------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn reconstruct_chroma_intra(
+fn reconstruct_chroma_intra<S: PicSample>(
     mb: &MbView<'_>,
     qp_y: i32,
     chroma_array_type: u32,
@@ -2938,7 +2939,7 @@ fn reconstruct_chroma_intra(
     writer: &MbWriter,
     sps: &Sps,
     pps: &Pps,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     grid: &MbGrid,
     current_slice_id: i32,
     field_scan: bool,
@@ -3218,7 +3219,7 @@ fn reconstruct_chroma_intra(
 // -------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn reconstruct_chroma_intra_444(
+fn reconstruct_chroma_intra_444<S: PicSample>(
     mb: &MbView<'_>,
     qp_y: i32,
     bit_depth_c: u32,
@@ -3228,7 +3229,7 @@ fn reconstruct_chroma_intra_444(
     writer: &MbWriter,
     sps: &Sps,
     pps: &Pps,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     grid: &MbGrid,
     current_slice_id: i32,
     field_scan: bool,
@@ -3375,7 +3376,7 @@ fn reconstruct_chroma_intra_444(
 /// exactly the same way as the luma `residual_luma` array, so the
 /// set-bit-counting index mapping mirrors `reconstruct_intra_nxn`.
 #[allow(clippy::too_many_arguments)]
-fn reconstruct_chroma_intra_nxn_444(
+fn reconstruct_chroma_intra_nxn_444<S: PicSample>(
     mb: &MbView<'_>,
     qp_y: i32,
     bit_depth_c: u32,
@@ -3385,7 +3386,7 @@ fn reconstruct_chroma_intra_nxn_444(
     writer: &MbWriter,
     sps: &Sps,
     pps: &Pps,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     grid: &MbGrid,
     current_slice_id: i32,
     field_scan: bool,
@@ -3567,8 +3568,8 @@ fn reconstruct_chroma_intra_nxn_444(
 /// style prediction on a chroma plane (ChromaArrayType==3 only). Same
 /// geometry as `gather_samples_16x16` but reads from `pic.cb`/`pic.cr`.
 #[allow(clippy::too_many_arguments)]
-fn gather_samples_16x16_chroma(
-    pic: &Picture,
+fn gather_samples_16x16_chroma<S: PicSample>(
+    pic: &Picture<S>,
     grid: &MbGrid,
     mb_px: i32,
     mb_py: i32,
@@ -3581,7 +3582,7 @@ fn gather_samples_16x16_chroma(
     // resolver runs with MbWidthC = MbHeightC = 16).
     if grid.mbaff_frame_flag {
         let p = plane + 1;
-        let (top, top_avail) = mbaff_gather_edge::<16>(
+        let (top, top_avail) = mbaff_gather_edge::<_, 16>(
             pic,
             grid,
             mb_addr,
@@ -3593,7 +3594,7 @@ fn gather_samples_16x16_chroma(
             current_slice_id,
             constrained_intra_pred,
         );
-        let (left, left_avail) = mbaff_gather_edge::<16>(
+        let (left, left_avail) = mbaff_gather_edge::<_, 16>(
             pic,
             grid,
             mb_addr,
@@ -3715,8 +3716,8 @@ fn chroma_block_xy(chroma_array_type: u32, blk: usize) -> (i32, i32) {
 /// (mb_px, mb_py). Availability derived solely from picture boundaries
 /// — full §6.4.11 availability (including constrained_intra_pred)
 /// should be layered by the caller when needed.
-fn gather_samples_16x16(
-    pic: &Picture,
+fn gather_samples_16x16<S: PicSample>(
+    pic: &Picture<S>,
     grid: &MbGrid,
     mb_px: i32,
     mb_py: i32,
@@ -3726,7 +3727,7 @@ fn gather_samples_16x16(
 ) -> Samples16x16 {
     // §6.4.12 — MBAFF path (see `gather_samples_4x4`).
     if grid.mbaff_frame_flag {
-        let (top, top_avail) = mbaff_gather_edge::<16>(
+        let (top, top_avail) = mbaff_gather_edge::<_, 16>(
             pic,
             grid,
             mb_addr,
@@ -3738,7 +3739,7 @@ fn gather_samples_16x16(
             current_slice_id,
             constrained_intra_pred,
         );
-        let (left, left_avail) = mbaff_gather_edge::<16>(
+        let (left, left_avail) = mbaff_gather_edge::<_, 16>(
             pic,
             grid,
             mb_addr,
@@ -3830,8 +3831,8 @@ fn gather_samples_16x16(
 /// substitution rule (copy p[3, -1] into p[4..7, -1]) then kicks in
 /// inside the intra-pred helpers.
 #[allow(clippy::too_many_arguments)]
-fn gather_samples_4x4(
-    pic: &Picture,
+fn gather_samples_4x4<S: PicSample>(
+    pic: &Picture<S>,
     grid: &MbGrid,
     bx: i32,
     by: i32,
@@ -3848,7 +3849,7 @@ fn gather_samples_4x4(
     // field-coded MB or a mixed frame/field pair is involved.
     if grid.mbaff_frame_flag {
         let tr_scan_ok = !matches!(block_idx, 3 | 7 | 11 | 13 | 15);
-        let (top, top_avail) = mbaff_gather_edge::<4>(
+        let (top, top_avail) = mbaff_gather_edge::<_, 4>(
             pic,
             grid,
             mb_addr,
@@ -3861,7 +3862,7 @@ fn gather_samples_4x4(
             constrained_intra_pred,
         );
         let (top_right, tr_edge_avail) = if tr_scan_ok {
-            mbaff_gather_edge::<4>(
+            mbaff_gather_edge::<_, 4>(
                 pic,
                 grid,
                 mb_addr,
@@ -3876,7 +3877,7 @@ fn gather_samples_4x4(
         } else {
             ([0i32; 4], false)
         };
-        let (left, left_avail) = mbaff_gather_edge::<4>(
+        let (left, left_avail) = mbaff_gather_edge::<_, 4>(
             pic,
             grid,
             mb_addr,
@@ -4061,8 +4062,8 @@ fn cip_ok_at(grid: &MbGrid, x: i32, y: i32, constrained_intra_pred: bool) -> boo
 /// picture bounds. The §8.3.2.2 substitution rule (copy p[7, -1] into
 /// p[8..15, -1]) then applies inside `filter_samples_8x8`.
 #[allow(clippy::too_many_arguments)]
-fn gather_samples_8x8(
-    pic: &Picture,
+fn gather_samples_8x8<S: PicSample>(
+    pic: &Picture<S>,
     grid: &MbGrid,
     bx: i32,
     by: i32,
@@ -4076,7 +4077,7 @@ fn gather_samples_8x8(
     // §6.4.12 — MBAFF path (see `gather_samples_4x4`).
     if grid.mbaff_frame_flag {
         let tr_scan_ok = blk8 != 3;
-        let (top, top_avail) = mbaff_gather_edge::<8>(
+        let (top, top_avail) = mbaff_gather_edge::<_, 8>(
             pic,
             grid,
             mb_addr,
@@ -4089,7 +4090,7 @@ fn gather_samples_8x8(
             constrained_intra_pred,
         );
         let (top_right, tr_edge_avail) = if tr_scan_ok {
-            mbaff_gather_edge::<8>(
+            mbaff_gather_edge::<_, 8>(
                 pic,
                 grid,
                 mb_addr,
@@ -4104,7 +4105,7 @@ fn gather_samples_8x8(
         } else {
             ([0i32; 8], false)
         };
-        let (left, left_avail) = mbaff_gather_edge::<8>(
+        let (left, left_avail) = mbaff_gather_edge::<_, 8>(
             pic,
             grid,
             mb_addr,
@@ -4206,8 +4207,8 @@ fn gather_samples_8x8(
 /// sample reads target `pic.cb_at` / `pic.cr_at` instead of
 /// `pic.luma_at`. `plane` selects 0 = Cb, 1 = Cr.
 #[allow(clippy::too_many_arguments)]
-fn gather_samples_4x4_chroma(
-    pic: &Picture,
+fn gather_samples_4x4_chroma<S: PicSample>(
+    pic: &Picture<S>,
     grid: &MbGrid,
     bx: i32,
     by: i32,
@@ -4223,7 +4224,7 @@ fn gather_samples_4x4_chroma(
     if grid.mbaff_frame_flag {
         let p = plane + 1;
         let tr_scan_ok = !matches!(block_idx, 3 | 7 | 11 | 13 | 15);
-        let (top, top_avail) = mbaff_gather_edge::<4>(
+        let (top, top_avail) = mbaff_gather_edge::<_, 4>(
             pic,
             grid,
             mb_addr,
@@ -4236,7 +4237,7 @@ fn gather_samples_4x4_chroma(
             constrained_intra_pred,
         );
         let (top_right, tr_edge_avail) = if tr_scan_ok {
-            mbaff_gather_edge::<4>(
+            mbaff_gather_edge::<_, 4>(
                 pic,
                 grid,
                 mb_addr,
@@ -4251,7 +4252,7 @@ fn gather_samples_4x4_chroma(
         } else {
             ([0i32; 4], false)
         };
-        let (left, left_avail) = mbaff_gather_edge::<4>(
+        let (left, left_avail) = mbaff_gather_edge::<_, 4>(
             pic,
             grid,
             mb_addr,
@@ -4349,8 +4350,8 @@ fn gather_samples_4x4_chroma(
 /// 8x8 availability + scan logic of [`gather_samples_8x8`]; only the
 /// sample plane differs. `plane` selects 0 = Cb, 1 = Cr.
 #[allow(clippy::too_many_arguments)]
-fn gather_samples_8x8_chroma(
-    pic: &Picture,
+fn gather_samples_8x8_chroma<S: PicSample>(
+    pic: &Picture<S>,
     grid: &MbGrid,
     bx: i32,
     by: i32,
@@ -4366,7 +4367,7 @@ fn gather_samples_8x8_chroma(
     if grid.mbaff_frame_flag {
         let p = plane + 1;
         let tr_scan_ok = blk8 != 3;
-        let (top, top_avail) = mbaff_gather_edge::<8>(
+        let (top, top_avail) = mbaff_gather_edge::<_, 8>(
             pic,
             grid,
             mb_addr,
@@ -4379,7 +4380,7 @@ fn gather_samples_8x8_chroma(
             constrained_intra_pred,
         );
         let (top_right, tr_edge_avail) = if tr_scan_ok {
-            mbaff_gather_edge::<8>(
+            mbaff_gather_edge::<_, 8>(
                 pic,
                 grid,
                 mb_addr,
@@ -4394,7 +4395,7 @@ fn gather_samples_8x8_chroma(
         } else {
             ([0i32; 8], false)
         };
-        let (left, left_avail) = mbaff_gather_edge::<8>(
+        let (left, left_avail) = mbaff_gather_edge::<_, 8>(
             pic,
             grid,
             mb_addr,
@@ -4484,8 +4485,8 @@ fn gather_samples_8x8_chroma(
 }
 
 /// §8.3.4 — chroma reference samples for plane `plane` (0 = Cb, 1 = Cr).
-fn gather_samples_chroma(
-    pic: &Picture,
+fn gather_samples_chroma<S: PicSample>(
+    pic: &Picture<S>,
     grid: &MbGrid,
     c_mb_px: i32,
     c_mb_py: i32,
@@ -4637,7 +4638,7 @@ fn gather_samples_chroma(
 }
 
 // -------------------------------------------------------------------------
-// Sample write helpers
+// S write helpers
 // -------------------------------------------------------------------------
 
 /// Combine an MB-sized prediction array with a 4x4 residual at
@@ -4645,9 +4646,9 @@ fn gather_samples_chroma(
 ///
 /// `writer` applies the §6.4.1 eq. (6-10) field-MB y-stride; `(bx, by)`
 /// is the 4x4 block's top-left in MB-local luma coordinates (0..=15).
-fn write_block_luma(
+fn write_block_luma<S: PicSample>(
     writer: &MbWriter,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     pred_mb: &[i32; 256],
     bx: i32,
     by: i32,
@@ -4791,7 +4792,7 @@ impl Default for InterPartition {
 
 /// §8.4 — Per-MB inter reconstruction.
 #[allow(clippy::too_many_arguments)]
-fn reconstruct_mb_inter<R: RefPicProvider>(
+fn reconstruct_mb_inter<S: PicSample, R: RefPicProvider<S>>(
     mb: &MbView<'_>,
     mb_addr: u32,
     qp_y: i32,
@@ -4802,7 +4803,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
     sps: &Sps,
     pps: &Pps,
     ref_pics: &R,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     grid: &mut MbGrid,
     mbaff_frame_flag: bool,
     mb_field_decoding_flag: bool,
@@ -5014,7 +5015,7 @@ fn reconstruct_mb_inter<R: RefPicProvider>(
 /// the luma / chroma residual, add it to the MB's prediction samples and
 /// write the clipped result through `writer` into `pic`.
 #[allow(clippy::too_many_arguments)]
-fn inter_residual_write(
+fn inter_residual_write<S: PicSample>(
     mb: &MbView<'_>,
     qp_y: i32,
     chroma_array_type: u32,
@@ -5029,7 +5030,7 @@ fn inter_residual_write(
     pred_luma: &mut [i32; 256],
     pred_cb: &mut [i32],
     pred_cr: &mut [i32],
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     mbaff_field_mb: bool,
     inter_debug: bool,
 ) -> Result<(), ReconstructError> {
@@ -5494,7 +5495,7 @@ fn coalesce_partitions(
 /// partition's motion vectors and store them, with its reference
 /// indices and reference-picture identities, on the MB grid.
 #[allow(clippy::too_many_arguments)]
-fn derive_and_store_partition<R: RefPicProvider>(
+fn derive_and_store_partition<S: PicSample, R: RefPicProvider<S>>(
     part: &InterPartition,
     mb_addr: u32,
     slice_header: &SliceHeader,
@@ -5928,7 +5929,7 @@ thread_local! {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn predict_partition<R: RefPicProvider>(
+fn predict_partition<S: PicSample, R: RefPicProvider<S>>(
     part: &InterPartition,
     mv_l0: Mv,
     mv_l1: Mv,
@@ -5981,7 +5982,7 @@ fn predict_partition<R: RefPicProvider>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn predict_partition_with<R: RefPicProvider>(
+fn predict_partition_with<S: PicSample, R: RefPicProvider<S>>(
     bufs: &mut PredBufs,
     part: &InterPartition,
     mv_l0: Mv,
@@ -6021,26 +6022,27 @@ fn predict_partition_with<R: RefPicProvider>(
 
     // §8.4.2.1 — resolve (list, refIdxLX) to the reference picture and
     // the field-parity view to read it with.
-    let resolve_ref = |list: u8, ref_idx: i8| -> Result<(&Picture, Option<u8>), ReconstructError> {
-        let idx = ref_idx.max(0) as u32;
-        match field_parity {
-            Some(par) => {
-                let rp = ref_pics
-                    .ref_pic(list, idx / 2)
-                    .ok_or(ReconstructError::MissingRefPic { list, idx: idx / 2 })?;
-                // refIdxLX % 2: 0 → same parity as the current field
-                // MB, 1 → opposite parity.
-                let sel = if idx.is_multiple_of(2) { par } else { 1 - par };
-                Ok((rp, Some(sel)))
+    let resolve_ref =
+        |list: u8, ref_idx: i8| -> Result<(&Picture<S>, Option<u8>), ReconstructError> {
+            let idx = ref_idx.max(0) as u32;
+            match field_parity {
+                Some(par) => {
+                    let rp = ref_pics
+                        .ref_pic(list, idx / 2)
+                        .ok_or(ReconstructError::MissingRefPic { list, idx: idx / 2 })?;
+                    // refIdxLX % 2: 0 → same parity as the current field
+                    // MB, 1 → opposite parity.
+                    let sel = if idx.is_multiple_of(2) { par } else { 1 - par };
+                    Ok((rp, Some(sel)))
+                }
+                None => Ok((
+                    ref_pics
+                        .ref_pic(list, idx)
+                        .ok_or(ReconstructError::MissingRefPic { list, idx })?,
+                    None,
+                )),
             }
-            None => Ok((
-                ref_pics
-                    .ref_pic(list, idx)
-                    .ok_or(ReconstructError::MissingRefPic { list, idx })?,
-                None,
-            )),
-        }
-    };
+        };
 
     // Frame threading — the published planes of a reference still being
     // reconstructed on another thread (frame macroblocks only).
@@ -6075,7 +6077,11 @@ fn predict_partition_with<R: RefPicProvider>(
                 rp.height_in_samples,
                 rp.pic_order_cnt,
                 fld,
-                rp.luma.iter().take(64).map(|&v| v as u32).sum::<u32>()
+                rp.luma
+                    .iter()
+                    .take(64)
+                    .map(|&v| Into::<i32>::into(v) as u32)
+                    .sum::<u32>()
             );
         }
         mc_luma_partition(
@@ -6101,7 +6107,11 @@ fn predict_partition_with<R: RefPicProvider>(
                 rp.height_in_samples,
                 rp.pic_order_cnt,
                 fld,
-                rp.luma.iter().take(64).map(|&v| v as u32).sum::<u32>()
+                rp.luma
+                    .iter()
+                    .take(64)
+                    .map(|&v| Into::<i32>::into(v) as u32)
+                    .sum::<u32>()
             );
         }
         mc_luma_partition(
@@ -6178,7 +6188,7 @@ fn predict_partition_with<R: RefPicProvider>(
         // parity as `selX`). Otherwise the frames / pictures themselves.
         let (poc_curr, poc0, poc1) = match (field_parity, sel0, sel1) {
             (Some(par), Some(s0), Some(s1)) => {
-                let field_foc = |list: u8, ref_idx: i8, rp: &Picture, sel: u8| {
+                let field_foc = |list: u8, ref_idx: i8, rp: &Picture<S>, sel: u8| {
                     let (t, b) = ref_pics
                         .ref_entry_unit_focs(list, (ref_idx.max(0) as u32) / 2)
                         .unwrap_or((rp.top_field_order_cnt, rp.bottom_field_order_cnt));
@@ -6710,8 +6720,8 @@ fn predict_partition_with<R: RefPicProvider>(
 /// rows) as a half-height plane — `part_abs_y` must then be given in
 /// FIELD rows (refPicHeightEffectiveL = PicHeightInSamplesL / 2 per
 /// §8.4.2.2.1). `None` is the ordinary frame access.
-fn mc_luma_partition(
-    ref_pic: &Picture,
+fn mc_luma_partition<S: PicSample>(
+    ref_pic: &Picture<S>,
     part_abs_x: i32,
     part_abs_y: i32,
     mv: Mv,
@@ -6720,7 +6730,7 @@ fn mc_luma_partition(
     bit_depth: u32,
     dst: &mut [i32],
     field: Option<u8>,
-    planes: Option<&crate::frame_thread::SharedPlanes>,
+    planes: Option<&crate::frame_thread::SharedPlanes<S>>,
 ) -> Result<(), ReconstructError> {
     // §8.4.2 — reference picture must have positive luma dims. A
     // zero-dim ref pic (e.g. uninitialised DPB slot) drives the slow-
@@ -6753,7 +6763,7 @@ fn mc_luma_partition(
     // §8.4.2.1 — field view of a stored frame: rows of one parity,
     // exposed zero-copy as a doubled-stride half-height plane.
     let stride = ref_pic.width_in_samples as usize;
-    let (src, src_stride, src_h): (&[Sample], usize, usize) = match field {
+    let (src, src_stride, src_h): (&[S], usize, usize) = match field {
         Some(parity) => (
             &ref_pic.luma[(parity as usize) * stride..],
             stride * 2,
@@ -6804,8 +6814,8 @@ fn mc_luma_partition(
 /// (4:2:0) or 2 (4:2:2). §8.4.1.4 — chroma MVs are in 1/8-pel units for
 /// 4:2:0 / 4:2:2.
 #[allow(clippy::too_many_arguments)]
-fn mc_chroma_partition(
-    ref_pic: &Picture,
+fn mc_chroma_partition<S: PicSample>(
+    ref_pic: &Picture<S>,
     part_abs_x: i32,
     part_abs_y: i32,
     mv: Mv,
@@ -6816,7 +6826,7 @@ fn mc_chroma_partition(
     dst_cb: &mut [i32],
     dst_cr: &mut [i32],
     field: Option<u8>,
-    planes: Option<&crate::frame_thread::SharedPlanes>,
+    planes: Option<&crate::frame_thread::SharedPlanes<S>>,
 ) -> Result<(), ReconstructError> {
     // §8.4.1.4 — chroma MV derivation:
     // - 4:2:0 (ChromaArrayType == 1): mvC = mv / 2 (both components).
@@ -6900,8 +6910,8 @@ fn mc_chroma_partition(
 /// bilinear filter. The chroma planes are therefore motion-compensated
 /// identically to luma (same MV, same 6-tap kernel, full resolution).
 #[allow(clippy::too_many_arguments)]
-fn mc_chroma_partition_444(
-    ref_pic: &Picture,
+fn mc_chroma_partition_444<S: PicSample>(
+    ref_pic: &Picture<S>,
     part_abs_x: i32,
     part_abs_y: i32,
     mv: Mv,
@@ -7374,12 +7384,12 @@ fn neighbour_from_block(
 
 /// §7.4.5 / Tables 7-13, 7-14 — derive the list of inter partitions
 /// for a given macroblock.
-fn derive_inter_partitions<R: RefPicProvider>(
+fn derive_inter_partitions<S: PicSample, R: RefPicProvider<S>>(
     mb: &Macroblock,
     slice_header: &SliceHeader,
     sps: &Sps,
     ref_pics: &R,
-    pic: &Picture,
+    pic: &Picture<S>,
     mb_addr: u32,
     grid: &MbGrid,
     current_slice_id: i32,
@@ -7793,8 +7803,8 @@ enum VertMvScale {
 /// spatial direct (§8.4.1.2.2 colZeroFlag, which uses mvCol unscaled per
 /// its NOTE 2) and temporal direct (§8.4.1.2.3, which scales mvCol[1]
 /// by `vert`).
-struct Colocated<'a> {
-    col_pic: &'a Picture,
+struct Colocated<'a, S> {
+    col_pic: &'a Picture<S>,
     col_struct: crate::picture::PicCodingStruct,
     curr_struct: crate::picture::PicCodingStruct,
     curr_mb_field: bool,
@@ -7807,13 +7817,13 @@ struct Colocated<'a> {
     used_l1: bool,
 }
 
-fn colocated_block<'a, R: RefPicProvider>(
+fn colocated_block<'a, S: PicSample, R: RefPicProvider<S>>(
     ref_pics: &'a R,
-    pic: &Picture,
+    pic: &Picture<S>,
     grid: &MbGrid,
     mb_addr: u32,
     luma4x4_blk_idx: usize,
-) -> Option<Colocated<'a>> {
+) -> Option<Colocated<'a, S>> {
     use crate::picture::PicCodingStruct as Pcs;
 
     let curr_struct = pic.coding_struct;
@@ -7837,7 +7847,7 @@ fn colocated_block<'a, R: RefPicProvider>(
     // ---- Table 8-6 — colPic ------------------------------------------
     // `col_pic` is the picture whose colocated grids we address;
     // `col_struct` its Table 8-7 classification.
-    let (col_pic, col_struct): (&Picture, Pcs) = if curr_struct == Pcs::Fld {
+    let (col_pic, col_struct): (&Picture<S>, Pcs) = if curr_struct == Pcs::Fld {
         let c = ref_pics.ref_pic(1, 0)?;
         if c.view_of_frame_parity.is_some() {
             // Row 1 — "a field of a decoded frame": colPic is the
@@ -8007,9 +8017,9 @@ fn colocated_block<'a, R: RefPicProvider>(
 /// Returns `Some((ref_idx_l0, mv_l0, mv_l1))` when the co-located
 /// picture is available; `None` if the provider didn't ship motion
 /// data (caller falls back to (0, 0, 0, 0)).
-fn derive_temporal_direct_mvs_for_block<R: RefPicProvider>(
+fn derive_temporal_direct_mvs_for_block<S: PicSample, R: RefPicProvider<S>>(
     ref_pics: &R,
-    pic: &Picture,
+    pic: &Picture<S>,
     grid: &MbGrid,
     mb_addr: u32,
     luma4x4_blk_idx: usize,
@@ -8242,10 +8252,10 @@ fn derive_temporal_direct_mvs_for_block<R: RefPicProvider>(
 ///   3. If pic0 is long-term or DiffPicOrderCnt(pic1, pic0) == 0:
 ///      mvL0 = mvCol, mvL1 = 0 (eq. 8-195/8-196).
 ///   4. Else apply temporal scaling (eq. 8-197..8-200).
-fn build_temporal_direct_partitions<R: RefPicProvider>(
+fn build_temporal_direct_partitions<S: PicSample, R: RefPicProvider<S>>(
     sps: &Sps,
     ref_pics: &R,
-    pic: &Picture,
+    pic: &Picture<S>,
     grid: &MbGrid,
     mb_addr: u32,
     is_skip: bool,
@@ -8312,10 +8322,10 @@ fn build_temporal_direct_partitions<R: RefPicProvider>(
 /// follows `direct_8x8_inference_flag`:
 ///   - flag == 1: one 8x8 partition.
 ///   - flag == 0: four 4x4 partitions.
-fn build_temporal_direct_sub_partitions<R: RefPicProvider>(
+fn build_temporal_direct_sub_partitions<S: PicSample, R: RefPicProvider<S>>(
     sps: &Sps,
     ref_pics: &R,
-    pic: &Picture,
+    pic: &Picture<S>,
     grid: &MbGrid,
     mb_addr: u32,
     part_x: u8,
@@ -8392,10 +8402,10 @@ fn build_temporal_direct_sub_partitions<R: RefPicProvider>(
 /// the MB's top-left (block (0, 0)) with width = region_size / 4 so
 /// that C sits above-right of the region. This matches the spec's
 /// "(mbPartIdx, subMbPartIdx) = (0, 0)" rule for refIdx derivation.
-fn build_spatial_direct_partitions<R: RefPicProvider>(
+fn build_spatial_direct_partitions<S: PicSample, R: RefPicProvider<S>>(
     sps: &Sps,
     ref_pics: &R,
-    pic: &Picture,
+    pic: &Picture<S>,
     mb_addr: u32,
     grid: &MbGrid,
     current_slice_id: i32,
@@ -8669,7 +8679,7 @@ fn b_sub_mode(t: SubMbType, r0: i8, r1: i8) -> (PartMode, i8, i8) {
 /// Inter prediction of the whole MB (P_Skip included — an SP skip
 /// still re-quantises its prediction, unlike a P_Skip sample copy).
 #[allow(clippy::too_many_arguments)]
-fn sp_reconstruct_inter_residual(
+fn sp_reconstruct_inter_residual<S: PicSample>(
     mb: &MbView<'_>,
     ctx: SpSiCtx,
     qp_y: i32,
@@ -8681,7 +8691,7 @@ fn sp_reconstruct_inter_residual(
     pred_cb: &[i32],
     pred_cr: &[i32],
     writer: &MbWriter,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     field_scan: bool,
 ) -> Result<(), ReconstructError> {
     // §8.6 is defined for the 4x4 transform only; the Extended profile
@@ -8784,7 +8794,7 @@ fn sp_reconstruct_inter_residual(
 /// write out. Shares code with the intra chroma path except the
 /// prediction buffer source.
 #[allow(clippy::too_many_arguments)]
-fn reconstruct_inter_chroma_residual(
+fn reconstruct_inter_chroma_residual<S: PicSample>(
     mb: &MbView<'_>,
     qp_y: i32,
     chroma_array_type: u32,
@@ -8797,7 +8807,7 @@ fn reconstruct_inter_chroma_residual(
     cbp_chroma: u8,
     pred_cb: &mut [i32],
     pred_cr: &mut [i32],
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     field_scan: bool,
 ) -> Result<(), ReconstructError> {
     let (mbw_c, _mbh_c) = chroma_mb_dims(chroma_array_type);
@@ -8950,7 +8960,7 @@ fn reconstruct_inter_chroma_residual(
 /// the coded planes' coefficients in `residual_cb_luma_like` /
 /// `residual_cr_luma_like`, compacted by the set bits of `cbp_luma`.
 #[allow(clippy::too_many_arguments)]
-fn reconstruct_inter_chroma_residual_444(
+fn reconstruct_inter_chroma_residual_444<S: PicSample>(
     mb: &MbView<'_>,
     qp_y: i32,
     bit_depth_c: u32,
@@ -8960,7 +8970,7 @@ fn reconstruct_inter_chroma_residual_444(
     cbp_luma: u8,
     pred_cb: &[i32],
     pred_cr: &[i32],
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     field_scan: bool,
 ) -> Result<(), ReconstructError> {
     // §8.5.8 — per-plane chroma QP (qP'C = QPC + QpBdOffsetC).
@@ -9243,8 +9253,8 @@ fn compute_chroma_nonzero_mask(mb: &MbView<'_>, chroma_array_type: u32) -> u16 {
 // -------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn deblock_picture(
-    pic: &mut Picture,
+fn deblock_picture<S: PicSample>(
+    pic: &mut Picture<S>,
     grid: &MbGrid,
     alpha_off: i32,
     beta_off: i32,
@@ -9642,8 +9652,8 @@ fn mbaff_edge_bs(
 /// a vertical edge: 8 horizontal taps in row `y` around edge column
 /// `edge_x` (q0 at `edge_x`).
 #[allow(clippy::too_many_arguments)]
-fn filter_luma_set_row(
-    pic: &mut Picture,
+fn filter_luma_set_row<S: PicSample>(
+    pic: &mut Picture<S>,
     edge_x: i32,
     y: i32,
     bs: u8,
@@ -9701,8 +9711,8 @@ fn filter_luma_set_row(
 /// a horizontal edge: 8 vertical taps in column `x`, q-side rows
 /// `q_y0 + stride*i`, p-side rows `q_y0 - stride*(i+1)` (stride = dy).
 #[allow(clippy::too_many_arguments)]
-fn filter_luma_set_col(
-    pic: &mut Picture,
+fn filter_luma_set_col<S: PicSample>(
+    pic: &mut Picture<S>,
     x: i32,
     q_y0: i32,
     stride: i32,
@@ -9756,8 +9766,8 @@ fn filter_luma_set_col(
 /// Chroma analogue of [`filter_luma_set_row`] (chromaStyle filter — only
 /// p1/p0/q0/q1 are written back).
 #[allow(clippy::too_many_arguments)]
-fn filter_chroma_set_row(
-    pic: &mut Picture,
+fn filter_chroma_set_row<S: PicSample>(
+    pic: &mut Picture<S>,
     plane: u8,
     edge_x: i32,
     y: i32,
@@ -9777,7 +9787,7 @@ fn filter_chroma_set_row(
         filter_offset_b: beta_off,
         bit_depth,
     };
-    let fetch = |p: &Picture, x: i32, y: i32| -> i32 {
+    let fetch = |p: &Picture<S>, x: i32, y: i32| -> i32 {
         if plane == 0 {
             p.cb_at(x, y)
         } else {
@@ -9825,8 +9835,8 @@ fn filter_chroma_set_row(
 
 /// Chroma analogue of [`filter_luma_set_col`].
 #[allow(clippy::too_many_arguments)]
-fn filter_chroma_set_col(
-    pic: &mut Picture,
+fn filter_chroma_set_col<S: PicSample>(
+    pic: &mut Picture<S>,
     plane: u8,
     x: i32,
     q_y0: i32,
@@ -9847,7 +9857,7 @@ fn filter_chroma_set_col(
         filter_offset_b: beta_off,
         bit_depth,
     };
-    let fetch = |p: &Picture, x: i32, y: i32| -> i32 {
+    let fetch = |p: &Picture<S>, x: i32, y: i32| -> i32 {
         if plane == 0 {
             p.cb_at(x, y)
         } else {
@@ -9896,8 +9906,8 @@ fn filter_chroma_set_col(
 /// per §8.7 step 3, with all sample addressing through the §8.7.1
 /// eq. 8-442..8-449 geometry (field MBs: dy = 2).
 #[allow(clippy::too_many_arguments)]
-fn deblock_mbaff_frame(
-    pic: &mut Picture,
+fn deblock_mbaff_frame<S: PicSample>(
+    pic: &mut Picture<S>,
     grid: &MbGrid,
     alpha_off: i32,
     beta_off: i32,
@@ -10471,10 +10481,10 @@ fn mv_delta_below_4(a: (i16, i16), b: (i16, i16), field_units: bool) -> bool {
 /// macroblock column: the last four luma rows and the last
 /// `4 / SubHeightC` chroma rows of each chroma plane, once no later
 /// edge of its own row can change them.
-struct DeblockHalo {
-    luma: [Sample; 64],
-    cb: [Sample; 32],
-    cr: [Sample; 32],
+struct DeblockHalo<S> {
+    luma: [S; 64],
+    cb: [S; 32],
+    cr: [S; 32],
 }
 
 /// Per-row count of published [`DeblockHalo`] columns, with a condvar
@@ -10544,21 +10554,21 @@ impl RowProgress {
 }
 
 /// One macroblock row's own sample rows of the picture.
-struct DeblockRowSink<'a> {
-    luma: &'a mut [Sample],
-    cb: &'a mut [Sample],
-    cr: &'a mut [Sample],
+struct DeblockRowSink<'a, S> {
+    luma: &'a mut [S],
+    cb: &'a mut [S],
+    cr: &'a mut [S],
     luma_bs: &'a mut [u8],
 }
 
 /// The final samples of the rows above a macroblock row that its top
 /// edges modified (luma rows `16 * r - 4 ..`, chroma likewise), written
 /// back into the picture after every row is done.
-struct DeblockRowBack {
+struct DeblockRowBack<S> {
     row: usize,
-    luma: Vec<Sample>,
-    cb: Vec<Sample>,
-    cr: Vec<Sample>,
+    luma: Vec<S>,
+    cb: Vec<S>,
+    cr: Vec<S>,
 }
 
 /// §8.7 — deblock a non-MBAFF picture (ChromaArrayType 0, 1 or 2) by
@@ -10579,8 +10589,8 @@ struct DeblockRowBack {
 /// independent, so filtering luma, Cb and Cr per macroblock in turn
 /// matches the serial plane-by-plane order.
 #[allow(clippy::too_many_arguments)]
-fn deblock_rows_threaded(
-    pic: &mut Picture,
+fn deblock_rows_threaded<S: PicSample>(
+    pic: &mut Picture<S>,
     grid: &MbGrid,
     alpha_off: i32,
     beta_off: i32,
@@ -10618,11 +10628,11 @@ fn deblock_rows_threaded(
         .unwrap_or(pps.chroma_qp_index_offset);
 
     let mut luma_bs = vec![BS_NOT_DERIVED; mb_w * mb_h * 32];
-    let mut sinks: Vec<Option<DeblockRowSink<'_>>> = Vec::with_capacity(mb_h);
+    let mut sinks: Vec<Option<DeblockRowSink<'_, S>>> = Vec::with_capacity(mb_h);
     {
-        let mut l_rest: &mut [Sample] = &mut pic.luma;
-        let mut b_rest: &mut [Sample] = &mut pic.cb;
-        let mut r_rest: &mut [Sample] = &mut pic.cr;
+        let mut l_rest: &mut [S] = &mut pic.luma;
+        let mut b_rest: &mut [S] = &mut pic.cb;
+        let mut r_rest: &mut [S] = &mut pic.cr;
         let mut s_rest: &mut [u8] = &mut luma_bs;
         for _ in 0..mb_h {
             let (l, lr) = std::mem::take(&mut l_rest).split_at_mut(16 * wu);
@@ -10642,12 +10652,12 @@ fn deblock_rows_threaded(
         }
     }
     let sinks = std::sync::Mutex::new(sinks);
-    let halos: Vec<std::sync::OnceLock<DeblockHalo>> = (0..mb_w * mb_h)
+    let halos: Vec<std::sync::OnceLock<DeblockHalo<S>>> = (0..mb_w * mb_h)
         .map(|_| std::sync::OnceLock::new())
         .collect();
     let progress = RowProgress::new(mb_h);
     let next_row = std::sync::atomic::AtomicUsize::new(0);
-    let backs: std::sync::Mutex<Vec<DeblockRowBack>> = std::sync::Mutex::new(Vec::new());
+    let backs: std::sync::Mutex<Vec<DeblockRowBack<S>>> = std::sync::Mutex::new(Vec::new());
 
     std::thread::scope(|scope| {
         for _ in 0..threads.min(mb_h) {
@@ -10665,7 +10675,7 @@ fn deblock_rows_threaded(
                 }
                 let _unblock = Unblock(progress);
                 // Band: 4 halo luma rows + 16 own rows (chroma alike).
-                let mut band = Picture::new(w as u32, 20, cat, bit_depth_y, bit_depth_c);
+                let mut band = Picture::zeroed(w as u32, 20, cat, bit_depth_y, bit_depth_c);
                 loop {
                     let r = next_row.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     if r >= mb_h {
@@ -10683,15 +10693,15 @@ fn deblock_rows_threaded(
                     let yc_base = (mbh_c * r) as i32 - halo_c as i32;
                     let mut back = DeblockRowBack {
                         row: r,
-                        luma: vec![0; 4 * wu],
-                        cb: vec![0; halo_c * cw],
-                        cr: vec![0; halo_c * cw],
+                        luma: vec![S::default(); 4 * wu],
+                        cb: vec![S::default(); halo_c * cw],
+                        cr: vec![S::default(); halo_c * cw],
                     };
-                    let publish = |band: &Picture, x: usize| {
+                    let publish = |band: &Picture<S>, x: usize| {
                         let mut halo = DeblockHalo {
-                            luma: [0; 64],
-                            cb: [0; 32],
-                            cr: [0; 32],
+                            luma: [S::default(); 64],
+                            cb: [S::default(); 32],
+                            cr: [S::default(); 32],
                         };
                         for k in 0..4 {
                             let o = (16 + k) * wu + 16 * x;
@@ -10825,8 +10835,8 @@ fn luma_bs_index(mb_w: i32, mb_x: i32, mb_y: i32, horizontal: bool, edge: i32, s
 }
 
 #[allow(clippy::too_many_arguments)]
-fn deblock_plane_luma(
-    pic: &mut Picture,
+fn deblock_plane_luma<S: PicSample>(
+    pic: &mut Picture<S>,
     grid: &MbGrid,
     alpha_off: i32,
     beta_off: i32,
@@ -10905,8 +10915,8 @@ fn deblock_plane_luma(
 /// picture's dimensions. Records each derived bS in `luma_bs`, the
 /// macroblock's 32 entries (see [`luma_bs_index`]).
 #[allow(clippy::too_many_arguments)]
-fn deblock_luma_mb(
-    pic: &mut Picture,
+fn deblock_luma_mb<S: PicSample>(
+    pic: &mut Picture<S>,
     y_base: i32,
     w: i32,
     h: i32,
@@ -11146,8 +11156,8 @@ fn deblock_luma_mb(
 /// blocks all carry the same motion skips the reference / motion
 /// comparison on its internal edges (it never differs there).
 #[allow(clippy::too_many_arguments)]
-fn deblock_luma_mb_frame(
-    pic: &mut Picture,
+fn deblock_luma_mb_frame<S: PicSample>(
+    pic: &mut Picture<S>,
     y_base: i32,
     w: i32,
     h: i32,
@@ -11330,8 +11340,8 @@ fn deblock_luma_mb_frame(
 /// [`filter_vertical_edge_luma`] / [`filter_horizontal_edge_luma`].
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn filter_luma_edge16(
-    pic: &mut Picture,
+fn filter_luma_edge16<S: PicSample>(
+    pic: &mut Picture<S>,
     vertical: bool,
     edge: i32,
     along: i32,
@@ -11361,16 +11371,16 @@ fn filter_luma_edge16(
     if vertical {
         let x = (edge - 4) as usize;
         for (l, y) in (along as usize..along as usize + EDGE_LINES).enumerate() {
-            let row: &[Sample; 8] = pic.luma[y * stride + x..][..8]
+            let row: &[S; 8] = pic.luma[y * stride + x..][..8]
                 .try_into()
                 .expect("eight samples");
             for k in 0..8 {
-                lanes[k][l] = i32::from(row[k]);
+                lanes[k][l] = row[k].into();
             }
         }
         filter_luma_lines16(&mut lanes, bs, tc0, alpha, beta, max);
         for (l, y) in (along as usize..along as usize + EDGE_LINES).enumerate() {
-            let row: &mut [Sample; 8] = (&mut pic.luma[y * stride + x..][..8])
+            let row: &mut [S; 8] = (&mut pic.luma[y * stride + x..][..8])
                 .try_into()
                 .expect("eight samples");
             for k in 1..7 {
@@ -11381,15 +11391,15 @@ fn filter_luma_edge16(
         let x = along as usize;
         for (k, lane) in lanes.iter_mut().enumerate() {
             let y = (edge - 4) as usize + k;
-            let row: &[Sample; EDGE_LINES] = pic.luma[y * stride + x..][..EDGE_LINES]
+            let row: &[S; EDGE_LINES] = pic.luma[y * stride + x..][..EDGE_LINES]
                 .try_into()
                 .expect("sixteen samples");
-            *lane = row.map(i32::from);
+            *lane = row.map(Into::<i32>::into);
         }
         filter_luma_lines16(&mut lanes, bs, tc0, alpha, beta, max);
         for (k, lane) in lanes.iter().enumerate().take(7).skip(1) {
             let y = (edge - 4) as usize + k;
-            let row: &mut [Sample; EDGE_LINES] = (&mut pic.luma[y * stride + x..][..EDGE_LINES])
+            let row: &mut [S; EDGE_LINES] = (&mut pic.luma[y * stride + x..][..EDGE_LINES])
                 .try_into()
                 .expect("sixteen samples");
             for (d, &v) in row.iter_mut().zip(lane) {
@@ -11414,8 +11424,8 @@ fn uniform_motion(info: &MbInfo) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn deblock_plane_chroma(
-    pic: &mut Picture,
+fn deblock_plane_chroma<S: PicSample>(
+    pic: &mut Picture<S>,
     grid: &MbGrid,
     alpha_off: i32,
     beta_off: i32,
@@ -11495,8 +11505,8 @@ fn deblock_plane_chroma(
 /// picture's chroma dimensions. `luma_bs` is the macroblock's luma bS
 /// record (see [`deblock_luma_mb`]).
 #[allow(clippy::too_many_arguments)]
-fn deblock_chroma_mb(
-    pic: &mut Picture,
+fn deblock_chroma_mb<S: PicSample>(
+    pic: &mut Picture<S>,
     y_base: i32,
     cw: i32,
     ch: i32,
@@ -11572,8 +11582,8 @@ fn deblock_chroma_mb(
 /// reach past the rows `pic` holds; [`deblock_chroma_mb_by_segment`] then
 /// filters it.
 #[allow(clippy::too_many_arguments)]
-fn deblock_chroma_mb_frame_420(
-    pic: &mut Picture,
+fn deblock_chroma_mb_frame_420<S: PicSample>(
+    pic: &mut Picture<S>,
     y_base: i32,
     cw: i32,
     ch: i32,
@@ -11649,12 +11659,12 @@ fn deblock_chroma_mb_frame_420(
     let qp_bd_offset_c = qp_bd_offset(bit_depth.saturating_sub(8));
     let max = (1i32 << bit_depth) - 1;
     let stride = buf_w as usize;
-    let buf: &mut [Sample] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+    let buf: &mut [S] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
     for (vertical, pair) in [(true, &edges[..2]), (false, &edges[2..])] {
         if pair.iter().all(Option::is_none) {
             continue;
         }
-        // Sample k (p1, p0, q0, q1) of line l across `edge`, as an index
+        // S k (p1, p0, q0, q1) of line l across `edge`, as an index
         // into `buf`.
         let at = |edge: i32, k: usize, l: usize| -> usize {
             if vertical {
@@ -11678,7 +11688,7 @@ fn deblock_chroma_mb_frame_420(
             (alpha[h], beta[h]) = (thresholds[0].alpha, thresholds[0].beta);
             for (k, lane) in lanes.iter_mut().enumerate() {
                 for l in 0..CHROMA_EDGE_LINES {
-                    lane[CHROMA_EDGE_LINES * h + l] = i32::from(buf[at(edge, k, l)]);
+                    lane[CHROMA_EDGE_LINES * h + l] = buf[at(edge, k, l)].into();
                 }
             }
         }
@@ -11700,8 +11710,8 @@ fn deblock_chroma_mb_frame_420(
 /// [`deblock_chroma_mb`] two lines (4:2:0) or four (4:2:2) at a time, each
 /// segment's bS taken from the luma record or derived, for every case.
 #[allow(clippy::too_many_arguments)]
-fn deblock_chroma_mb_by_segment(
-    pic: &mut Picture,
+fn deblock_chroma_mb_by_segment<S: PicSample>(
+    pic: &mut Picture<S>,
     y_base: i32,
     cw: i32,
     ch: i32,
@@ -12068,8 +12078,8 @@ fn chroma_qp_avg(p_qp_y: i32, q_qp_y: i32, offset: i32, qp_bd_offset_c: i32) -> 
 /// `chroma_qp_index_offset`) for a chroma edge — and to the `QPC` that
 /// corresponds to `QPY == 0` for an I_PCM macroblock.
 #[allow(clippy::too_many_arguments)]
-fn deblock_plane_chroma_444(
-    pic: &mut Picture,
+fn deblock_plane_chroma_444<S: PicSample>(
+    pic: &mut Picture<S>,
     grid: &MbGrid,
     alpha_off: i32,
     beta_off: i32,
@@ -12336,8 +12346,8 @@ fn derive_chroma_444_bs(
 /// `chromaStyleFilteringFlag == 0` (the four-sample filter) is used,
 /// matching eq. (8-450) for ChromaArrayType == 3.
 #[allow(clippy::too_many_arguments)]
-fn filter_vertical_edge_plane_luma_style(
-    pic: &mut Picture,
+fn filter_vertical_edge_plane_luma_style<S: PicSample>(
+    pic: &mut Picture<S>,
     plane: u8,
     edge_x: i32,
     y0: i32,
@@ -12398,8 +12408,8 @@ fn filter_vertical_edge_plane_luma_style(
 /// §8.7.2 — luma-style filtering of a horizontal edge of one 4:4:4
 /// chroma plane. See [`filter_vertical_edge_plane_luma_style`].
 #[allow(clippy::too_many_arguments)]
-fn filter_horizontal_edge_plane_luma_style(
-    pic: &mut Picture,
+fn filter_horizontal_edge_plane_luma_style<S: PicSample>(
+    pic: &mut Picture<S>,
     plane: u8,
     x0: i32,
     edge_y: i32,
@@ -12459,7 +12469,7 @@ fn filter_horizontal_edge_plane_luma_style(
 
 /// Clamped read of chroma plane `plane` (0 = Cb, 1 = Cr).
 #[inline]
-fn plane_at(pic: &Picture, plane: u8, x: i32, y: i32) -> i32 {
+fn plane_at<S: PicSample>(pic: &Picture<S>, plane: u8, x: i32, y: i32) -> i32 {
     if plane == 0 {
         pic.cb_at(x, y)
     } else {
@@ -12469,7 +12479,7 @@ fn plane_at(pic: &Picture, plane: u8, x: i32, y: i32) -> i32 {
 
 /// Bounds-checked write to chroma plane `plane` (0 = Cb, 1 = Cr).
 #[inline]
-fn plane_set(pic: &mut Picture, plane: u8, x: i32, y: i32, v: i32) {
+fn plane_set<S: PicSample>(pic: &mut Picture<S>, plane: u8, x: i32, y: i32, v: i32) {
     if plane == 0 {
         pic.set_cb(x, y, v);
     } else {
@@ -12481,8 +12491,8 @@ fn plane_set(pic: &mut Picture, plane: u8, x: i32, y: i32, v: i32) {
 /// `plane` starting at `p3_at` (1 across a vertical edge, the row
 /// stride across a horizontal one), with [`filter_line`].
 #[inline(always)]
-fn filter_samples_strided(
-    plane: &mut [Sample],
+fn filter_samples_strided<S: PicSample>(
+    plane: &mut [S],
     p3_at: usize,
     step: usize,
     t: &EdgeThresholds,
@@ -12490,7 +12500,7 @@ fn filter_samples_strided(
 ) {
     let mut s = [0i32; 8];
     for (k, v) in s.iter_mut().enumerate() {
-        *v = i32::from(plane[p3_at + k * step]);
+        *v = plane[p3_at + k * step].into();
     }
     let before = s;
     filter_line(&mut s, t, chroma_style);
@@ -12504,8 +12514,8 @@ fn filter_samples_strided(
 /// [`filter_samples_strided`] for eight contiguous samples (a line across
 /// a vertical edge).
 #[inline(always)]
-fn filter_samples(row: &mut [Sample; 8], t: &EdgeThresholds, chroma_style: bool) {
-    let mut s = row.map(i32::from);
+fn filter_samples<S: PicSample>(row: &mut [S; 8], t: &EdgeThresholds, chroma_style: bool) {
+    let mut s = row.map(Into::<i32>::into);
     let before = s;
     filter_line(&mut s, t, chroma_style);
     if s != before {
@@ -12517,8 +12527,8 @@ fn filter_samples(row: &mut [Sample; 8], t: &EdgeThresholds, chroma_style: bool)
 
 // Kept out of line; see `filter_horizontal_edge_luma`.
 #[inline(never)]
-fn filter_vertical_edge_luma(
-    pic: &mut Picture,
+fn filter_vertical_edge_luma<S: PicSample>(
+    pic: &mut Picture<S>,
     edge_x: i32,
     y0: i32,
     bs: u8,
@@ -12564,7 +12574,7 @@ fn filter_vertical_edge_luma(
         let base_x = (edge_x - 4) as usize;
         for dy in 0..4 {
             let y = (y0 + dy) as usize;
-            let row: &mut [Sample; 8] = (&mut pic.luma[y * stride + base_x..][..8])
+            let row: &mut [S; 8] = (&mut pic.luma[y * stride + base_x..][..8])
                 .try_into()
                 .expect("eight samples");
             filter_samples(row, &t, false);
@@ -12619,8 +12629,8 @@ fn filter_vertical_edge_luma(
 // `deblock_luma_mb_frame`, its strength-reduced row pointers were spilled
 // and stepped on every segment, filtered or not.
 #[inline(never)]
-fn filter_horizontal_edge_luma(
-    pic: &mut Picture,
+fn filter_horizontal_edge_luma<S: PicSample>(
+    pic: &mut Picture<S>,
     x0: i32,
     edge_y: i32,
     bs: u8,
@@ -12702,8 +12712,8 @@ fn filter_horizontal_edge_luma(
 #[allow(clippy::too_many_arguments)]
 // Kept out of line; see `filter_horizontal_edge_luma`.
 #[inline(never)]
-fn filter_chroma_vertical_rows(
-    pic: &mut Picture,
+fn filter_chroma_vertical_rows<S: PicSample>(
+    pic: &mut Picture<S>,
     plane: u8,
     edge_x: i32,
     y0: i32,
@@ -12728,10 +12738,10 @@ fn filter_chroma_vertical_rows(
         let t = EdgeThresholds::new(bs, qp_avg, alpha_off, beta_off, bit_depth);
         let stride = cw as usize;
         let base_x = (edge_x - 4) as usize;
-        let buf: &mut [Sample] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+        let buf: &mut [S] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
         for dy in 0..rows {
             let y = (y0 + dy) as usize;
-            let row: &mut [Sample; 8] = (&mut buf[y * stride + base_x..][..8])
+            let row: &mut [S; 8] = (&mut buf[y * stride + base_x..][..8])
                 .try_into()
                 .expect("eight samples");
             filter_samples(row, &t, true);
@@ -12798,8 +12808,8 @@ fn filter_chroma_vertical_rows(
 #[allow(clippy::too_many_arguments)]
 // Kept out of line; see `filter_horizontal_edge_luma`.
 #[inline(never)]
-fn filter_chroma_horizontal_cols(
-    pic: &mut Picture,
+fn filter_chroma_horizontal_cols<S: PicSample>(
+    pic: &mut Picture<S>,
     plane: u8,
     x0: i32,
     edge_y: i32,
@@ -12823,7 +12833,7 @@ fn filter_chroma_horizontal_cols(
     if bs != 0 && x0 >= 0 && x0 + cols <= cw && edge_y >= 4 && edge_y + 4 <= ch {
         let t = EdgeThresholds::new(bs, qp_avg, alpha_off, beta_off, bit_depth);
         let stride = cw as usize;
-        let buf: &mut [Sample] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
+        let buf: &mut [S] = if plane == 0 { &mut pic.cb } else { &mut pic.cr };
         for dx in 0..cols {
             let p3_at = ((edge_y - 4) as usize) * stride + (x0 + dx) as usize;
             filter_samples_strided(buf, p3_at, stride, &t, true);
@@ -12982,7 +12992,7 @@ pub(crate) fn ft_eligible_slice(slice_header: &SliceHeader, sps: &Sps, pps: &Pps
 /// §8.4.2 — the checks the sample stage of an inter macroblock applies
 /// to its reference pictures, run up front so a macroblock the
 /// single-threaded decoder would reject is rejected at the same point.
-fn ft_validate_inter_refs<R: RefPicProvider>(
+fn ft_validate_inter_refs<S: PicSample, R: RefPicProvider<S>>(
     parts: &[(InterPartition, Mv, Mv)],
     ref_pics: &R,
     chroma_array_type: u32,
@@ -13044,13 +13054,13 @@ fn ft_validate_inter_refs<R: RefPicProvider>(
 /// happens here, at the same macroblock. Returns the sample-stage plan
 /// up to the first failing macroblock, and that failure.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn ft_motion_pass<R: RefPicProvider>(
+pub(crate) fn ft_motion_pass<S: PicSample, R: RefPicProvider<S>>(
     slice_data: &SliceData,
     slice_header: &SliceHeader,
     sps: &Sps,
     pps: &Pps,
     ref_pics: &R,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     grid: &mut MbGrid,
 ) -> (FtSlicePlan, Result<(), ReconstructError>) {
     let chroma_array_type = sps.chroma_array_type();
@@ -13148,15 +13158,15 @@ pub(crate) fn ft_motion_pass<R: RefPicProvider>(
 /// macroblock of [`ft_motion_pass`]'s plan, written into `pic`.
 /// `scratch` is a one-macroblock picture.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn ft_inter_mb<R: RefPicProvider>(
+pub(crate) fn ft_inter_mb<S: PicSample, R: RefPicProvider<S>>(
     slice_data: &SliceData,
     job: &InterMbJob,
     slice_header: &SliceHeader,
     sps: &Sps,
     pps: &Pps,
     ref_pics: &R,
-    scratch: &mut Picture,
-    pic: &mut Picture,
+    scratch: &mut Picture<S>,
+    pic: &mut Picture<S>,
 ) -> Result<(), ReconstructError> {
     ft_fits(sps, pic, job.mb_x, job.mb_y)?;
     let chroma_array_type = sps.chroma_array_type();
@@ -13199,7 +13209,12 @@ pub(crate) fn ft_inter_mb<R: RefPicProvider>(
 /// Frame threading — whether macroblock (`mb_x`, `mb_y`) of a slice
 /// decoded with `sps` fits `pic`: the same chroma format, and inside the
 /// picture's planes (see [`ReconstructError::SliceDoesNotFitPicture`]).
-fn ft_fits(sps: &Sps, pic: &Picture, mb_x: u32, mb_y: u32) -> Result<(), ReconstructError> {
+fn ft_fits<S: PicSample>(
+    sps: &Sps,
+    pic: &Picture<S>,
+    mb_x: u32,
+    mb_y: u32,
+) -> Result<(), ReconstructError> {
     let inside = (u64::from(mb_x) + 1) * 16 <= u64::from(pic.width_in_samples)
         && (u64::from(mb_y) + 1) * 16 <= u64::from(pic.height_in_samples);
     if inside && sps.chroma_array_type() == pic.chroma_array_type {
@@ -13212,13 +13227,13 @@ fn ft_fits(sps: &Sps, pic: &Picture, mb_x: u32, mb_y: u32) -> Result<(), Reconst
 /// Frame threading — the §8.3 / §8.5 reconstruction of one intra
 /// macroblock of [`ft_motion_pass`]'s plan.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn ft_intra_mb(
+pub(crate) fn ft_intra_mb<S: PicSample>(
     slice_data: &SliceData,
     (idx, addr, qp_y): (usize, u32, i32),
     slice_header: &SliceHeader,
     sps: &Sps,
     pps: &Pps,
-    pic: &mut Picture,
+    pic: &mut Picture<S>,
     grid: &mut MbGrid,
 ) -> Result<(), ReconstructError> {
     let width_in_mbs = grid.width_in_mbs.max(1);
@@ -13249,8 +13264,8 @@ pub(crate) fn ft_intra_mb(
 /// of [`deblock_picture_full`] filters them. Rows must be filtered in
 /// order, each once the row below it is reconstructed.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn ft_deblock_row(
-    pic: &mut Picture,
+pub(crate) fn ft_deblock_row<S: PicSample>(
+    pic: &mut Picture<S>,
     grid: &MbGrid,
     mb_y: u32,
     alpha_off: i32,
@@ -13325,6 +13340,7 @@ mod tests {
     use crate::macroblock_layer::{
         Intra16x16, Macroblock, MbPred, MbType, PcmSamples, SubMbPred, SubMbType,
     };
+    use crate::picture::Sample;
 
     /// The weighted-pair row kernel (scalar, and the SSE2 form on
     /// x86-64) equals

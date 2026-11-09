@@ -14,7 +14,7 @@
 //!
 //! Clean-room: derived only from ITU-T Rec. H.264 (08/2024).
 
-use crate::picture::Picture;
+use crate::picture::{PicSample, Picture, Sample};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -27,8 +27,8 @@ use std::sync::Arc;
 /// Returns `None` when the requested slot is out of bounds or carries
 /// no picture — the caller surfaces this as
 /// [`crate::reconstruct::ReconstructError::MissingRefPic`].
-pub trait RefPicProvider {
-    fn ref_pic(&self, list: u8, idx: u32) -> Option<&Picture>;
+pub trait RefPicProvider<S: PicSample = Sample> {
+    fn ref_pic(&self, list: u8, idx: u32) -> Option<&Picture<S>>;
 
     /// §8.4.1.2.3 — POC of the picture at `(list, idx)`.
     /// Default implementation delegates to `ref_pic`. Callers can
@@ -105,7 +105,7 @@ pub trait RefPicProvider {
     /// FRAME slice's list is a complementary field PAIR, the stored
     /// coded-field picture of the given parity (`false` = top). `None`
     /// for genuine frame references.
-    fn ref_pair_field(&self, _list: u8, _idx: u32, _bottom: bool) -> Option<&Picture> {
+    fn ref_pair_field(&self, _list: u8, _idx: u32, _bottom: bool) -> Option<&Picture<S>> {
         None
     }
     /// Frame threading — the sample planes of the picture at
@@ -113,7 +113,7 @@ pub trait RefPicProvider {
     /// thread (its [`Self::ref_pic`] then carries no samples). `None`
     /// for an ordinary, fully reconstructed reference.
     #[doc(hidden)] // internal — frame-threading plumbing
-    fn ref_planes(&self, _list: u8, _idx: u32) -> Option<&crate::frame_thread::SharedPlanes> {
+    fn ref_planes(&self, _list: u8, _idx: u32) -> Option<&crate::frame_thread::SharedPlanes<S>> {
         None
     }
 }
@@ -233,8 +233,8 @@ impl RefPicProvider for RefPicStore {
 /// `ref_pic` query returns `None`.
 pub struct NoRefs;
 
-impl RefPicProvider for NoRefs {
-    fn ref_pic(&self, _list: u8, _idx: u32) -> Option<&Picture> {
+impl<S: PicSample> RefPicProvider<S> for NoRefs {
+    fn ref_pic(&self, _list: u8, _idx: u32) -> Option<&Picture<S>> {
         None
     }
 }
@@ -318,8 +318,9 @@ mod tests {
     #[test]
     fn no_refs_always_none() {
         let nr = NoRefs;
-        assert!(nr.ref_pic(0, 0).is_none());
-        assert!(nr.ref_pic(1, 0).is_none());
-        assert!(nr.ref_pic(5, 99).is_none());
+        assert!(RefPicProvider::<Sample>::ref_pic(&nr, 0, 0).is_none());
+        assert!(RefPicProvider::<u8>::ref_pic(&nr, 0, 0).is_none());
+        assert!(RefPicProvider::<Sample>::ref_pic(&nr, 1, 0).is_none());
+        assert!(RefPicProvider::<Sample>::ref_pic(&nr, 5, 99).is_none());
     }
 }
