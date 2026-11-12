@@ -3570,18 +3570,21 @@ struct BlockCtx {
     /// eq. (9-24): the most numDecodAbsLevelGt1 adds to ctxIdxInc 5,
     /// 4 - (ctxBlockCat == 3 ? 1 : 0).
     gt1_cap: u32,
+    /// Whether both ctxIdxInc tables are levelListIdx itself (eq. 9-21):
+    /// every category but chroma DC and the 8x8 blocks.
+    by_index: bool,
 }
 
 impl BlockCtx {
     fn new(block_type: BlockType, field: bool, chroma_422: bool) -> Self {
         let sig_cat = block_type.sig_block_cat_offset() as usize;
-        let (sig_inc, last_inc, gt1_cap) = match block_type.ctx_block_cat() {
+        let (sig_inc, last_inc, gt1_cap, by_index) = match block_type.ctx_block_cat() {
             3 => {
                 let t = &INC_CHROMA_DC[usize::from(chroma_422)];
-                (t, t, 3)
+                (t, t, 3, false)
             }
-            5 | 9 | 13 => (&INC_8X8[usize::from(field)], &INC_8X8[2], 4),
-            _ => (&INC_BY_INDEX, &INC_BY_INDEX, 4),
+            5 | 9 | 13 => (&INC_8X8[usize::from(field)], &INC_8X8[2], 4, false),
+            _ => (&INC_BY_INDEX, &INC_BY_INDEX, 4, true),
         };
         Self {
             cbf: (block_type.cbf_ctx_offset() + block_type.cbf_block_cat_offset()) as usize,
@@ -3591,6 +3594,7 @@ impl BlockCtx {
             sig_inc,
             last_inc,
             gt1_cap,
+            by_index,
         }
     }
 }
@@ -3640,21 +3644,22 @@ pub(crate) fn decode_residual_block(
 ) -> CabacResult<bool> {
     let bc = BlockCtx::new(block_type, field, chroma_422);
     let mut engine = dec.clone();
-    let coded = residual_block_bins(
-        &mut engine,
-        &mut ctxs.contexts,
-        &bc,
-        cbf_inc,
-        num_coeff.clamp(1, 64),
-        out,
-    );
+    let n = num_coeff.clamp(1, 64);
+    // A copy of the loop for the categories whose context increments are
+    // the scan position itself, without the two table lookups per bin.
+    let coded = if bc.by_index {
+        residual_block_bins::<true>(&mut engine, &mut ctxs.contexts, &bc, cbf_inc, n, out)
+    } else {
+        residual_block_bins::<false>(&mut engine, &mut ctxs.contexts, &bc, cbf_inc, n, out)
+    };
     *dec = engine;
     coded
 }
 
-/// The bins of [`decode_residual_block`], on the engine copy `e`.
+/// The bins of [`decode_residual_block`], on the engine copy `e`. With
+/// `BY_INDEX`, ctxIdxInc of both flags is levelListIdx (`bc.by_index`).
 #[inline(always)]
-fn residual_block_bins(
+fn residual_block_bins<const BY_INDEX: bool>(
     e: &mut CabacDecoder<'_>,
     ctxs: &mut [CtxState; NUM_CTX_IDX],
     bc: &BlockCtx,
@@ -3682,11 +3687,21 @@ fn residual_block_bins(
             n += 1;
             break;
         }
-        let sig_ctx = bc.sig + usize::from(bc.sig_inc[i & 63]);
+        let sig_ctx = bc.sig
+            + if BY_INDEX {
+                i
+            } else {
+                usize::from(bc.sig_inc[i & 63])
+            };
         if e.decide(ctx_at(ctxs, sig_ctx))? != 0 {
             sig_pos[n & 63] = i as u8;
             n += 1;
-            let last_ctx = bc.last + usize::from(bc.last_inc[i & 63]);
+            let last_ctx = bc.last
+                + if BY_INDEX {
+                    i
+                } else {
+                    usize::from(bc.last_inc[i & 63])
+                };
             if e.decide(ctx_at(ctxs, last_ctx))? != 0 {
                 break;
             }
