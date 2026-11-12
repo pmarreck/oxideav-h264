@@ -5674,6 +5674,34 @@ impl CombineOp {
             None => CombineOp::Zero,
         }
     }
+
+    /// The same combination in its plainest form: weighted prediction
+    /// whose weights are the unit weight `2^logWD` with zero offsets is
+    /// the default one. Single list (eqs. 8-274 / 8-275):
+    /// `(p * 2^logWD + 2^(logWD - 1)) >> logWD` is `p`, and Clip1 keeps a
+    /// sample; bipred (eq. 8-276): `(2^logWD * (p0 + p1 + 1)) >> (logWD + 1)`
+    /// is eq. 8-273's `(p0 + p1 + 1) >> 1`. Encoders send such weights for
+    /// every reference without its own (§7.4.3.2 infers them), and the
+    /// implicit weights of a picture midway between its references are
+    /// them too.
+    fn simplified(self) -> Self {
+        let CombineOp::Weighted {
+            mode,
+            w0,
+            w1,
+            log2_wd,
+        } = self
+        else {
+            return self;
+        };
+        let unit = |e: WeightedEntry| e.offset == 0 && log2_wd < 31 && e.weight == 1 << log2_wd;
+        match mode {
+            BiPredMode::L0Only if unit(w0) => CombineOp::Copy0,
+            BiPredMode::L1Only if unit(w1) => CombineOp::Copy1,
+            BiPredMode::Bipred if unit(w0) && unit(w1) => CombineOp::Avg,
+            _ => self,
+        }
+    }
 }
 
 /// §8.4.2.3.2 — one row of weighted prediction in the shape every
@@ -5915,6 +5943,26 @@ fn combine_partition(
     }
 }
 
+/// §8.4.2.3.1 eq. 8-273 in place: `dst` (rows `dst_stride` apart from
+/// `dst_off`) holds predPartL0 for a `w`x`h` partition and becomes
+/// `(predPartL0 + predPartL1 + 1) >> 1`, with predPartL1 tightly packed
+/// in `l1`.
+fn average_into(
+    dst: &mut [i32],
+    dst_off: usize,
+    dst_stride: usize,
+    l1: &[i32],
+    w: usize,
+    h: usize,
+) {
+    for y in 0..h {
+        let o = dst_off + y * dst_stride;
+        for (d, &p1) in dst[o..o + w].iter_mut().zip(&l1[y * w..y * w + w]) {
+            *d = (*d + p1 + 1) >> 1;
+        }
+    }
+}
+
 /// Per-partition motion-compensation scratch (predPartL0 / predPartL1
 /// for luma and both chroma planes), kept per thread so a partition
 /// does not zero six buffers on every call.
@@ -6067,79 +6115,6 @@ fn predict_partition_with<S: PicSample, R: RefPicProvider<S>>(
         PartMode::L1Only | PartMode::BiPred | PartMode::Direct
     ) && part.ref_idx_l1 >= 0;
 
-    if has_l0 {
-        let (rp, fld) = resolve_ref(0, part.ref_idx_l0)?;
-        if inter_debug {
-            eprintln!(
-                "    L0 ref idx={} pic {}x{} poc={} fld={:?} ysum0={}",
-                part.ref_idx_l0,
-                rp.width_in_samples,
-                rp.height_in_samples,
-                rp.pic_order_cnt,
-                fld,
-                rp.luma
-                    .iter()
-                    .take(64)
-                    .map(|&v| Into::<i32>::into(v) as u32)
-                    .sum::<u32>()
-            );
-        }
-        mc_luma_partition(
-            rp,
-            part_abs_x,
-            part_abs_y,
-            mv_l0,
-            w,
-            h,
-            bit_depth_y,
-            l0_buf,
-            fld,
-            ref_planes_for(0, part.ref_idx_l0),
-        )?;
-    }
-    if has_l1 {
-        let (rp, fld) = resolve_ref(1, part.ref_idx_l1)?;
-        if inter_debug {
-            eprintln!(
-                "    L1 ref idx={} pic {}x{} poc={} fld={:?} ysum0={}",
-                part.ref_idx_l1,
-                rp.width_in_samples,
-                rp.height_in_samples,
-                rp.pic_order_cnt,
-                fld,
-                rp.luma
-                    .iter()
-                    .take(64)
-                    .map(|&v| Into::<i32>::into(v) as u32)
-                    .sum::<u32>()
-            );
-        }
-        mc_luma_partition(
-            rp,
-            part_abs_x,
-            part_abs_y,
-            mv_l1,
-            w,
-            h,
-            bit_depth_y,
-            l1_buf,
-            fld,
-            ref_planes_for(1, part.ref_idx_l1),
-        )?;
-        if inter_debug {
-            eprintln!(
-                "    L1 buf abs=({part_abs_x},{part_abs_y}) mv={:?} row sums: {:?}",
-                (mv_l1.x, mv_l1.y),
-                (0..h as usize)
-                    .map(|j| l1_buf[j * w as usize..(j + 1) * w as usize]
-                        .iter()
-                        .sum::<i32>()
-                        / w as i32)
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
-
     // §8.4.2.3 — combine L0 / L1 prediction buffers into the final
     // prediction samples. The mode is selected per §8.4.2.3:
     //
@@ -6269,18 +6244,114 @@ fn predict_partition_with<S: PicSample, R: RefPicProvider<S>>(
         }
     } else {
         CombineOp::default_for(bi_mode)
-    };
-    combine_partition(
-        pred_luma,
-        part.y as usize * 16 + part.x as usize,
-        16,
-        l0_buf,
-        l1_buf,
-        w as usize,
-        h as usize,
-        luma_op,
-        bit_depth_y,
-    );
+    }
+    .simplified();
+    // Default single-list prediction is written straight into the
+    // macroblock's prediction samples, and the default bipred average
+    // (eq. 8-273) adds list 1 to list 0 there: neither copies the
+    // partition again.
+    let luma_off = part.y as usize * 16 + part.x as usize;
+    let l0_in_place = matches!(luma_op, CombineOp::Copy0 | CombineOp::Avg);
+    let l1_in_place = matches!(luma_op, CombineOp::Copy1);
+    if has_l0 {
+        let (l0_dst, l0_stride): (&mut [i32], usize) = if l0_in_place {
+            (&mut pred_luma[luma_off..], 16)
+        } else {
+            (&mut l0_buf[..], w as usize)
+        };
+        let (rp, fld) = resolve_ref(0, part.ref_idx_l0)?;
+        if inter_debug {
+            eprintln!(
+                "    L0 ref idx={} pic {}x{} poc={} fld={:?} ysum0={}",
+                part.ref_idx_l0,
+                rp.width_in_samples,
+                rp.height_in_samples,
+                rp.pic_order_cnt,
+                fld,
+                rp.luma
+                    .iter()
+                    .take(64)
+                    .map(|&v| Into::<i32>::into(v) as u32)
+                    .sum::<u32>()
+            );
+        }
+        mc_luma_partition(
+            rp,
+            part_abs_x,
+            part_abs_y,
+            mv_l0,
+            w,
+            h,
+            bit_depth_y,
+            l0_dst,
+            l0_stride,
+            fld,
+            ref_planes_for(0, part.ref_idx_l0),
+        )?;
+    }
+    if has_l1 {
+        let (l1_dst, l1_stride): (&mut [i32], usize) = if l1_in_place {
+            (&mut pred_luma[luma_off..], 16)
+        } else {
+            (&mut l1_buf[..], w as usize)
+        };
+        let (rp, fld) = resolve_ref(1, part.ref_idx_l1)?;
+        if inter_debug {
+            eprintln!(
+                "    L1 ref idx={} pic {}x{} poc={} fld={:?} ysum0={}",
+                part.ref_idx_l1,
+                rp.width_in_samples,
+                rp.height_in_samples,
+                rp.pic_order_cnt,
+                fld,
+                rp.luma
+                    .iter()
+                    .take(64)
+                    .map(|&v| Into::<i32>::into(v) as u32)
+                    .sum::<u32>()
+            );
+        }
+        mc_luma_partition(
+            rp,
+            part_abs_x,
+            part_abs_y,
+            mv_l1,
+            w,
+            h,
+            bit_depth_y,
+            l1_dst,
+            l1_stride,
+            fld,
+            ref_planes_for(1, part.ref_idx_l1),
+        )?;
+        if inter_debug {
+            eprintln!(
+                "    L1 buf abs=({part_abs_x},{part_abs_y}) mv={:?} row sums: {:?}",
+                (mv_l1.x, mv_l1.y),
+                (0..h as usize)
+                    .map(|j| l1_dst[j * l1_stride..j * l1_stride + w as usize]
+                        .iter()
+                        .sum::<i32>()
+                        / w as i32)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+    match luma_op {
+        CombineOp::Copy0 | CombineOp::Copy1 => {}
+        CombineOp::Avg => average_into(pred_luma, luma_off, 16, l1_buf, w as usize, h as usize),
+        op => combine_partition(
+            pred_luma,
+            luma_off,
+            16,
+            l0_buf,
+            l1_buf,
+            w as usize,
+            h as usize,
+            op,
+            bit_depth_y,
+        ),
+    }
 
     // Chroma MC. For 4:2:0, chroma MV = mv_luma / 2 in 1/4-pel units
     // at luma resolution -> 1/8-pel chroma units. §8.4.1.4 / §8.4.2.2.
@@ -6350,40 +6421,6 @@ fn predict_partition_with<S: PicSample, R: RefPicProvider<S>>(
             }
             mv
         };
-        if has_l0 {
-            let (rp, fld) = resolve_ref(0, part.ref_idx_l0)?;
-            mc_chroma_partition(
-                rp,
-                c_mb_px + c_part_x,
-                c_mb_py + c_part_y,
-                chroma_mv(mv_l0, 0, part.ref_idx_l0, fld),
-                c_w,
-                c_h,
-                chroma_array_type,
-                bit_depth_c,
-                l0_cb,
-                l0_cr,
-                fld,
-                ref_planes_for(0, part.ref_idx_l0),
-            )?;
-        }
-        if has_l1 {
-            let (rp, fld) = resolve_ref(1, part.ref_idx_l1)?;
-            mc_chroma_partition(
-                rp,
-                c_mb_px + c_part_x,
-                c_mb_py + c_part_y,
-                chroma_mv(mv_l1, 1, part.ref_idx_l1, fld),
-                c_w,
-                c_h,
-                chroma_array_type,
-                bit_depth_c,
-                l1_cb,
-                l1_cr,
-                fld,
-                ref_planes_for(1, part.ref_idx_l1),
-            )?;
-        }
         // Combine into pred_cb / pred_cr at MB-local position.
         // §8.4.2.3 — the same default/explicit/implicit dispatch as
         // luma applies to chroma. Explicit mode uses separate weights
@@ -6443,29 +6480,95 @@ fn predict_partition_with<S: PicSample, R: RefPicProvider<S>>(
             // slice without a pred_weight_table.
             (default_op, default_op)
         };
+        let (cb_op, cr_op) = (cb_op.simplified(), cr_op.simplified());
         let c_off = c_part_y as usize * mbw_c_use as usize + c_part_x as usize;
-        combine_partition(
-            pred_cb,
-            c_off,
-            mbw_c_use as usize,
-            l0_cb,
-            l1_cb,
-            c_w as usize,
-            c_h as usize,
-            cb_op,
-            bit_depth_c,
-        );
-        combine_partition(
-            pred_cr,
-            c_off,
-            mbw_c_use as usize,
-            l0_cr,
-            l1_cr,
-            c_w as usize,
-            c_h as usize,
-            cr_op,
-            bit_depth_c,
-        );
+        let c_stride = mbw_c_use as usize;
+        // As for luma: the default prediction is made in place.
+        let (l0_in_place, l1_in_place) = match (cb_op, cr_op) {
+            (CombineOp::Copy0, CombineOp::Copy0) | (CombineOp::Avg, CombineOp::Avg) => {
+                (true, false)
+            }
+            (CombineOp::Copy1, CombineOp::Copy1) => (false, true),
+            _ => (false, false),
+        };
+        if has_l0 {
+            let (rp, fld) = resolve_ref(0, part.ref_idx_l0)?;
+            let (dst_cb, dst_cr, stride): (&mut [i32], &mut [i32], usize) = if l0_in_place {
+                (&mut pred_cb[c_off..], &mut pred_cr[c_off..], c_stride)
+            } else {
+                (&mut l0_cb[..], &mut l0_cr[..], c_w as usize)
+            };
+            mc_chroma_partition(
+                rp,
+                c_mb_px + c_part_x,
+                c_mb_py + c_part_y,
+                chroma_mv(mv_l0, 0, part.ref_idx_l0, fld),
+                c_w,
+                c_h,
+                chroma_array_type,
+                bit_depth_c,
+                dst_cb,
+                dst_cr,
+                stride,
+                fld,
+                ref_planes_for(0, part.ref_idx_l0),
+            )?;
+        }
+        if has_l1 {
+            let (rp, fld) = resolve_ref(1, part.ref_idx_l1)?;
+            let (dst_cb, dst_cr, stride): (&mut [i32], &mut [i32], usize) = if l1_in_place {
+                (&mut pred_cb[c_off..], &mut pred_cr[c_off..], c_stride)
+            } else {
+                (&mut l1_cb[..], &mut l1_cr[..], c_w as usize)
+            };
+            mc_chroma_partition(
+                rp,
+                c_mb_px + c_part_x,
+                c_mb_py + c_part_y,
+                chroma_mv(mv_l1, 1, part.ref_idx_l1, fld),
+                c_w,
+                c_h,
+                chroma_array_type,
+                bit_depth_c,
+                dst_cb,
+                dst_cr,
+                stride,
+                fld,
+                ref_planes_for(1, part.ref_idx_l1),
+            )?;
+        }
+        match (cb_op, cr_op) {
+            (CombineOp::Copy0, CombineOp::Copy0) | (CombineOp::Copy1, CombineOp::Copy1) => {}
+            (CombineOp::Avg, CombineOp::Avg) => {
+                let (cw, chh) = (c_w as usize, c_h as usize);
+                average_into(pred_cb, c_off, c_stride, l1_cb, cw, chh);
+                average_into(pred_cr, c_off, c_stride, l1_cr, cw, chh);
+            }
+            _ => {
+                combine_partition(
+                    pred_cb,
+                    c_off,
+                    c_stride,
+                    l0_cb,
+                    l1_cb,
+                    c_w as usize,
+                    c_h as usize,
+                    cb_op,
+                    bit_depth_c,
+                );
+                combine_partition(
+                    pred_cr,
+                    c_off,
+                    c_stride,
+                    l0_cr,
+                    l1_cr,
+                    c_w as usize,
+                    c_h as usize,
+                    cr_op,
+                    bit_depth_c,
+                );
+            }
+        }
     } else if chroma_array_type == 3 {
         // §8.4.2.2 (ChromaArrayType == 3) — 4:4:4 chroma is
         // motion-compensated identically to luma: full-resolution
@@ -6711,8 +6814,9 @@ fn predict_partition_with<S: PicSample, R: RefPicProvider<S>>(
     Ok(())
 }
 
-/// §8.4.2.2 — motion-compensate one partition's luma plane. `dst`
-/// is the partition-sized output buffer (w * h samples, row-major).
+/// §8.4.2.2 — motion-compensate one partition's luma plane into the
+/// `w` x `h` samples of `dst` whose rows start `dst_stride` apart (a
+/// partition-sized buffer, or the partition's place in the macroblock).
 ///
 /// `field` selects §8.4.2.1's field-of-a-reference-frame view for
 /// MBAFF field macroblocks: `Some(parity)` reads only the frame rows
@@ -6729,6 +6833,7 @@ fn mc_luma_partition<S: PicSample>(
     h: u32,
     bit_depth: u32,
     dst: &mut [i32],
+    dst_stride: usize,
     field: Option<u8>,
     planes: Option<&crate::frame_thread::SharedPlanes>,
 ) -> Result<(), ReconstructError> {
@@ -6807,13 +6912,14 @@ fn mc_luma_partition<S: PicSample>(
         h as usize,
         (1i32 << bit_depth) - 1,
         dst,
-        w as usize,
+        dst_stride,
     );
     Ok(())
 }
 
 /// §8.4.2.2 — motion-compensate one partition's chroma planes (Cb + Cr).
-/// Writes to two partition-sized scratch buffers. ChromaArrayType is 1
+/// Writes `w` x `h` samples of each into `dst_cb` and `dst_cr`, rows
+/// `dst_stride` apart. ChromaArrayType is 1
 /// (4:2:0) or 2 (4:2:2). §8.4.1.4 — chroma MVs are in 1/8-pel units for
 /// 4:2:0 / 4:2:2.
 #[allow(clippy::too_many_arguments)]
@@ -6828,6 +6934,7 @@ fn mc_chroma_partition<S: PicSample>(
     bit_depth: u32,
     dst_cb: &mut [i32],
     dst_cr: &mut [i32],
+    dst_stride: usize,
     field: Option<u8>,
     planes: Option<&crate::frame_thread::SharedPlanes>,
 ) -> Result<(), ReconstructError> {
@@ -6899,7 +7006,7 @@ fn mc_chroma_partition<S: PicSample>(
             },
         };
         crate::mc::chroma(
-            &src, int_x, int_y, x_frac, y_frac, w as usize, h as usize, dst, w as usize,
+            &src, int_x, int_y, x_frac, y_frac, w as usize, h as usize, dst, dst_stride,
         );
     }
     Ok(())
@@ -14016,6 +14123,132 @@ mod tests {
         }
     }
 
+    /// Weighted prediction with unit weights and zero offsets becomes the
+    /// default combination, sample for sample, at every logWD and bit
+    /// depth; any other weight or offset stays weighted.
+    #[test]
+    fn unit_weights_simplify_to_the_default_combination() {
+        let mut seed = 0x6c07_8965u32;
+        let mut next = |m: i32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed % m as u32) as i32
+        };
+        for bit_depth in [8u32, 10, 14] {
+            let max_v = (1i32 << bit_depth) - 1;
+            let mut l0: Vec<i32> = (0..256).map(|_| next(max_v + 1)).collect();
+            let mut l1: Vec<i32> = (0..256).map(|_| next(max_v + 1)).collect();
+            // The ends of the sample range.
+            (l0[0], l1[0], l0[1], l1[1]) = (0, 0, max_v, max_v);
+            for log2_wd in 0..8u32 {
+                let unit = WeightedEntry {
+                    weight: 1 << log2_wd,
+                    offset: 0,
+                };
+                for (mode, plain) in [
+                    (BiPredMode::L0Only, CombineOp::Copy0),
+                    (BiPredMode::L1Only, CombineOp::Copy1),
+                    (BiPredMode::Bipred, CombineOp::Avg),
+                ] {
+                    let weighted = CombineOp::Weighted {
+                        mode,
+                        w0: unit,
+                        w1: unit,
+                        log2_wd,
+                    };
+                    let simple = weighted.simplified();
+                    assert_eq!(
+                        std::mem::discriminant(&simple),
+                        std::mem::discriminant(&plain),
+                        "{mode:?} logWD {log2_wd}"
+                    );
+                    let (mut a, mut b) = ([0i32; 256], [0i32; 256]);
+                    combine_partition(&mut a, 0, 16, &l0, &l1, 16, 16, weighted, bit_depth);
+                    combine_partition(&mut b, 0, 16, &l0, &l1, 16, 16, simple, bit_depth);
+                    assert_eq!(a, b, "{mode:?} logWD {log2_wd} depth {bit_depth}");
+                    // Off the unit weight or with an offset: still weighted.
+                    for other in [
+                        WeightedEntry {
+                            weight: (1 << log2_wd) + 1,
+                            offset: 0,
+                        },
+                        WeightedEntry {
+                            weight: 1 << log2_wd,
+                            offset: 1,
+                        },
+                    ] {
+                        for (w0, w1) in [(other, unit), (unit, other)] {
+                            let op = CombineOp::Weighted {
+                                mode,
+                                w0,
+                                w1,
+                                log2_wd,
+                            };
+                            let affected = match mode {
+                                BiPredMode::L0Only => w0 != unit,
+                                BiPredMode::L1Only => w1 != unit,
+                                BiPredMode::Bipred => true,
+                            };
+                            if affected {
+                                assert!(
+                                    matches!(op.simplified(), CombineOp::Weighted { .. }),
+                                    "{mode:?} {w0:?} {w1:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The in-place default average (list 0 already in the macroblock's
+    /// prediction) equals eq. 8-273 inside the partition and leaves every
+    /// other sample alone, for each partition shape at every offset.
+    #[test]
+    fn average_into_matches_eq_8_273_in_place() {
+        let mut seed = 0x9e37_79b9u32;
+        let mut next = |m: i32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed % m as u32) as i32
+        };
+        let shapes = [
+            (16, 16),
+            (16, 8),
+            (8, 16),
+            (8, 8),
+            (8, 4),
+            (4, 8),
+            (4, 4),
+            (2, 2),
+        ];
+        for &(w, h) in &shapes {
+            for (x0, y0) in [(0, 0), (16 - w, 0), (0, 16 - h), (16 - w, 16 - h)] {
+                let l0: Vec<i32> = (0..w * h).map(|_| next(1 << 14)).collect();
+                let l1: Vec<i32> = (0..w * h).map(|_| next(1 << 14)).collect();
+                let mut dst = [-7i32; 256];
+                for y in 0..h {
+                    dst[(y0 + y) * 16 + x0..][..w].copy_from_slice(&l0[y * w..y * w + w]);
+                }
+                average_into(&mut dst, y0 * 16 + x0, 16, &l1, w, h);
+                for y in 0..16 {
+                    for x in 0..16 {
+                        let want = if (x0..x0 + w).contains(&x) && (y0..y0 + h).contains(&y) {
+                            let i = (y - y0) * w + (x - x0);
+                            (l0[i] + l1[i] + 1) >> 1
+                        } else {
+                            -7
+                        };
+                        assert_eq!(dst[y * 16 + x], want, "{w}x{h} at ({x0},{y0}): ({x},{y})");
+                    }
+                }
+            }
+        }
+    }
+
     // ----- §6.4.10 MBAFF neighbour-address derivation -------------------
 
     /// In an MBAFF frame, macroblock addresses are pair-interleaved
@@ -16898,7 +17131,10 @@ mod tests {
         let (px, py) = (0i32, 0i32);
 
         let mut luma = vec![0i32; (w * h) as usize];
-        mc_luma_partition(&ref_pic, px, py, mv, w, h, 8, &mut luma, None, None).unwrap();
+        mc_luma_partition(
+            &ref_pic, px, py, mv, w, h, 8, &mut luma, w as usize, None, None,
+        )
+        .unwrap();
 
         let mut cb = vec![0i32; (w * h) as usize];
         let mut cr = vec![0i32; (w * h) as usize];
@@ -17045,7 +17281,19 @@ mod tests {
         let mut cb = vec![0i32; (cw * ch) as usize];
         let mut cr = vec![0i32; (cw * ch) as usize];
         mc_chroma_partition(
-            &ref_pic, c_part_x, c_part_y, mv, cw, ch, 2, 8, &mut cb, &mut cr, None, None,
+            &ref_pic,
+            c_part_x,
+            c_part_y,
+            mv,
+            cw,
+            ch,
+            2,
+            8,
+            &mut cb,
+            &mut cr,
+            cw as usize,
+            None,
+            None,
         )
         .unwrap();
 
@@ -17090,7 +17338,19 @@ mod tests {
         let mut cb = vec![0i32; (cw * ch) as usize];
         let mut cr = vec![0i32; (cw * ch) as usize];
         mc_chroma_partition(
-            &ref_pic, c_part_x, c_part_y, mv, cw, ch, 2, 8, &mut cb, &mut cr, None, None,
+            &ref_pic,
+            c_part_x,
+            c_part_y,
+            mv,
+            cw,
+            ch,
+            2,
+            8,
+            &mut cb,
+            &mut cr,
+            cw as usize,
+            None,
+            None,
         )
         .unwrap();
 
