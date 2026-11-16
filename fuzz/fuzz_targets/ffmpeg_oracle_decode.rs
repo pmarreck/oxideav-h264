@@ -55,6 +55,10 @@
 //!   one) and the reference's answer depends on the CPU: reported as
 //!   `[oracle cpu-dependent]`, not as a divergence. Only a mismatch
 //!   with both reference paths agreeing is a crash.
+//! - A mismatch on a stream whose chroma DC values leave the §8.5.11.2 range
+//!   (`transform::chroma_dc_range_violations` rose during our decode) is reported as
+//!   `[oracle out-of-range]`, not as a divergence: the standard forbids such data and
+//!   specifies no output for it, and the reference keeps those values in 16 bits.
 //!
 //! Skips silently when libavcodec isn't loadable so the harness still
 //! runs against the panic_free coverage even on hosts without ffmpeg
@@ -65,6 +69,7 @@ use oxideav_core::{CodecId, Decoder, Frame, Packet, TimeBase, VideoPlane};
 use oxideav_h264::h264_decoder::H264CodecDecoder;
 use oxideav_h264::nal::{AnnexBSplitter, rbsp_from_nal_payload};
 use oxideav_h264::sps::Sps;
+use oxideav_h264::transform::chroma_dc_range_violations;
 use oxideav_h264_fuzz::libavcodec;
 
 /// Per-channel tolerance (in 8-bit code units) for the cross-decode
@@ -178,7 +183,11 @@ fuzz_target!(|data: &[u8]| {
     // Run libavcodec first so we know what to expect from ours.
     let oracle = libavcodec::decode_h264(data);
 
+    // Chroma DC blocks out of the §8.5.11.2 range that this decode produced (per thread, so the oracle
+    // call above does not count).
+    let range_violations_before = chroma_dc_range_violations();
     let ours = decode_with_ours(data);
+    let out_of_range = chroma_dc_range_violations() != range_violations_before;
 
     use libavcodec::OracleResult;
     match (oracle, ours) {
@@ -244,6 +253,17 @@ fuzz_target!(|data: &[u8]| {
             let Some(mismatch) = oracle_mismatch(&o, &ours_frames, data.len()) else {
                 return;
             };
+            // A stream with a chroma DC value beyond §8.5.11.2 has no specified output (the standard forbids the
+            // data), and the reference keeps those values in 16 bits on every code path while this decoder
+            // computes them exactly: report, do not assert. Pinned by unit tests in
+            // src/transform.rs.
+            if out_of_range {
+                eprintln!(
+                    "[oracle out-of-range] the stream's chroma DC values leave the §8.5.11.2 range, so its output is \
+                     unspecified: {mismatch}"
+                );
+                return;
+            }
             // Second opinion before calling it a divergence: the
             // reference's portable C paths. On conforming streams they
             // decode exactly as its default (SIMD) paths do. Where the

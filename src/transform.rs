@@ -1146,8 +1146,36 @@ pub fn inverse_hadamard_luma_dc_16x16(
 // §8.5.11 — chroma DC Hadamard + scaling.
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// Count of chroma DC blocks, on this thread, whose scaled values left the §8.5.11.2 range.
+    static CHROMA_DC_RANGE_VIOLATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of chroma DC blocks decoded on the calling thread so far whose scaled values dcC (§8.5.11.2)
+/// fell outside -2^(7+BitDepthC) .. 2^(7+BitDepthC)-1. The standard forbids such data, so a stream that
+/// produces any has no specified output; the decoder still computes its exact result (see
+/// [`inverse_hadamard_chroma_dc_420`]). A diagnostic for differential testing, which must not hold another
+/// decoder to the output of such a stream: read it before and after a decode and compare. Frame and slice
+/// worker threads keep their own counts.
+pub fn chroma_dc_range_violations() -> u64 {
+    CHROMA_DC_RANGE_VIOLATIONS.with(std::cell::Cell::get)
+}
+
+/// §8.5.11.2: note a block whose dcC values leave the range the bitstream may produce.
+fn note_chroma_dc_range(dc: &[i32], bit_depth: u32) {
+    let limit = 1i64 << (7 + bit_depth);
+    if dc.iter().any(|&v| !(-limit..limit).contains(&i64::from(v))) {
+        CHROMA_DC_RANGE_VIOLATIONS.with(|c| c.set(c.get() + 1));
+    }
+}
+
 /// §8.5.11.1 + §8.5.11.2 (4:2:0 sub-path) — 2x2 Hadamard on chroma DC,
 /// followed by §8.5.11.2 Eq. 8-326 scaling.
+///
+/// §8.5.11.2 requires every dcC to stay within -2^(7+BitDepthC) .. 2^(7+BitDepthC)-1; data that leaves it is not
+/// allowed in a bitstream and the standard specifies no output for it. This function computes the equations
+/// exactly in 32 bits whatever the values (and counts such blocks, see [`chroma_dc_range_violations`]) rather
+/// than imitating a decoder that keeps dcC in 16 bits.
 ///
 /// `dc_coeffs` is the 2x2 coefficient array laid out row-major:
 ///   [c00, c01,
@@ -1216,6 +1244,7 @@ pub fn inverse_hadamard_chroma_dc_420(
     for k in 0..4 {
         out[k] = (f[k].wrapping_mul(ls).wrapping_shl((qp_div as u32) & 31)) >> 5;
     }
+    note_chroma_dc_range(&out, bit_depth);
     Ok(out)
 }
 
@@ -1333,6 +1362,7 @@ pub fn inverse_hadamard_chroma_dc_422(
             out[k] = f[k].wrapping_mul(ls).wrapping_add(round) >> shift;
         }
     }
+    note_chroma_dc_range(&out, bit_depth);
     Ok(out)
 }
 
@@ -2112,6 +2142,88 @@ mod tests {
         let sl = default_scaling_list_4x4_flat();
         let out = inverse_hadamard_chroma_dc_420(&dc, 36, &sl, 8).unwrap();
         assert_eq!(out, [320i32; 4]);
+    }
+
+    #[test]
+    fn chroma_dc_420_keeps_out_of_range_scaled_values_exact() {
+        // §8.5.11.2 forbids any dcC_ij outside -2^(7+bitDepth) ..
+        // 2^(7+bitDepth)-1 (-32768..32767 at 8 bits), so a stream that
+        // produces one does not conform and its output is not specified.
+        // The decoder computes eq. 8-326 exactly (in i32); one reference
+        // decoder keeps dcC in 16 bits instead. A fuzzed 96x64 frame
+        // carried this very block: ChromaDCLevel = [-15, -15, 650, 1]
+        // for Cr at QP'C 26.
+        //
+        // qP = 26: qP/6 = 4, qP%6 = 2, LevelScale4x4(2, 0, 0) =
+        // 16 * normAdjust4x4(2, 0, 0) = 16 * 13 = 208, so
+        // dcC = (f * 208 << 4) >> 5 = f * 104.
+        // c = [[-15, -15], [650, 1]] gives f00 = 621, f01 = 649,
+        // f10 = -681 and f11 = -649 (eq. 8-324), hence
+        // dcC = [64_584, 67_496, -70_824, -67_496], all out of range.
+        // Keeping 16 bits would give [-952, 1_960, -5_288, -1_960].
+        let dc = [-15, -15, 650, 1];
+        let sl = default_scaling_list_4x4_flat();
+        let out = inverse_hadamard_chroma_dc_420(&dc, 26, &sl, 8).unwrap();
+        assert_eq!(out, [64_584, 67_496, -70_824, -67_496]);
+    }
+
+    #[test]
+    fn out_of_range_chroma_dc_saturates_its_block_exactly() {
+        // The first block of that macroblock: eq. 8-330's residual from a
+        // DC alone is r = (dcC + 32) >> 6 = (64_584 + 32) >> 6 = 1_009 on
+        // every sample, so Clip1 pins the whole block at 255 (or 0 for a
+        // negative dcC). With dcC kept in 16 bits it would be
+        // (-952 + 32) >> 6 = -15, a block slightly darker than its
+        // prediction, which is what the reference decoder shows.
+        let sl = default_scaling_list_4x4_flat();
+        let dc = inverse_hadamard_chroma_dc_420(&[-15, -15, 650, 1], 26, &sl, 8).unwrap();
+        let mut coeffs = [0i32; 16];
+        coeffs[0] = dc[0];
+        let out = inverse_transform_4x4_dc_preserved(&coeffs, 26, &sl, 8).unwrap();
+        assert_eq!(out, [1_009i32; 16]);
+    }
+
+    #[test]
+    fn chroma_dc_range_violations_count_only_out_of_range_blocks() {
+        // §8.5.11.2 range check, reported for the differential fuzz
+        // harness: a stream with an out-of-range dcC has no specified
+        // output, so the harness must not hold the reference to it.
+        let sl = default_scaling_list_4x4_flat();
+        let before = chroma_dc_range_violations();
+        // In range: f = 32 gives dcC = 3_328, far below 2^15.
+        let _ = inverse_hadamard_chroma_dc_420(&[32, 0, 0, 0], 26, &sl, 8).unwrap();
+        assert_eq!(chroma_dc_range_violations(), before);
+        // f = 316 everywhere gives 316 * 104 = 32_864 > 32_767.
+        let _ = inverse_hadamard_chroma_dc_420(&[316, 0, 0, 0], 26, &sl, 8).unwrap();
+        assert_eq!(chroma_dc_range_violations(), before + 1);
+        // The largest in-range value does not count: f = 315 gives
+        // 32_760, and -2^15 itself is in range (f = -315 gives -32_760).
+        let _ = inverse_hadamard_chroma_dc_420(&[315, 0, 0, 0], 26, &sl, 8).unwrap();
+        let _ = inverse_hadamard_chroma_dc_420(&[-315, 0, 0, 0], 26, &sl, 8).unwrap();
+        assert_eq!(chroma_dc_range_violations(), before + 1);
+        // -316 * 104 = -32_864 < -32_768 counts.
+        let _ = inverse_hadamard_chroma_dc_420(&[-316, 0, 0, 0], 26, &sl, 8).unwrap();
+        assert_eq!(chroma_dc_range_violations(), before + 2);
+        // The limits themselves: qP = 28 gives LevelScale 256 and dcC = f * 128, so f = -256 is exactly
+        // -2^15 (in range) and f = 256 is exactly 2^15 (one past the largest allowed value, 2^15 - 1).
+        let _ = inverse_hadamard_chroma_dc_420(&[-256, 0, 0, 0], 28, &sl, 8).unwrap();
+        assert_eq!(chroma_dc_range_violations(), before + 2);
+        let _ = inverse_hadamard_chroma_dc_420(&[256, 0, 0, 0], 28, &sl, 8).unwrap();
+        assert_eq!(chroma_dc_range_violations(), before + 3);
+    }
+
+    #[test]
+    fn chroma_dc_422_range_violations_are_counted_too() {
+        // 4:2:2 (eq. 8-327..8-329) is under the same §8.5.11.2 limit.
+        // qP = 26, qPDC = 29 < 36: eq. 8-329, qPDC%6 = 5 gives
+        // LevelScale = 16 * 18 = 288, shift 6 - 4 = 2, round 2^(5-4) = 2:
+        // dcC = (f * 288 + 2) >> 2 = f * 72. f = 456 -> 32_832.
+        let sl = default_scaling_list_4x4_flat();
+        let before = chroma_dc_range_violations();
+        let _ = inverse_hadamard_chroma_dc_422(&[455, 0, 0, 0, 0, 0, 0, 0], 26, &sl, 8).unwrap();
+        assert_eq!(chroma_dc_range_violations(), before);
+        let _ = inverse_hadamard_chroma_dc_422(&[457, 0, 0, 0, 0, 0, 0, 0], 26, &sl, 8).unwrap();
+        assert_eq!(chroma_dc_range_violations(), before + 1);
     }
 
     // Regression: §8.5.11.2 Eq. 8-329 (4:2:2, qPDC<36) uses qPDC%6 to
